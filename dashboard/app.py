@@ -202,7 +202,7 @@ with map_col:
             map_style="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
         )
 
-        st.pydeck_chart(deck, use_container_width=True, height=560)
+        st.pydeck_chart(deck, use_container_width=True)
 
         # Légende
         l1, l2, l3 = st.columns(3)
