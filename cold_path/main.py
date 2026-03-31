@@ -78,13 +78,22 @@ def flush(records: list[dict]) -> None:
     )
     partition.mkdir(parents=True, exist_ok=True)
 
-    # Conversion des timestamps ISO 8601 → Arrow timestamp
+    # Conversion des timestamps ISO 8601 → datetime → Arrow timestamp
+    # pa.array() ne parse pas les strings ISO directement : on parse manuellement
+    def _parse_ts(s: str | None) -> datetime | None:
+        if not s:
+            return None
+        try:
+            return datetime.fromisoformat(s)
+        except ValueError:
+            return None
+
     try:
         ts_array = pa.array(
-            [r.get("timestamp") for r in records],
+            [_parse_ts(r.get("timestamp")) for r in records],
             type=pa.timestamp("ms", tz="UTC"),
         )
-    except (pa.ArrowInvalid, ValueError):
+    except Exception:
         log.warning("Timestamps invalides dans le batch — fallback None")
         ts_array = pa.array([None] * len(records), type=pa.timestamp("ms", tz="UTC"))
 
