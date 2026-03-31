@@ -25,6 +25,8 @@ import redis.asyncio as aioredis
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from prometheus_client import Gauge
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
@@ -114,6 +116,19 @@ app.add_middleware(
     allow_methods=["GET"],
     allow_headers=["*"],
 )
+
+# Sert le dashboard HTML statique depuis le dossier /dashboard
+_DASHBOARD_DIR = Path(__file__).parent / "static"
+if _DASHBOARD_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(_DASHBOARD_DIR)), name="static")
+
+@app.get("/map", include_in_schema=False)
+async def live_map():
+    """Dashboard HTML live — carte Leaflet sans clignotement."""
+    p = Path(__file__).parent / "static" / "index.html"
+    if p.exists():
+        return FileResponse(str(p), media_type="text/html")
+    return {"detail": "Dashboard non trouvé — monter le volume /static"}
 
 
 # ── Modèles ─────────────────────────────────────────────────────────────────────

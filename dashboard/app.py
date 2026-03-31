@@ -1,38 +1,31 @@
 """
-FleetStream — Live Dashboard (Streamlit)
-=========================================
-Tableau de bord temps réel de la flotte de livreurs.
+FleetStream — Streamlit Dashboard (stats & analytics)
+=======================================================
+Ce dashboard affiche les KPIs et analytics Cold Path.
+Pour la carte live sans clignotement : http://localhost:8001/map
 
-Hot Path  : Redis GEOSEARCH — positions live (rafraîchissement 2s)
-Cold Path : Statistiques du Data Lake Parquet
-
-Usage (depuis docker-compose) : http://localhost:8501
-Usage (local)                  : streamlit run dashboard/app.py
+Anti-flickering : les widgets sont mis à jour via st.empty() containers
+sans jamais appeler st.rerun() sur toute la page.
 """
 import os
 import time
 from datetime import datetime
 
 import pandas as pd
-import pydeck as pdk
 import requests
 import streamlit as st
 
-# ── Config ──────────────────────────────────────────────────────────────────────
 API_URL         = os.getenv("API_URL", "http://api:8000")
-REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", "2"))
-PARIS_LAT       = 48.8566
-PARIS_LON       = 2.3522
+REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", "3"))
 
 STATUS_COLORS = {
-    "delivering": [255, 140, 0,  230],   # Orange — en course
-    "available":  [0,   210, 100, 230],  # Vert   — dispo
-    "idle":       [160, 160, 160, 180],  # Gris   — inactif
+    "delivering": "#f59e0b",
+    "available":  "#10b981",
+    "idle":       "#6b7280",
 }
 
-# ── Page setup ──────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="FleetStream — Live",
+    page_title="FleetStream — Analytics",
     page_icon="🛵",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -40,217 +33,131 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    /* Réduit le padding global */
-    .block-container { padding-top: 0.8rem; padding-bottom: 0rem; }
-    /* Metrics cards */
-    [data-testid="metric-container"] {
-        background: #1E1E2E;
-        border: 1px solid #313244;
-        border-radius: 10px;
-        padding: 12px 16px;
-    }
-    /* Titre */
-    h1 { margin-bottom: 0 !important; }
+.block-container { padding-top: 1rem; padding-bottom: 0; }
+[data-testid="metric-container"] {
+    background: #1E1E2E; border: 1px solid #313244;
+    border-radius: 10px; padding: 12px 16px;
+}
+h1 { margin-bottom: 0 !important; }
+a { color: #7c6af7 !important; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ── Data fetching (avec cache TTL) ──────────────────────────────────────────────
-@st.cache_data(ttl=REFRESH_SECONDS)
-def fetch_livreurs() -> dict:
+def fetch(path: str, params: dict | None = None) -> dict:
     try:
-        r = requests.get(
-            f"{API_URL}/livreurs-proches",
-            params={"lat": PARIS_LAT, "lon": PARIS_LON, "rayon": 15, "limit": 200},
-            timeout=3,
-        )
-        return r.json()
-    except Exception as exc:
-        return {"error": str(exc), "livreurs": [], "count": 0}
-
-
-@st.cache_data(ttl=5)
-def fetch_stats() -> dict:
-    try:
-        return requests.get(f"{API_URL}/stats", timeout=3).json()
+        return requests.get(f"{API_URL}{path}", params=params, timeout=4).json()
     except Exception:
         return {}
 
 
-@st.cache_data(ttl=10)
-def fetch_performance() -> dict:
-    try:
-        return requests.get(f"{API_URL}/health/performance?samples=100", timeout=8).json()
-    except Exception:
-        return {}
-
-
-# ── Header ──────────────────────────────────────────────────────────────────────
-hdr_left, hdr_right = st.columns([4, 1])
-with hdr_left:
-    st.markdown("# 🛵 FleetStream — Architecture Lambda")
-    st.caption(
-        "**Hot Path** : Redis Stack GEOSEARCH <10ms  ·  "
-        "**Cold Path** : Apache Parquet + DuckDB  ·  "
-        "**Broker** : Redpanda (Kafka-compatible)"
-    )
-with hdr_right:
-    st.markdown(f"🕐 `{datetime.now().strftime('%H:%M:%S')}`")
-    st.caption(f"Auto-refresh: {REFRESH_SECONDS}s")
-
+# ── Header (statique — ne se re-render pas) ──────────────────────────────────
+st.markdown("# 🛵 FleetStream — Analytics Dashboard")
+st.markdown(
+    "**Hot Path** : Redis GEOSEARCH  ·  "
+    "**Cold Path** : DuckDB / Parquet  ·  "
+    "[🗺️ Carte live sans clignotement →](http://localhost:8001/map)"
+)
 st.divider()
 
-# ── Fetch data ──────────────────────────────────────────────────────────────────
-livreurs_data = fetch_livreurs()
-stats_data    = fetch_stats()
-perf_data     = fetch_performance()
+# ── Placeholders (créés une seule fois) ──────────────────────────────────────
+ph_kpis      = st.empty()
+ph_bench     = st.empty()
+ph_cold      = st.empty()
+ph_history   = st.empty()
+ph_ts        = st.empty()
 
-hp = stats_data.get("hot_path", {})
-cp = stats_data.get("cold_path", {})
-statuts = hp.get("statuts", {})
-bench   = perf_data.get("geosearch_benchmark", {})
+# ── Boucle de refresh — mise à jour des placeholders uniquement ──────────────
+while True:
+    stats = fetch("/stats")
+    hp    = stats.get("hot_path", {})
+    cp    = stats.get("cold_path", {})
+    st_counts = hp.get("statuts", {})
 
-# ── KPI Row ─────────────────────────────────────────────────────────────────────
-k1, k2, k3, k4, k5, k6 = st.columns(6)
+    # ── KPIs ─────────────────────────────────────────────────────────────────
+    with ph_kpis.container():
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("🛵 Livreurs actifs",   hp.get("livreurs_actifs", "—"))
+        c2.metric("📨 Messages GPS",      f"{hp.get('messages_traites', 0):,}")
+        c3.metric("🟠 En livraison",      st_counts.get("delivering", 0))
+        c4.metric("🟢 Disponibles",       st_counts.get("available", 0))
+        c5.metric("🗄️ Fichiers Parquet",  cp.get("fichiers_parquet", 0))
 
-k1.metric("🛵 Livreurs actifs",  hp.get("livreurs_actifs", "—"))
-k2.metric("📨 Messages traités", f"{hp.get('messages_traites', 0):,}")
-k3.metric("🟠 En livraison",     statuts.get("delivering", 0))
-k4.metric("🟢 Disponibles",      statuts.get("available", 0))
-k5.metric("⚡ Latence P99",      f"{bench.get('p99_ms', '—')} ms" if bench else "—")
-k6.metric("🗄️ Fichiers Parquet", cp.get("fichiers_parquet", 0))
+    # ── Benchmark Redis ──────────────────────────────────────────────────────
+    perf = fetch("/health/performance", {"samples": 100})
+    bench = perf.get("geosearch_benchmark", {})
+    rinfo = perf.get("redis_info", {})
 
-st.divider()
+    with ph_bench.container():
+        st.subheader("⚡ Hot Path — SLA Redis GEOSEARCH")
+        if bench:
+            sla_ok = bench.get("p99_ms", 999) < 10
+            if sla_ok:
+                st.success(f"✅ SLA respecté — p99 = **{bench['p99_ms']} ms** (cible < 10ms)")
+            else:
+                st.error(f"⚠️ SLA dépassé — p99 = **{bench['p99_ms']} ms**")
 
-# ── Main layout : Map | Stats ───────────────────────────────────────────────────
-map_col, stats_col = st.columns([3, 1])
+            bc1, bc2, bc3, bc4 = st.columns(4)
+            bc1.metric("P50", f"{bench.get('p50_ms', '—')} ms")
+            bc2.metric("P95", f"{bench.get('p95_ms', '—')} ms")
+            bc3.metric("P99", f"{bench.get('p99_ms', '—')} ms")
+            bc4.metric("Max", f"{bench.get('max_ms', '—')} ms")
 
-# ── Carte live ──────────────────────────────────────────────────────────────────
-with map_col:
-    livreurs = livreurs_data.get("livreurs", [])
-    error    = livreurs_data.get("error")
-
-    if error:
-        st.error(f"API inaccessible : {error}")
-    elif not livreurs:
-        st.warning("⏳ En attente des données GPS... (les consumers doivent être actifs)")
-    else:
-        df = pd.DataFrame([
-            {
-                "lat":    lv["lat"],
-                "lon":    lv["lon"],
-                "id":     lv["livreur_id"],
-                "speed":  round(lv.get("speed_kmh", 0), 1),
-                "status": lv.get("status", "unknown"),
-                "dist":   lv.get("distance_km", 0),
-                "color":  STATUS_COLORS.get(lv.get("status", ""), [200, 200, 200, 200]),
-            }
-            for lv in livreurs
-        ])
-
-        # Couche principale : livreurs (ScatterplotLayer)
-        scatter = pdk.Layer(
-            "ScatterplotLayer",
-            df,
-            get_position=["lon", "lat"],
-            get_fill_color="color",
-            get_radius=100,
-            pickable=True,
-            auto_highlight=True,
-            highlight_color=[255, 255, 0, 255],
-            radius_min_pixels=4,
-            radius_max_pixels=20,
-        )
-
-        # Couche de flou (halo) pour l'effet visuel
-        halo = pdk.Layer(
-            "ScatterplotLayer",
-            df,
-            get_position=["lon", "lat"],
-            get_fill_color=[[c[0], c[1], c[2], 40] for c in df["color"].tolist()],
-            get_radius=300,
-            pickable=False,
-            radius_min_pixels=8,
-        )
-
-        deck = pdk.Deck(
-            layers=[halo, scatter],
-            initial_view_state=pdk.ViewState(
-                latitude=PARIS_LAT,
-                longitude=PARIS_LON,
-                zoom=11,
-                pitch=45,
-                bearing=0,
-            ),
-            tooltip={
-                "html": (
-                    "<b style='color:#CBA6F7'>🛵 {id}</b><br/>"
-                    "📍 {lat:.5f}, {lon:.5f}<br/>"
-                    "⚡ <b>{speed}</b> km/h<br/>"
-                    "● {status}<br/>"
-                    "📏 {dist:.2f} km du centre"
-                ),
-                "style": {
-                    "backgroundColor": "#1E1E2E",
-                    "color": "#CDD6F4",
-                    "fontSize": "13px",
-                    "borderRadius": "8px",
-                    "padding": "8px",
-                },
-            },
-            # Fond carte sombre sans token Mapbox (CartoCDN)
-            map_style="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
-        )
-
-        st.pydeck_chart(deck, use_container_width=True)
-
-        # Légende
-        l1, l2, l3 = st.columns(3)
-        l1.markdown("🟠 **En livraison**")
-        l2.markdown("🟢 **Disponible**")
-        l3.markdown("⚫ **Inactif**")
-
-# ── Panneau de droite ───────────────────────────────────────────────────────────
-with stats_col:
-    st.subheader("⚡ Hot Path (Redis)")
-    if bench:
-        sla_ok = bench.get("p99_ms", 999) < 10
-        sla_badge = "✅ SLA OK" if sla_ok else "⚠️ SLA KO"
-        st.info(f"{sla_badge} — Cible : p99 < 10ms")
-        bcol1, bcol2 = st.columns(2)
-        bcol1.metric("P50", f"{bench.get('p50_ms', '—')} ms")
-        bcol2.metric("P95", f"{bench.get('p95_ms', '—')} ms")
-        bcol1.metric("P99", f"{bench.get('p99_ms', '—')} ms")
-        bcol2.metric("Max", f"{bench.get('max_ms', '—')} ms")
-    else:
-        st.caption("Benchmark en cours de chargement...")
+            if rinfo:
+                with st.expander("📊 Redis INFO"):
+                    r1, r2, r3 = st.columns(3)
+                    r1.metric("Version",       rinfo.get("version", "—"))
+                    r2.metric("Clients",       rinfo.get("connected_clients", "—"))
+                    r3.metric("Mémoire",       rinfo.get("used_memory_human", "—"))
+                    r1.metric("Ops/sec",       rinfo.get("ops_per_sec", "—"))
+                    r2.metric("Keyspace hits", f"{rinfo.get('keyspace_hits', 0):,}")
+                    r3.metric("Commands tot.", f"{rinfo.get('total_commands', 0):,}")
 
     st.divider()
-    st.subheader("🗄️ Cold Path (Parquet)")
-    st.metric("Fichiers Parquet",  cp.get("fichiers_parquet", 0))
-    st.metric("Taille Data Lake",  f"{cp.get('taille_totale_mb', 0):.1f} MB")
-    st.caption("DuckDB query sur hive-partitions `year/month/day/hour`")
 
-    st.divider()
-    st.subheader("🏗️ Architecture Lambda")
-    st.code(
-        "Producer\n"
-        "  └─→ Redpanda (Kafka)\n"
-        "       ├─→ hot-consumer\n"
-        "       │    └─→ Redis (TTL 30s)\n"
-        "       └─→ cold-consumer\n"
-        "            └─→ Parquet/Snappy\n"
-        "API\n"
-        "  ├─→ GEOSEARCH Redis (<10ms)\n"
-        "  └─→ DuckDB → Parquet",
-        language="text",
-    )
+    # ── Cold Path ────────────────────────────────────────────────────────────
+    with ph_cold.container():
+        st.subheader("🗄️ Cold Path — Data Lake Parquet")
+        cc1, cc2, cc3, cc4 = st.columns(4)
+        cc1.metric("Fichiers Parquet",  cp.get("fichiers_parquet", 0))
+        cc2.metric("Taille totale",     f"{cp.get('taille_totale_mb', 0):.1f} MB")
+        cc3.metric("Compression",       "Snappy")
+        cc4.metric("Partitionnement",   "Hive (y/m/d/h)")
 
-    st.divider()
-    if st.button("🔄 Forcer le rafraîchissement"):
-        st.cache_data.clear()
-        st.rerun()
+    # ── Historique livreur ───────────────────────────────────────────────────
+    with ph_history.container():
+        st.subheader("📍 Trajectoire historique (Cold Path — DuckDB)")
 
-# ── Auto-refresh ─────────────────────────────────────────────────────────────────
-time.sleep(REFRESH_SECONDS)
-st.rerun()
+        col_input, col_btn = st.columns([3, 1])
+        with col_input:
+            livreur_id = st.text_input("Livreur ID", value="L042", label_visibility="collapsed")
+        with col_btn:
+            heures = st.selectbox("Fenêtre", [1, 2, 4, 8, 24], label_visibility="collapsed")
+
+        hist = fetch(f"/analytics/history/{livreur_id}", {"heures": heures})
+        if "resume" in hist:
+            r = hist["resume"]
+            h1, h2, h3, h4 = st.columns(4)
+            h1.metric("Points GPS",       r.get("nb_points", 0))
+            h2.metric("Distance parcourue", f"{r.get('distance_totale_km', 0)} km")
+            h3.metric("Vitesse moy.",     f"{r.get('vitesse_moy_kmh', 0)} km/h")
+            h4.metric("Statut dominant",  r.get("statut_dominant", "—"))
+
+            traj = hist.get("trajectory", [])
+            if traj:
+                df = pd.DataFrame([
+                    {"lat": p["lat"], "lon": p["lon"],
+                     "speed_kmh": p.get("speed_kmh") or 0,
+                     "status": p.get("status", "")}
+                    for p in traj
+                ])
+                st.map(df, latitude="lat", longitude="lon", size=20, use_container_width=True)
+
+        elif "detail" in hist:
+            st.info(f"ℹ️ {hist['detail']}")
+
+    # ── Timestamp ────────────────────────────────────────────────────────────
+    with ph_ts.container():
+        st.caption(f"Dernière mise à jour : {datetime.now().strftime('%H:%M:%S')} · Refresh {REFRESH_SECONDS}s")
+
+    time.sleep(REFRESH_SECONDS)

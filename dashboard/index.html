@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FleetStream — Live Map</title>
+
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+
+  <style>
+    /* ── Reset & Base ──────────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:         #0f1117;
+      --surface:    #1a1d27;
+      --surface2:   #252836;
+      --border:     #2d3148;
+      --text:       #e2e8f0;
+      --muted:      #8892b0;
+      --accent:     #7c6af7;
+      --delivering: #f59e0b;
+      --available:  #10b981;
+      --idle:       #6b7280;
+      --red:        #ef4444;
+    }
+
+    html, body { height: 100%; font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); }
+
+    /* ── Layout ─────────────────────────────────────────────────────────────── */
+    #app { display: grid; grid-template-rows: 56px 1fr; height: 100vh; }
+
+    /* ── Topbar ──────────────────────────────────────────────────────────────── */
+    #topbar {
+      display: flex; align-items: center; gap: 16px;
+      padding: 0 20px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      z-index: 1000;
+    }
+    #topbar h1 { font-size: 16px; font-weight: 700; letter-spacing: -0.3px; }
+    #topbar h1 span { color: var(--accent); }
+    .badge {
+      font-size: 11px; font-weight: 600; padding: 2px 8px;
+      border-radius: 999px; background: var(--surface2); border: 1px solid var(--border);
+      color: var(--muted); letter-spacing: 0.5px;
+    }
+    .badge.live { color: var(--available); border-color: var(--available); animation: pulse-badge 2s infinite; }
+    @keyframes pulse-badge {
+      0%,100% { box-shadow: 0 0 0 0 rgba(16,185,129,0); }
+      50%      { box-shadow: 0 0 0 4px rgba(16,185,129,0.15); }
+    }
+
+    /* KPIs dans la topbar */
+    #kpis { display: flex; gap: 4px; margin-left: auto; }
+    .kpi {
+      display: flex; flex-direction: column; align-items: center;
+      padding: 4px 14px; border-radius: 8px;
+      background: var(--surface2); border: 1px solid var(--border);
+      min-width: 80px;
+    }
+    .kpi-val { font-size: 18px; font-weight: 700; line-height: 1.1; font-family: 'JetBrains Mono', monospace; }
+    .kpi-lbl { font-size: 10px; color: var(--muted); font-weight: 500; letter-spacing: 0.5px; text-transform: uppercase; }
+    .kpi-val.delivering { color: var(--delivering); }
+    .kpi-val.available  { color: var(--available); }
+    .kpi-val.latency    { color: var(--accent); }
+
+    #last-update { font-size: 11px; color: var(--muted); font-family: 'JetBrains Mono', monospace; white-space: nowrap; }
+
+    /* ── Main ───────────────────────────────────────────────────────────────── */
+    #main { display: grid; grid-template-columns: 1fr 300px; overflow: hidden; }
+
+    /* ── Map ────────────────────────────────────────────────────────────────── */
+    #map-wrap { position: relative; }
+    #map { width: 100%; height: 100%; }
+
+    /* Override Leaflet popup */
+    .leaflet-popup-content-wrapper {
+      background: var(--surface) !important;
+      color: var(--text) !important;
+      border: 1px solid var(--border) !important;
+      border-radius: 10px !important;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.5) !important;
+      font-family: 'Inter', sans-serif !important;
+    }
+    .leaflet-popup-tip { background: var(--surface) !important; }
+    .popup-id   { font-weight: 700; font-size: 14px; color: var(--accent); margin-bottom: 6px; }
+    .popup-row  { font-size: 12px; color: var(--muted); line-height: 1.7; }
+    .popup-row strong { color: var(--text); }
+
+    /* ── Sidebar ────────────────────────────────────────────────────────────── */
+    #sidebar {
+      background: var(--surface);
+      border-left: 1px solid var(--border);
+      overflow-y: auto;
+      display: flex; flex-direction: column; gap: 0;
+    }
+
+    .panel {
+      padding: 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    .panel h2 { font-size: 11px; font-weight: 600; color: var(--muted); letter-spacing: 1px; text-transform: uppercase; margin-bottom: 12px; }
+
+    /* Architecture badge */
+    .arch-block {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      line-height: 1.8;
+      color: var(--muted);
+    }
+    .arch-block .hl { color: var(--accent); font-weight: 600; }
+    .arch-block .ok { color: var(--available); }
+    .arch-block .warn { color: var(--delivering); }
+
+    /* SLA Gauge */
+    .sla-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .sla-label { font-size: 12px; color: var(--muted); }
+    .sla-val { font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 600; }
+    .bar-track { height: 4px; background: var(--surface2); border-radius: 2px; overflow: hidden; margin-bottom: 10px; }
+    .bar-fill  { height: 100%; border-radius: 2px; transition: width 0.6s ease; background: var(--available); }
+    .bar-fill.warn { background: var(--delivering); }
+    .bar-fill.danger { background: var(--red); }
+
+    /* Livreur list */
+    #livreur-list { display: flex; flex-direction: column; gap: 4px; max-height: 340px; overflow-y: auto; }
+    .lv-row {
+      display: flex; align-items: center; gap: 8px;
+      padding: 6px 8px; border-radius: 6px;
+      background: var(--surface2); border: 1px solid transparent;
+      cursor: pointer; transition: border-color 0.15s;
+      font-size: 12px;
+    }
+    .lv-row:hover { border-color: var(--accent); }
+    .lv-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    .lv-name { font-family: 'JetBrains Mono', monospace; font-weight: 600; color: var(--text); flex: 1; }
+    .lv-speed { color: var(--muted); }
+    .lv-dist { color: var(--muted); font-size: 11px; }
+
+    /* Parquet / cold path */
+    .cold-stat { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
+    .cold-stat:last-child { border-bottom: none; }
+    .cold-stat-val { font-family: 'JetBrains Mono', monospace; font-weight: 600; color: var(--accent); }
+
+    /* Spinner */
+    #spinner {
+      position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+      font-size: 14px; color: var(--muted); background: var(--surface);
+      padding: 12px 24px; border-radius: 10px; border: 1px solid var(--border);
+      z-index: 9999;
+    }
+
+    /* ── Scrollbar ─────────────────────────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 4px; } ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    /* ── Marker styles via CSS (injectés par JS) ────────────────────────────── */
+    .lf-marker-delivering { background: #f59e0b; }
+    .lf-marker-available  { background: #10b981; }
+    .lf-marker-idle       { background: #6b7280; }
+  </style>
+</head>
+<body>
+<div id="app">
+
+  <!-- ── TOPBAR ──────────────────────────────────────────────────────────── -->
+  <div id="topbar">
+    <h1>🛵 Fleet<span>Stream</span></h1>
+    <span class="badge live">● LIVE</span>
+    <span class="badge">Lambda Architecture</span>
+
+    <div id="kpis">
+      <div class="kpi">
+        <span class="kpi-val" id="k-total">—</span>
+        <span class="kpi-lbl">Livreurs</span>
+      </div>
+      <div class="kpi">
+        <span class="kpi-val delivering" id="k-delivering">—</span>
+        <span class="kpi-lbl">🟠 Livraison</span>
+      </div>
+      <div class="kpi">
+        <span class="kpi-val available" id="k-available">—</span>
+        <span class="kpi-lbl">🟢 Dispo</span>
+      </div>
+      <div class="kpi">
+        <span class="kpi-val latency" id="k-p99">—</span>
+        <span class="kpi-lbl">P99 ms</span>
+      </div>
+      <div class="kpi">
+        <span class="kpi-val" id="k-msgs" style="font-size:14px">—</span>
+        <span class="kpi-lbl">GPS traités</span>
+      </div>
+    </div>
+    <span id="last-update">—</span>
+  </div>
+
+  <!-- ── MAIN ──────────────────────────────────────────────────────────────── -->
+  <div id="main">
+
+    <!-- MAP -->
+    <div id="map-wrap">
+      <div id="spinner">⏳ Connexion à l'API...</div>
+      <div id="map"></div>
+    </div>
+
+    <!-- SIDEBAR -->
+    <div id="sidebar">
+
+      <!-- Architecture -->
+      <div class="panel">
+        <h2>Architecture Lambda</h2>
+        <div class="arch-block">
+          <span class="hl">Producer</span> → <span class="warn">Redpanda</span><br>
+          &nbsp;&nbsp;├─ <span class="hl">hot-consumer</span><br>
+          &nbsp;&nbsp;│&nbsp;&nbsp;&nbsp;└─ <span class="ok">Redis</span> TTL 30s<br>
+          &nbsp;&nbsp;└─ <span class="hl">cold-consumer</span><br>
+          &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└─ <span class="ok">Parquet</span>/Snappy<br>
+          <br>
+          <span class="hl">API</span> (FastAPI)<br>
+          &nbsp;&nbsp;├─ GEOSEARCH → <span class="ok">Redis</span><br>
+          &nbsp;&nbsp;└─ DuckDB → <span class="ok">Parquet</span>
+        </div>
+      </div>
+
+      <!-- SLA Hot Path -->
+      <div class="panel">
+        <h2>Hot Path — SLA Redis</h2>
+        <div class="sla-row"><span class="sla-label">P50</span><span class="sla-val" id="p50">— ms</span></div>
+        <div class="bar-track"><div class="bar-fill" id="bar-p50" style="width:0%"></div></div>
+        <div class="sla-row"><span class="sla-label">P95</span><span class="sla-val" id="p95">— ms</span></div>
+        <div class="bar-track"><div class="bar-fill" id="bar-p95" style="width:0%"></div></div>
+        <div class="sla-row"><span class="sla-label">P99</span><span class="sla-val" id="p99">— ms</span></div>
+        <div class="bar-track"><div class="bar-fill" id="bar-p99" style="width:0%"></div></div>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px">Cible SLA : p99 &lt; 10ms</div>
+      </div>
+
+      <!-- Cold Path -->
+      <div class="panel">
+        <h2>Cold Path — Data Lake</h2>
+        <div class="cold-stat"><span>Fichiers Parquet</span><span class="cold-stat-val" id="c-files">—</span></div>
+        <div class="cold-stat"><span>Taille totale</span><span class="cold-stat-val" id="c-size">—</span></div>
+        <div class="cold-stat"><span>Compression</span><span class="cold-stat-val">Snappy</span></div>
+        <div class="cold-stat"><span>Partitionnement</span><span class="cold-stat-val">Hive</span></div>
+        <div class="cold-stat"><span>Analytics</span><span class="cold-stat-val">DuckDB</span></div>
+      </div>
+
+      <!-- Livreurs proches -->
+      <div class="panel" style="flex:1">
+        <h2>Livreurs actifs <span id="lv-count" style="color:var(--accent)"></span></h2>
+        <div id="livreur-list"></div>
+      </div>
+
+    </div><!-- /sidebar -->
+  </div><!-- /main -->
+</div><!-- /app -->
+
+<!-- Leaflet JS -->
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<script>
+/* ════════════════════════════════════════════════════════════════════════════
+   FleetStream — Live Dashboard
+   Principe anti-clignotement : on NE recrée JAMAIS la carte ni les marqueurs.
+   On appelle marker.setLatLng() pour un déplacement fluide.
+   ════════════════════════════════════════════════════════════════════════════ */
+
+const API = '';          // même origin (servi par FastAPI)
+const POLL_MS  = 2000;   // intervalle de polling GPS
+const PERF_MS  = 15000;  // intervalle benchmark perf (moins fréquent)
+
+const STATUS_COLOR = {
+  delivering: '#f59e0b',
+  available:  '#10b981',
+  idle:       '#6b7280',
+};
+
+/* ── Init carte ──────────────────────────────────────────────────────────── */
+const map = L.map('map', {
+  center: [48.8566, 2.3522],
+  zoom: 12,
+  zoomControl: true,
+  attributionControl: false,
+});
+
+L.tileLayer(
+  'https://{s}.basemaps.cartocdn.com/dark_matter_all/{z}/{x}/{y}{r}.png',
+  { maxZoom: 19, subdomains: 'abcd' }
+).addTo(map);
+
+/* ── State ───────────────────────────────────────────────────────────────── */
+const markers = new Map();   // livreur_id → L.circleMarker
+let firstLoad = true;
+
+/* ── Créer un marqueur pour un livreur ───────────────────────────────────── */
+function createMarker(lv) {
+  const color = STATUS_COLOR[lv.status] || '#6b7280';
+
+  const m = L.circleMarker([lv.lat, lv.lon], {
+    radius: 7,
+    fillColor: color,
+    color: 'rgba(255,255,255,0.25)',
+    weight: 1.5,
+    fillOpacity: 0.92,
+  }).addTo(map);
+
+  m.bindPopup('', { maxWidth: 220 });
+  m.on('click', () => {
+    m.setPopupContent(buildPopup(lv));
+    m.openPopup();
+  });
+
+  return m;
+}
+
+/* ── Contenu popup ───────────────────────────────────────────────────────── */
+function buildPopup(lv) {
+  const statusEmoji = { delivering: '🟠', available: '🟢', idle: '⚫' }[lv.status] || '●';
+  return `
+    <div class="popup-id">🛵 ${lv.livreur_id}</div>
+    <div class="popup-row">📍 <strong>${lv.lat.toFixed(5)}, ${lv.lon.toFixed(5)}</strong></div>
+    <div class="popup-row">⚡ Vitesse : <strong>${lv.speed_kmh.toFixed(1)} km/h</strong></div>
+    <div class="popup-row">🧭 Cap : <strong>${lv.heading_deg.toFixed(0)}°</strong></div>
+    <div class="popup-row">${statusEmoji} Statut : <strong>${lv.status}</strong></div>
+    <div class="popup-row">📏 GPS ±${lv.accuracy_m.toFixed(0)} m</div>
+    ${lv.distance_km != null ? `<div class="popup-row">🗺️ Distance : <strong>${lv.distance_km.toFixed(2)} km</strong></div>` : ''}
+  `;
+}
+
+/* ── Mettre à jour la liste sidebar ──────────────────────────────────────── */
+function updateSidebar(livreurs) {
+  const list = document.getElementById('livreur-list');
+  list.innerHTML = '';
+  document.getElementById('lv-count').textContent = `(${livreurs.length})`;
+
+  livreurs.slice(0, 40).forEach(lv => {
+    const color = STATUS_COLOR[lv.status] || '#6b7280';
+    const row = document.createElement('div');
+    row.className = 'lv-row';
+    row.innerHTML = `
+      <div class="lv-dot" style="background:${color}"></div>
+      <span class="lv-name">${lv.livreur_id}</span>
+      <span class="lv-speed">${lv.speed_kmh.toFixed(0)} km/h</span>
+      ${lv.distance_km != null ? `<span class="lv-dist">${lv.distance_km.toFixed(1)} km</span>` : ''}
+    `;
+    row.addEventListener('click', () => {
+      map.setView([lv.lat, lv.lon], 15, { animate: true, duration: 0.5 });
+      const m = markers.get(lv.livreur_id);
+      if (m) { m.setPopupContent(buildPopup(lv)); m.openPopup(); }
+    });
+    list.appendChild(row);
+  });
+}
+
+/* ── Mise à jour barre SLA ───────────────────────────────────────────────── */
+function updateBar(id, barId, ms) {
+  document.getElementById(id).textContent = `${ms.toFixed(2)} ms`;
+  const pct = Math.min(100, (ms / 10) * 100);
+  const bar = document.getElementById(barId);
+  bar.style.width = pct + '%';
+  bar.className = 'bar-fill' + (ms > 10 ? ' danger' : ms > 7 ? ' warn' : '');
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   POLL GPS — cœur du système
+   Met à jour les marqueurs EN PLACE sans recréer quoi que ce soit
+   ════════════════════════════════════════════════════════════════════════════ */
+async function pollGPS() {
+  try {
+    const res = await fetch(`${API}/livreurs-proches?lat=48.8566&lon=2.3522&rayon=15&limit=200`);
+    if (!res.ok) return;
+    const data = await res.json();
+    const livreurs = data.livreurs || [];
+
+    if (firstLoad) {
+      document.getElementById('spinner').style.display = 'none';
+      firstLoad = false;
+    }
+
+    // Compter statuts
+    let nDel = 0, nAvail = 0, nIdle = 0;
+    livreurs.forEach(lv => {
+      if (lv.status === 'delivering') nDel++;
+      else if (lv.status === 'available') nAvail++;
+      else nIdle++;
+    });
+
+    // KPIs
+    document.getElementById('k-total').textContent = livreurs.length;
+    document.getElementById('k-delivering').textContent = nDel;
+    document.getElementById('k-available').textContent = nAvail;
+    document.getElementById('last-update').textContent =
+      '⟳ ' + new Date().toLocaleTimeString('fr-FR');
+
+    // Track which IDs on arrive
+    const seen = new Set();
+
+    livreurs.forEach(lv => {
+      seen.add(lv.livreur_id);
+      const color = STATUS_COLOR[lv.status] || '#6b7280';
+
+      if (markers.has(lv.livreur_id)) {
+        // ── UPDATE en place — pas de clignotement ──
+        const m = markers.get(lv.livreur_id);
+        m.setLatLng([lv.lat, lv.lon]);
+        m.setStyle({ fillColor: color });
+        // Mettre à jour popup si ouverte
+        if (m.isPopupOpen()) m.setPopupContent(buildPopup(lv));
+      } else {
+        // ── Nouveau livreur → créer le marqueur ──
+        markers.set(lv.livreur_id, createMarker(lv));
+      }
+    });
+
+    // Supprimer les marqueurs disparus (TTL expiré)
+    for (const [id, m] of markers) {
+      if (!seen.has(id)) { m.remove(); markers.delete(id); }
+    }
+
+    updateSidebar(livreurs);
+  } catch (e) {
+    console.warn('GPS poll error:', e);
+  }
+}
+
+/* ── POLL STATS ──────────────────────────────────────────────────────────── */
+async function pollStats() {
+  try {
+    const res = await fetch(`${API}/stats`);
+    if (!res.ok) return;
+    const d = await res.json();
+    const cp = d.cold_path || {};
+    document.getElementById('k-msgs').textContent =
+      (d.hot_path?.messages_traites || 0).toLocaleString('fr-FR');
+    document.getElementById('c-files').textContent = cp.fichiers_parquet ?? '—';
+    document.getElementById('c-size').textContent  = (cp.taille_totale_mb ?? '—') + ' MB';
+  } catch (e) {}
+}
+
+/* ── POLL PERFORMANCE ────────────────────────────────────────────────────── */
+async function pollPerf() {
+  try {
+    const res = await fetch(`${API}/health/performance?samples=50`);
+    if (!res.ok) return;
+    const d = await res.json();
+    const b = d.geosearch_benchmark || {};
+    document.getElementById('k-p99').textContent = (b.p99_ms ?? '—') + ' ms';
+    updateBar('p50', 'bar-p50', b.p50_ms || 0);
+    updateBar('p95', 'bar-p95', b.p95_ms || 0);
+    updateBar('p99', 'bar-p99', b.p99_ms || 0);
+  } catch (e) {}
+}
+
+/* ── Démarrage ───────────────────────────────────────────────────────────── */
+pollGPS();
+pollStats();
+pollPerf();
+setInterval(pollGPS,   POLL_MS);
+setInterval(pollStats, 5000);
+setInterval(pollPerf,  PERF_MS);
+</script>
+</body>
+</html>

@@ -25,6 +25,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY main.py .
+# Dashboard HTML servi à /map (même origin → pas de CORS)
+COPY static/ ./static/
 
 EXPOSE 8000
 

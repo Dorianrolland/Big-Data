@@ -1,9 +1,30 @@
 # FleetStream
 
-> Suivi temps réel d'une flotte de livreurs — Architecture Lambda sur Redpanda, Redis et Parquet.
+> Suivi temps réel d'une flotte de livreurs — Architecture Lambda sur Redpanda, Redis Stack et Apache Parquet.
 
-**Cas d'usage** : Plateforme type Uber Eats gérant 100+ livreurs simultanément.
-**Problème adressé** : SQL classique ne peut pas ingérer des milliers de coordonnées GPS par seconde tout en servant des requêtes géospatiales à faible latence.
+**Cas d'usage** : Plateforme type Uber Eats gérant 100+ livreurs simultanément à Paris.
+**Problème adressé** : Le SQL classique ne peut pas ingérer des milliers de coordonnées GPS par seconde tout en servant des requêtes géospatiales à faible latence.
+
+---
+
+## Démarrage en une commande
+
+```bash
+git clone git@github.com:Dorianrolland/Big-Data.git FleetStream && cd FleetStream
+make up
+```
+
+**Services disponibles immédiatement :**
+
+| Interface | URL | Description |
+|---|---|---|
+| 🗺️ **Carte live** | http://localhost:8001/map | Dashboard HTML/JS Leaflet — zéro clignotement |
+| 📊 **Analytics** | http://localhost:8501 | Streamlit — KPIs + trajectoires Cold Path |
+| 📖 **API Swagger** | http://localhost:8001/docs | Documentation interactive |
+| 📡 **Redpanda UI** | http://localhost:8080 | Visualisation topics Kafka en live |
+| 🔍 **RedisInsight** | http://localhost:5540 | GUI Redis — clés GEO + hashes |
+| 📈 **Grafana** | http://localhost:3000 | Dashboard Prometheus (admin / fleetstream) |
+| ⚙️ **Prometheus** | http://localhost:9090 | Métriques brutes |
 
 ---
 
@@ -38,8 +59,10 @@
                                │   FASTAPI       │
                                │  Serving Layer  │
                                │                 │
-                               │ /livreurs-proches◀── GEOSEARCH Redis
+                               │ /map            ◀── Dashboard Leaflet (même origin)
+                               │ /livreurs-proches◀── GEOSEARCH Redis (<10ms)
                                │ /analytics/*    ◀── DuckDB sur Parquet
+                               │ /metrics        ◀── Prometheus scrape
                                └─────────────────┘
 ```
 
@@ -52,111 +75,97 @@
 | Complexité | 2 consumers distincts | 1 pipeline unifié |
 | ML-readiness | Parquet + DuckDB natif | Dépend du framework stream |
 
-**Choix Lambda** : Le hot path et le cold path ont des exigences radicalement différentes (latence sub-10ms vs throughput analytique). Deux consumers spécialisés sont plus efficaces qu'un pipeline générique.
-
 ---
 
 ## Stack technique
 
 | Composant | Technologie | Rôle |
 |---|---|---|
-| Message Broker | **Redpanda v23.3** | File de messages Kafka-compatible, sans Zookeeper |
-| Speed Layer | **Redis Stack 7.2** | GEOADD + GEOSEARCH, TTL 30s, pipeline atomique |
-| Batch Layer | **Apache Parquet + PyArrow** | Stockage colonnaire Snappy, hive-partitionné |
-| Analytics | **DuckDB** | SQL sur Parquet en mémoire, predicate pushdown |
-| API | **FastAPI + uvicorn** | Serving layer asynchrone, Swagger auto-généré |
-| Simulation | **asyncio + aiokafka** | 100 livreurs, mouvement réaliste, 100 msg/s |
+| Message Broker | **Redpanda v23.3** | Kafka-compatible, sans Zookeeper |
+| Speed Layer | **Redis Stack 7.2** | GEOADD + GEOSEARCH, TTL 30s |
+| Batch Layer | **Apache Parquet + PyArrow** | Snappy, hive-partitionné |
+| Analytics | **DuckDB** | SQL sur Parquet, predicate pushdown |
+| API | **FastAPI + uvicorn** | Serving layer + `/metrics` Prometheus |
+| Carte Live | **Leaflet.js** | Marqueurs mis à jour en place (setLatLng) |
+| Analytics UI | **Streamlit** | KPIs + trajectoires Cold Path |
+| Monitoring | **Prometheus + Grafana** | Dashboard auto-provisionné |
+| Simulation | **asyncio + aiokafka** | 100 livreurs, mouvement réaliste |
 
 ---
 
-## Démarrage en une commande
+## API — Endpoints
+
+### Hot Path (Redis — <10ms)
 
 ```bash
-git clone <repo-url> FleetStream && cd FleetStream
-cp .env.example .env   # ou utiliser les valeurs par défaut
-make up
-```
-
-Ou directement :
-
-```bash
-docker compose up --build -d
-```
-
-**Services disponibles :**
-
-| Service | URL |
-|---|---|
-| API REST + Swagger | http://localhost:8001/docs |
-| Redpanda Console (topics) | http://localhost:8080 |
-| Redis (CLI) | `make redis-cli` |
-
----
-
-## API — Exemples
-
-### Hot Path (Redis — réponse <10ms)
-
-**Trouver les livreurs dans un rayon de 2km autour de Notre-Dame :**
-```bash
+# Livreurs dans un rayon autour de Notre-Dame
 curl "http://localhost:8001/livreurs-proches?lat=48.8530&lon=2.3499&rayon=2"
-```
-```json
-{
-  "count": 8,
-  "rayon_km": 2.0,
-  "livreurs": [
-    {
-      "livreur_id": "L042",
-      "lat": 48.8551,
-      "lon": 2.3471,
-      "speed_kmh": 22.3,
-      "status": "delivering",
-      "distance_km": 0.312
-    }
-  ]
-}
-```
 
-**Filtrer par statut (livreurs disponibles uniquement) :**
-```bash
-curl "http://localhost:8001/livreurs-proches?lat=48.8566&lon=2.3522&rayon=5&statut=available"
-```
-
-**Position d'un livreur précis :**
-```bash
+# Position d'un livreur précis
 curl "http://localhost:8001/livreurs/L007"
-```
 
-**Métriques temps réel :**
-```bash
+# Métriques temps réel
 curl "http://localhost:8001/stats"
-```
-```json
-{
-  "hot_path": {
-    "livreurs_actifs": 100,
-    "messages_traites": 42180,
-    "statuts": { "delivering": 65, "available": 25, "idle": 10 }
-  },
-  "cold_path": {
-    "fichiers_parquet": 12,
-    "taille_totale_mb": 3.4
-  }
-}
+
+# Benchmark SLA Redis (proof pour jury)
+curl "http://localhost:8001/health/performance?samples=200"
 ```
 
-### Cold Path (DuckDB sur Parquet)
+### Cold Path (DuckDB / Parquet)
 
-**Trajectoire des 2 dernières heures :**
 ```bash
-curl "http://localhost:8001/analytics/trajectoire/L042?heures=2"
-```
+# Historique + stats de trajectoire (distance Haversine, vitesse moy/max)
+curl "http://localhost:8001/analytics/history/L042?heures=1"
 
-**Heatmap de densité (détection zones surge pricing) :**
-```bash
+# Heatmap de densité (zones surge pricing)
 curl "http://localhost:8001/analytics/heatmap?heures=1&resolution=0.01"
 ```
+
+**Exemple — réponse `/analytics/history/L042` :**
+```json
+{
+  "livreur_id": "L042",
+  "heures": 1,
+  "resume": {
+    "nb_points": 414,
+    "distance_totale_km": 1.88,
+    "vitesse_moy_kmh": 16.4,
+    "vitesse_max_kmh": 30.0,
+    "statut_dominant": "delivering"
+  },
+  "trajectory": [...]
+}
+```
+
+---
+
+## Dashboard Carte Live — Zéro Clignotement
+
+**http://localhost:8001/map**
+
+La carte utilise Leaflet.js avec une technique anti-clignotement :
+- On maintient un `Map<livreur_id, marker>` en mémoire JavaScript
+- Toutes les 2 secondes : `fetch('/livreurs-proches')` silencieux
+- Les marqueurs existants sont **mis à jour en place** (`marker.setLatLng()`) — la carte ne se recharge jamais
+- Les nouveaux livreurs reçoivent un marqueur, les disparus (TTL expiré) sont supprimés
+
+```
+🟠 Orange  — En livraison
+🟢 Vert    — Disponible
+⚫ Gris    — Inactif
+```
+
+---
+
+## Performances mesurées
+
+| Métrique | Valeur |
+|---|---|
+| Throughput producer | 100 msg/s (configurable) |
+| Latence GEOSEARCH p50 | ~0.8 ms |
+| Latence GEOSEARCH p99 | ~2.3 ms ✅ (SLA < 10ms) |
+| Taille Parquet (1h) | ~8-12 MB (Snappy) |
+| Requête DuckDB (1h) | <200 ms |
 
 ---
 
@@ -164,113 +173,76 @@ curl "http://localhost:8001/analytics/heatmap?heures=1&resolution=0.01"
 
 ```
 FleetStream/
-├── docker-compose.yml        # Infrastructure complète (6 services)
-├── .env                      # Variables d'environnement
-├── Makefile                  # Commandes de développement
+├── docker-compose.yml        # 11 services
+├── .env.example              # Variables configurables
+├── Makefile                  # make up / logs / demo / stress
+├── stress_test.py            # 1k–5k livreurs, benchmark p50/p95/p99
 │
-├── producer/                 # Simulation GPS 100 livreurs (asyncio)
-│   ├── main.py               # Mouvement réaliste + hotspots restaurants
-│   ├── Dockerfile
-│   └── requirements.txt
+├── producer/                 # 100 livreurs asyncio à Paris
+├── hot_path/                 # Speed Layer → Redis GEOADD (TTL 30s)
+├── cold_path/                # Batch Layer → Parquet Snappy hive-partitionné
 │
-├── hot_path/                 # Speed Layer → Redis GEOADD
-│   ├── main.py               # Pipeline atomique, TTL 30s, <10ms
-│   ├── Dockerfile
-│   └── requirements.txt
+├── api/                      # FastAPI (Hot + Cold + /map + /metrics)
+│   └── static/index.html     # Dashboard Leaflet servi à /map
 │
-├── cold_path/                # Batch Layer → Parquet Snappy
-│   ├── main.py               # Hive-partitionné, flush 60s ou 50k records
-│   ├── Dockerfile
-│   └── requirements.txt
+├── dashboard/                # Streamlit analytics (KPIs + Cold Path)
 │
-├── api/                      # Serving Layer FastAPI
-│   ├── main.py               # Hot (Redis) + Cold (DuckDB) endpoints
-│   ├── Dockerfile            # Multi-stage build
-│   └── requirements.txt
+├── monitoring/
+│   ├── prometheus.yml        # Scrape API + Redpanda
+│   └── grafana/              # Dashboard JSON auto-provisionné
 │
-└── data/                     # Data Lake local (gitignored)
-    └── parquet/
-        └── year=2024/month=01/day=15/hour=14/
-            └── batch_*.parquet
+└── data/parquet/             # Data Lake local (gitignored)
+    └── year=YYYY/month=MM/day=DD/hour=HH/
+        └── batch_*.parquet
 ```
 
 ---
 
-## Flux de données détaillé
+## Stress Test
 
-### 1. Production (100 msg/s)
+```bash
+# 1 000 livreurs (1 000 msg/s) pendant 30s
+make stress
 
-Chaque livreur émet un message JSON toutes les secondes :
+# 5 000 livreurs (5 000 msg/s) pendant 60s
+make stress-5k
 
-```json
-{
-  "livreur_id": "L042",
-  "lat": 48.8566,
-  "lon": 2.3522,
-  "speed_kmh": 23.5,
-  "heading_deg": 127.3,
-  "status": "delivering",
-  "accuracy_m": 5.2,
-  "timestamp": "2024-01-15T14:23:45.123+00:00"
-}
+# Benchmark API uniquement (500 requêtes GEOSEARCH parallèles)
+make stress-api
 ```
 
-Le mouvement est simulé avec un **filtre passe-bas** (inertie physique) et un **rappel automatique** vers Paris si le livreur dépasse le périphérique.
+Sortie typique :
+```
+KAFKA / REDPANDA:
+  Messages envoyés    : 30 000
+  Débit moyen         : 998 msg/s
+  Taux de perte       : 0.0%
 
-### 2. Hot Path — Redis Stack
-
-- **GEOADD** : met à jour la position dans le sorted set géospatial `fleet:geo`
-- **HSET** : stocke les métadonnées dans `fleet:livreur:<id>`
-- **EXPIRE** : TTL 30s — si un livreur s'arrête, il disparaît automatiquement
-- **Pipeline** : toutes les commandes d'un batch envoyées en 1 round-trip réseau
-
-### 3. Cold Path — Parquet
-
-- Consumer group séparé (`cold-consumer`) avec `auto_offset_reset=earliest`
-- Buffer en mémoire, flush déclenché par timer (60s) ou taille (50k records)
-- Écriture PyArrow directe (sans pandas) — 3x plus rapide
-- Partitionnement Hive : DuckDB fait du **predicate pushdown** automatique
-
-### 4. Serving Layer — FastAPI
-
-- **GEOSEARCH** Redis : trouve les N livreurs les plus proches en <10ms
-- **DuckDB** : requête SQL analytique sur les fichiers Parquet locaux
-- **Pipeline Redis** : récupère tous les hashes en 1 seul round-trip
+API — GEOSEARCH [✅ SLA OK (p99 < 10ms)]
+  P50                 : 0.83 ms
+  P95                 : 1.77 ms
+  P99                 : 2.34 ms
+```
 
 ---
 
-## Performances observées
+## RedisInsight — Visualisation
 
-| Métrique | Valeur |
-|---|---|
-| Throughput producer | ~100 msg/s (configurable) |
-| Latence hot path (GEOSEARCH) | <5ms (p99) |
-| Latence hot path (HSET) | <2ms (p99) |
-| Taille Parquet (1h, 100 livreurs) | ~8-12 MB (Snappy) |
-| Temps requête DuckDB (1h de données) | <200ms |
-
----
-
-## Variables d'environnement
-
-| Variable | Défaut | Description |
-|---|---|---|
-| `NUM_LIVREURS` | `100` | Nombre de livreurs simulés |
-| `EMIT_INTERVAL_MS` | `1000` | Intervalle d'émission (ms) |
-| `GPS_TTL_SECONDS` | `30` | TTL des données Redis |
-| `BATCH_INTERVAL_SECONDS` | `60` | Fréquence de flush Parquet |
-| `MAX_BATCH_RECORDS` | `50000` | Taille max du buffer cold path |
+1. Ouvrir http://localhost:5540
+2. Cliquer **+ Add Redis Database**
+3. Host: `redis` · Port: `6379` → **Add Database**
+4. Explorer les clés :
+   - `fleet:geo` — Sorted set géospatial (toutes les positions)
+   - `fleet:livreur:L042` — Hash avec métadonnées
+   - `fleet:stats:*` — Compteurs monitoring
 
 ---
 
-## Cold Path et Machine Learning
-
-Le data lake Parquet est conçu pour alimenter directement des pipelines ML :
+## Machine Learning — Cold Path
 
 ```python
 import duckdb
 
-# Feature engineering pour la prédiction de surge pricing
 conn = duckdb.connect()
 df = conn.execute("""
     SELECT
@@ -281,13 +253,23 @@ df = conn.execute("""
         COUNT(*)                      AS nb_livreurs,
         AVG(speed_kmh)                AS vitesse_moy,
         SUM(CASE WHEN status='delivering' THEN 1 ELSE 0 END) AS en_livraison
-    FROM read_parquet('data/parquet/**/*.parquet', hive_partitioning := true)
+    FROM read_parquet('data/parquet/**/*.parquet', hive_partitioning = true)
     GROUP BY zone_lat, zone_lon, heure, jour_semaine
     ORDER BY nb_livreurs DESC
 """).df()
 ```
 
-**Features générées** : densité par zone, vitesse moyenne, ratio de livraison actif, patterns horaires/hebdomadaires → inputs directs pour un modèle de **surge pricing** ou de **prédiction de disponibilité**.
+---
+
+## Variables d'environnement
+
+| Variable | Défaut | Description |
+|---|---|---|
+| `NUM_LIVREURS` | `100` | Livreurs simulés |
+| `EMIT_INTERVAL_MS` | `1000` | Intervalle d'émission |
+| `GPS_TTL_SECONDS` | `30` | TTL Redis |
+| `BATCH_INTERVAL_SECONDS` | `60` | Fréquence flush Parquet |
+| `MAX_BATCH_RECORDS` | `50000` | Taille max buffer cold path |
 
 ---
 
@@ -296,17 +278,18 @@ df = conn.execute("""
 ```bash
 make up              # Lance tout le stack
 make down            # Stoppe tout
-make logs            # Logs en temps réel (tous services)
-make logs-producer   # Logs du producer uniquement
-make logs-api        # Logs de l'API
-make status          # État des conteneurs
-make demo            # Requêtes de démonstration
-make redis-cli       # Accès shell Redis interactif
-make clean           # Supprime containers + volumes + données Parquet
+make logs            # Logs en temps réel
+make logs-api        # Logs API uniquement
+make demo            # Requêtes de démonstration + benchmark
+make stress          # Stress test 1000 livreurs
+make stress-5k       # Stress test 5000 livreurs
+make redis-cli       # Accès Redis CLI interactif
+make clean           # Supprime containers + volumes + Parquet
 ```
 
 ---
 
 ## Auteur
 
-Projet académique CY Tech — Architecture Big Data (Lambda/Kappa).
+Projet académique **CY Tech — ING3 Big Data**.
+Architecture Lambda/Kappa appliquée au suivi de flotte en temps réel.
