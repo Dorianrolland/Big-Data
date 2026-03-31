@@ -1,9 +1,7 @@
 """
-FleetStream — Analytics Dashboard (Streamlit)
-Premium SaaS Design — Inter, cards blanches, palette Indigo/Emeraude/Ambre.
-
-Anti-DuplicateWidgetID : widgets déclarés UNE SEULE FOIS hors boucle,
-résultats mémorisés dans st.session_state.
+FleetStream — Analytics Dashboard
+Pixel Perfect "SaaS 2026" — HTML/CSS pur, zéro chrome Streamlit visible.
+Anti-DuplicateWidgetID : widgets hors boucle, résultats en session_state.
 """
 import os
 import time
@@ -18,12 +16,11 @@ API_URL         = os.getenv("API_URL", "http://api:8000")
 REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", "4"))
 
 STATUS_COLOR_RGB = {
-    "delivering": [251, 146,  60, 230],
-    "available":  [ 52, 211, 153, 230],
-    "idle":       [148, 163, 184, 160],
+    "delivering": [251, 146,  60, 220],
+    "available":  [ 52, 211, 153, 220],
+    "idle":       [148, 163, 184, 150],
 }
 
-# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="FleetStream Analytics",
     page_icon="🛵",
@@ -32,217 +29,369 @@ st.set_page_config(
 )
 
 # ════════════════════════════════════════════════════════════════════════════
-#  DESIGN SYSTEM — CSS global
+#  GLOBAL CSS — Pixel Perfect
 # ════════════════════════════════════════════════════════════════════════════
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300..900&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap');
 
-/* ── Reset global ─────────────────────────────────────────────────────────── */
-html, body, [class*="css"], .stApp {
-    font-family: 'Inter', 'Segoe UI', system-ui, sans-serif !important;
-    background: #F8FAFC !important;
+/* ─── Reset ───────────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; }
+html, body, [class*="css"] {
+    font-family: 'Inter', system-ui, -apple-system, sans-serif !important;
 }
 
-/* ── Cacher éléments Streamlit natifs ─────────────────────────────────────── */
-#MainMenu            { visibility: hidden !important; }
-footer               { visibility: hidden !important; }
-header               { visibility: hidden !important; }
-[data-testid="stToolbar"]      { display: none !important; }
-[data-testid="stDecoration"]   { display: none !important; }
-[data-testid="stStatusWidget"] { display: none !important; }
+/* ─── Fond dégradé ────────────────────────────────────────────────────────── */
+.stApp {
+    background: linear-gradient(135deg, #f0f4ff 0%, #e8ecf4 50%, #dde3f0 100%) !important;
+    min-height: 100vh;
+}
 
-/* ── Layout principal ────────────────────────────────────────────────────── */
+/* ─── Cacher TOUT le chrome Streamlit ────────────────────────────────────── */
+#MainMenu, footer, header,
+[data-testid="stToolbar"],
+[data-testid="stDecoration"],
+[data-testid="stStatusWidget"],
+[data-testid="stDeployButton"],
+[data-testid="stSidebarCollapsedControl"],
+[data-testid="collapsedControl"],
+.st-emotion-cache-h4xjwg,
+.st-emotion-cache-1dp5vir,
+button[kind="header"] { display: none !important; }
+[data-testid="stSidebar"] { display: none !important; }
+
+/* ─── Block container ─────────────────────────────────────────────────────── */
 .block-container {
-    padding: 1.75rem 2.5rem 2rem !important;
-    max-width: 1440px !important;
+    padding: 5.75rem 2.5rem 3rem !important;
+    max-width: 1500px !important;
 }
 
-/* ── Composant card ──────────────────────────────────────────────────────── */
-.card {
-    background: #FFFFFF;
-    border-radius: 16px;
-    border: 1px solid #E2E8F0;
-    box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.07), 0 2px 4px -2px rgb(0 0 0 / 0.04);
-    padding: 1.5rem 1.75rem;
-    margin-bottom: 1.25rem;
+/* ═══════════════════════════════════════════════════════════════════════════
+   NAVBAR FIXE — Glassmorphism
+═══════════════════════════════════════════════════════════════════════════ */
+.fs-navbar {
+    position: fixed;
+    top: 0; left: 0; right: 0; z-index: 9999;
+    height: 56px;
+    background: rgba(255, 255, 255, 0.72);
+    backdrop-filter: blur(16px) saturate(180%);
+    -webkit-backdrop-filter: blur(16px) saturate(180%);
+    border-bottom: 1px solid rgba(99, 102, 241, 0.1);
+    display: flex; align-items: center;
+    justify-content: space-between;
+    padding: 0 2.5rem;
+    box-shadow: 0 1px 28px rgba(0, 0, 0, 0.05);
 }
-.card-title {
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 1px;
-    text-transform: uppercase;
-    color: #94A3B8;
-    margin-bottom: 1.1rem;
+.fs-logo { display: flex; align-items: center; gap: 10px; }
+.fs-logo-badge {
+    width: 32px; height: 32px;
+    background: linear-gradient(135deg, #6366F1, #8B5CF6);
+    border-radius: 9px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px;
+    box-shadow: 0 2px 10px rgba(99, 102, 241, 0.4);
 }
-.card-heading {
-    font-size: 18px;
-    font-weight: 700;
-    color: #0F172A;
-    margin-bottom: .25rem;
-    display: flex;
-    align-items: center;
-    gap: 8px;
+.fs-logo-name {
+    font-size: 15px; font-weight: 800;
+    color: #0F172A; letter-spacing: -0.3px;
 }
-.card-sub {
-    font-size: 13px;
-    color: #64748B;
-    margin-bottom: 1.25rem;
-    line-height: 1.5;
+.fs-logo-name em { color: #6366F1; font-style: normal; }
+.fs-nav-right { display: flex; align-items: center; gap: 8px; }
+.fs-pill {
+    font-size: 11px; font-weight: 600; color: #64748B;
+    background: rgba(100, 116, 139, 0.07);
+    border: 1px solid rgba(100, 116, 139, 0.12);
+    border-radius: 6px; padding: 3px 10px;
 }
-
-/* ── Métriques KPI ───────────────────────────────────────────────────────── */
-[data-testid="metric-container"] {
-    background: #FAFAFA !important;
-    border: 1.5px solid #E2E8F0 !important;
-    border-radius: 14px !important;
-    padding: 1rem 1.25rem .875rem !important;
-    box-shadow: none !important;
-    transition: box-shadow .15s ease !important;
+.fs-btn-live {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 12px; font-weight: 700;
+    background: linear-gradient(135deg, #6366F1, #8B5CF6);
+    color: white !important; text-decoration: none !important;
+    border-radius: 9px; padding: 7px 15px;
+    box-shadow: 0 2px 12px rgba(99, 102, 241, 0.35);
+    transition: box-shadow 0.2s, transform 0.15s;
 }
-[data-testid="metric-container"]:hover {
-    box-shadow: 0 4px 12px rgb(0 0 0 / .08) !important;
-}
-[data-testid="metric-container"] label {
-    font-size: 11px !important;
-    font-weight: 600 !important;
-    color: #94A3B8 !important;
-    letter-spacing: .6px !important;
-    text-transform: uppercase !important;
-}
-[data-testid="metric-container"] [data-testid="stMetricValue"] {
-    font-size: 2rem !important;
-    font-weight: 800 !important;
-    color: #0F172A !important;
-    line-height: 1.15 !important;
-    letter-spacing: -.5px !important;
-}
-[data-testid="stMetricDelta"] { font-size: 12px !important; }
-
-/* ── Bouton principal ────────────────────────────────────────────────────── */
-[data-testid="stButton"] > button {
-    background: #6366F1 !important;
-    color: #FFFFFF !important;
-    border: none !important;
-    border-radius: 10px !important;
-    font-weight: 600 !important;
-    font-size: 13px !important;
-    padding: .55rem 1.4rem !important;
-    letter-spacing: .1px !important;
-    box-shadow: 0 1px 3px rgb(99 102 241 / .35) !important;
-    transition: background .15s, box-shadow .15s !important;
-}
-[data-testid="stButton"] > button:hover {
-    background: #4F46E5 !important;
-    box-shadow: 0 4px 12px rgb(99 102 241 / .4) !important;
+.fs-btn-live:hover {
+    box-shadow: 0 4px 20px rgba(99, 102, 241, 0.5);
+    transform: translateY(-1px); color: white !important;
 }
 
-/* ── Inputs ──────────────────────────────────────────────────────────────── */
-[data-testid="stTextInput"] input {
-    border: 1.5px solid #E2E8F0 !important;
-    border-radius: 10px !important;
-    font-size: 14px !important;
-    padding: .5rem .875rem !important;
-    background: #FAFAFA !important;
-    transition: border-color .15s, box-shadow .15s !important;
+/* ═══════════════════════════════════════════════════════════════════════════
+   SECTION HEADER
+═══════════════════════════════════════════════════════════════════════════ */
+.fs-sh { margin: 2px 0 16px; }
+.fs-sh .overline {
+    font-size: 10.5px; font-weight: 700;
+    letter-spacing: 1.4px; text-transform: uppercase;
+    color: #94A3B8; margin-bottom: 4px;
 }
-[data-testid="stTextInput"] input:focus {
-    border-color: #6366F1 !important;
-    box-shadow: 0 0 0 3px rgb(99 102 241 / .15) !important;
-    background: #FFFFFF !important;
+.fs-sh .heading {
+    font-size: 1.2rem; font-weight: 800;
+    color: #0F172A; letter-spacing: -0.3px; margin-bottom: 3px;
 }
-/* Selectbox */
-[data-testid="stSelectbox"] > div > div {
-    border: 1.5px solid #E2E8F0 !important;
-    border-radius: 10px !important;
-    font-size: 14px !important;
-    background: #FAFAFA !important;
+.fs-sh .sub { font-size: 12.5px; color: #64748B; line-height: 1.5; }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   BENTO GRID — KPIs
+═══════════════════════════════════════════════════════════════════════════ */
+.bento-grid {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 14px; margin-bottom: 28px;
+}
+.bento-card {
+    background: #FFFFFF; border-radius: 20px;
+    padding: 18px 18px 16px; position: relative; overflow: hidden;
+    border: 1px solid rgba(226, 232, 240, 0.7);
+    box-shadow: 0 10px 15px -3px rgba(0,0,0,0.06), 0 4px 6px -4px rgba(0,0,0,0.04);
+    transition: transform 0.2s ease, box-shadow 0.2s ease; cursor: default;
+}
+.bento-card:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 20px 25px -5px rgba(0,0,0,0.09), 0 8px 10px -6px rgba(0,0,0,0.04);
+}
+.bento-card::before {
+    content: '';
+    position: absolute; left: 0; top: 14px; bottom: 14px;
+    width: 3.5px; border-radius: 0 3px 3px 0;
+}
+.bc-indigo::before  { background: linear-gradient(180deg, #6366F1, #8B5CF6); }
+.bc-emerald::before { background: linear-gradient(180deg, #10B981, #059669); }
+.bc-amber::before   { background: linear-gradient(180deg, #F59E0B, #F97316); }
+.bc-sky::before     { background: linear-gradient(180deg, #0EA5E9, #6366F1); }
+.bc-slate::before   { background: linear-gradient(180deg, #94A3B8, #64748B); }
+.bento-icon {
+    width: 38px; height: 38px; border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 19px; margin-bottom: 13px;
+}
+.bi-indigo  { background: rgba(99,102,241,0.1); }
+.bi-emerald { background: rgba(16,185,129,0.1); }
+.bi-amber   { background: rgba(245,158,11,0.1); }
+.bi-sky     { background: rgba(14,165,233,0.1); }
+.bi-slate   { background: rgba(148,163,184,0.1); }
+.bento-lbl {
+    font-size: 10px; font-weight: 700; letter-spacing: 0.9px;
+    text-transform: uppercase; color: #94A3B8; margin-bottom: 3px;
+}
+.bento-val { font-size: 2.1rem; font-weight: 800; line-height: 1.08; letter-spacing: -1.5px; }
+.bv-indigo  { color: #4F46E5; }
+.bv-emerald { color: #059669; }
+.bv-amber   { color: #D97706; }
+.bv-sky     { color: #0284C7; }
+.bv-slate   { color: #64748B; }
+.bento-sub  { font-size: 11px; color: #94A3B8; margin-top: 5px; font-weight: 500; }
+.bento-glyph {
+    position: absolute; right: 14px; bottom: 10px;
+    font-size: 2.8rem; opacity: 0.06; pointer-events: none; line-height: 1;
 }
 
-/* ── Alertes ─────────────────────────────────────────────────────────────── */
-[data-testid="stSuccess"] {
-    background: #F0FDF4 !important;
-    border: 1.5px solid #86EFAC !important;
-    border-radius: 12px !important;
-    color: #14532D !important;
-    font-weight: 500 !important;
+/* ═══════════════════════════════════════════════════════════════════════════
+   SLA CARD
+═══════════════════════════════════════════════════════════════════════════ */
+.sla-card {
+    background: #FFFFFF; border-radius: 20px;
+    border: 1px solid rgba(226,232,240,0.7);
+    box-shadow: 0 10px 15px -3px rgba(0,0,0,0.06);
+    padding: 22px 26px; margin-bottom: 22px;
 }
-[data-testid="stError"] {
-    background: #FFF7ED !important;
-    border: 1.5px solid #FCD34D !important;
-    border-radius: 12px !important;
-    color: #78350F !important;
-    font-weight: 500 !important;
+.sla-card-header {
+    display: flex; align-items: center; gap: 10px; margin-bottom: 18px;
 }
-[data-testid="stInfo"] {
-    background: #EFF6FF !important;
-    border: 1.5px solid #BFDBFE !important;
-    border-radius: 12px !important;
-    color: #1E3A8A !important;
+.sla-card-title { font-size: 14px; font-weight: 800; color: #0F172A; }
+.sla-badge-ok {
+    font-size: 10px; font-weight: 800; letter-spacing: 0.3px;
+    background: #DCFCE7; color: #166534;
+    border: 1px solid #86EFAC; border-radius: 20px; padding: 2px 9px;
 }
-
-/* ── Divider ─────────────────────────────────────────────────────────────── */
-[data-testid="stDivider"] hr {
-    border-color: #E2E8F0 !important;
+.sla-badge-ko {
+    font-size: 10px; font-weight: 800; letter-spacing: 0.3px;
+    background: #FEF9C3; color: #854D0E;
+    border: 1px solid #FDE047; border-radius: 20px; padding: 2px 9px;
 }
-
-/* ── Expander ────────────────────────────────────────────────────────────── */
-[data-testid="stExpander"] {
-    border: 1.5px solid #E2E8F0 !important;
-    border-radius: 12px !important;
-    background: #FAFAFA !important;
-    box-shadow: none !important;
+.sla-item { margin-bottom: 12px; }
+.sla-item-row {
+    display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;
 }
-
-/* ── Caption ─────────────────────────────────────────────────────────────── */
-[data-testid="stCaptionContainer"] small {
-    color: #94A3B8 !important;
-    font-size: 11.5px !important;
-}
-
-/* ── pydeck iframe ───────────────────────────────────────────────────────── */
-iframe { border-radius: 14px !important; border: 1.5px solid #E2E8F0 !important; }
-
-/* ── SLA Progress Bar (HTML natif dans st.markdown) ─────────────────────── */
-.sla-bar-track {
-    width: 100%; height: 5px; background: #F1F5F9;
-    border-radius: 999px; margin: 4px 0 12px;
-    overflow: hidden;
-}
-.sla-bar-fill {
-    height: 100%; border-radius: 999px;
-    transition: width .5s cubic-bezier(.4,0,.2,1);
-}
-.sla-row-label {
-    display: flex; justify-content: space-between;
-    font-size: 12px; color: #64748B; font-weight: 500;
-    font-family: 'Inter', sans-serif;
-}
-.sla-val { font-weight: 700; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+.sla-lbl  { font-size: 12px; font-weight: 500; color: #64748B; }
+.sla-ms   { font-size: 12px; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
 .sla-ok   { color: #059669; }
 .sla-warn { color: #D97706; }
 .sla-bad  { color: #DC2626; }
+.sla-track { height: 5px; background: #F1F5F9; border-radius: 999px; overflow: hidden; }
+.sla-fill  { height: 100%; border-radius: 999px; transition: width .6s cubic-bezier(.4,0,.2,1); }
 
-/* ── Cold Path table ─────────────────────────────────────────────────────── */
-.cold-row {
-    display: flex; justify-content: space-between; align-items: center;
-    padding: 7px 0; border-bottom: 1px solid #F1F5F9;
-    font-size: 13px;
+/* ═══════════════════════════════════════════════════════════════════════════
+   SPOTLIGHT SEARCH
+═══════════════════════════════════════════════════════════════════════════ */
+.spotlight-container {
+    background: rgba(255,255,255,0.88);
+    backdrop-filter: blur(20px) saturate(160%);
+    -webkit-backdrop-filter: blur(20px) saturate(160%);
+    border: 1.5px solid rgba(99,102,241,0.2);
+    border-radius: 18px;
+    box-shadow:
+        0 8px 32px rgba(99,102,241,0.1),
+        0 2px 8px rgba(0,0,0,0.05),
+        inset 0 1px 0 rgba(255,255,255,0.9);
+    padding: 20px 22px 16px;
+    margin-bottom: 18px;
 }
-.cold-row:last-child { border-bottom: none; }
-.cold-key { color: #64748B; }
-.cold-val { font-weight: 700; color: #6366F1; font-size: 13px; }
+.spotlight-header {
+    font-size: 13px; font-weight: 700; color: #0F172A;
+    display: flex; align-items: center; gap: 7px; margin-bottom: 14px;
+}
+.spotlight-container [data-testid="stTextInput"] input {
+    background: #F8FAFC !important;
+    border: 1.5px solid rgba(99,102,241,0.18) !important;
+    border-radius: 12px !important;
+    font-size: 15px !important; font-weight: 600 !important;
+    padding: 10px 16px !important; color: #0F172A !important;
+    letter-spacing: -0.2px !important; height: 44px !important;
+    transition: all 0.2s !important;
+}
+.spotlight-container [data-testid="stTextInput"] input:focus {
+    border-color: #6366F1 !important;
+    box-shadow: 0 0 0 3px rgba(99,102,241,0.12) !important;
+    background: #FFFFFF !important; outline: none !important;
+}
+.spotlight-container [data-testid="stSelectbox"] > div > div {
+    background: #F8FAFC !important;
+    border: 1.5px solid rgba(99,102,241,0.18) !important;
+    border-radius: 12px !important;
+    font-size: 14px !important; font-weight: 500 !important; min-height: 44px !important;
+}
+.spotlight-container [data-testid="stButton"] > button {
+    background: linear-gradient(135deg, #6366F1 0%, #8B5CF6 55%, #7C3AED 100%) !important;
+    color: #FFFFFF !important; border: none !important;
+    border-radius: 12px !important; font-weight: 700 !important;
+    font-size: 14px !important; height: 44px !important; letter-spacing: 0.15px !important;
+    box-shadow: 0 4px 16px rgba(99,102,241,0.45),
+                inset 0 1px 0 rgba(255,255,255,0.25) !important;
+    transition: all 0.2s ease !important;
+}
+.spotlight-container [data-testid="stButton"] > button:hover {
+    box-shadow: 0 6px 24px rgba(99,102,241,0.55),
+                inset 0 1px 0 rgba(255,255,255,0.25) !important;
+    transform: translateY(-1px) !important;
+}
+.spotlight-container [data-testid="stButton"] > button:active {
+    transform: translateY(0) !important;
+}
 
-/* ── Légende ─────────────────────────────────────────────────────────────── */
-.legend-dot {
-    display: inline-block; width: 10px; height: 10px;
-    border-radius: 50%; margin-right: 5px; vertical-align: middle;
+/* ═══════════════════════════════════════════════════════════════════════════
+   KPIs TRAJECTOIRE
+═══════════════════════════════════════════════════════════════════════════ */
+.traj-kpis {
+    display: grid; grid-template-columns: repeat(4, 1fr);
+    gap: 12px; margin-bottom: 18px;
 }
-.legend-item { font-size: 12px; color: #475569; margin-right: 16px; }
+.traj-kpi {
+    background: linear-gradient(140deg, #F5F7FF 0%, #EEF2FF 100%);
+    border-radius: 14px; padding: 14px 16px;
+    border: 1px solid rgba(99,102,241,0.1);
+}
+.tk-lbl  { font-size: 10px; font-weight: 700; color: #94A3B8; text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 5px; }
+.tk-val  { font-size: 1.55rem; font-weight: 800; color: #4F46E5; letter-spacing: -0.8px; line-height: 1.1; }
+.tk-unit { font-size: 10.5px; color: #94A3B8; margin-top: 3px; font-weight: 500; }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   MAP CARD WRAPPER
+═══════════════════════════════════════════════════════════════════════════ */
+.map-card {
+    background: #FFFFFF; border-radius: 20px;
+    border: 1px solid rgba(226,232,240,0.7);
+    box-shadow: 0 10px 15px -3px rgba(0,0,0,0.06);
+    padding: 18px 18px 14px; margin-bottom: 14px;
+}
+.map-card-header {
+    font-size: 12px; font-weight: 700; color: #475569;
+    display: flex; align-items: center; gap: 6px;
+    margin-bottom: 12px; padding: 0 2px;
+}
+.map-card iframe { border-radius: 12px !important; border: none !important; }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   LÉGENDE TRAJECTOIRE
+═══════════════════════════════════════════════════════════════════════════ */
+.traj-legend {
+    display: flex; flex-wrap: wrap; gap: 14px;
+    padding: 10px 14px; margin-top: 10px;
+    background: #F8FAFC; border-radius: 10px;
+}
+.tl-item { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: #475569; font-weight: 500; }
+.tl-dot  { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+.tl-line {
+    width: 24px; height: 4px; border-radius: 2px; flex-shrink: 0;
+    background: linear-gradient(90deg, rgba(99,102,241,0.25), #6366F1);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   COLD PATH CARD
+═══════════════════════════════════════════════════════════════════════════ */
+.cold-card {
+    background: #FFFFFF; border-radius: 20px;
+    border: 1px solid rgba(226,232,240,0.7);
+    box-shadow: 0 10px 15px -3px rgba(0,0,0,0.06);
+    padding: 22px 26px; margin-bottom: 22px;
+}
+.cold-card-header { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
+.cold-card-title  { font-size: 14px; font-weight: 800; color: #0F172A; }
+.cold-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+.cold-stat {
+    background: #F8FAFC; border-radius: 12px; padding: 14px 16px;
+    border: 1px solid rgba(226,232,240,0.9);
+}
+.cs-lbl { font-size: 10px; font-weight: 700; color: #94A3B8; text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 5px; }
+.cs-val { font-size: 1.4rem; font-weight: 800; color: #0F172A; letter-spacing: -0.5px; }
+.cs-sub { font-size: 11px; color: #64748B; margin-top: 3px; }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   EMPTY STATE
+═══════════════════════════════════════════════════════════════════════════ */
+.empty-state {
+    padding: 52px 24px; text-align: center;
+    background: rgba(248,250,252,0.7);
+    border-radius: 16px; border: 2px dashed #E2E8F0; margin: 8px 0;
+}
+.es-icon { font-size: 40px; margin-bottom: 12px; }
+.es-text { font-size: 14px; color: #94A3B8; font-weight: 500; line-height: 1.6; }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   FOOTER / TIMESTAMP
+═══════════════════════════════════════════════════════════════════════════ */
+.fs-footer {
+    text-align: center; font-size: 11px; color: #94A3B8;
+    font-family: 'JetBrains Mono', monospace; padding: 10px 0 4px;
+}
+.live-dot {
+    display: inline-block; width: 6px; height: 6px;
+    border-radius: 50%; background: #10B981;
+    margin-right: 5px; vertical-align: middle;
+    animation: pulse-dot 1.8s ease-in-out infinite;
+}
+@keyframes pulse-dot {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.4; transform: scale(0.7); }
+}
+
+/* ─── Divers Streamlit → invisible ───────────────────────────────────────── */
+[data-testid="stDivider"] { display: none !important; }
+.stDeckGlJsonChart { width: 100% !important; }
+iframe { border: none !important; border-radius: 12px !important; }
+[data-testid="stInfo"] {
+    background: #EFF6FF !important; border: 1.5px solid #BFDBFE !important;
+    border-radius: 12px !important; color: #1E3A8A !important; font-weight: 500 !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  HELPERS
+# ════════════════════════════════════════════════════════════════════════════
 def fetch(path: str, params: dict | None = None) -> dict:
     try:
         return requests.get(f"{API_URL}{path}", params=params, timeout=5).json()
@@ -250,82 +399,114 @@ def fetch(path: str, params: dict | None = None) -> dict:
         return {}
 
 
-def sla_bar(label: str, ms: float | None, target: float = 10.0) -> str:
+def bento(color: str, icon: str, label: str, value: str, sub: str = "", glyph: str = "") -> str:
+    sub_html  = f'<div class="bento-sub">{sub}</div>' if sub else ""
+    glph_html = f'<div class="bento-glyph">{glyph}</div>' if glyph else ""
+    return (
+        f'<div class="bento-card bc-{color}">'
+        f'<div class="bento-icon bi-{color}">{icon}</div>'
+        f'<div class="bento-lbl">{label}</div>'
+        f'<div class="bento-val bv-{color}">{value}</div>'
+        f'{sub_html}{glph_html}'
+        f'</div>'
+    )
+
+
+def sla_row(label: str, ms: float | None, target: float = 10.0) -> str:
     if ms is None:
         return ""
     pct = min(100, (ms / target) * 100)
-    if ms < target * 0.7:
+    if ms < target * 0.5:
         color, cls = "#10B981", "sla-ok"
     elif ms < target:
         color, cls = "#F59E0B", "sla-warn"
     else:
         color, cls = "#EF4444", "sla-bad"
-    return f"""
-    <div class="sla-row-label">
-        <span>{label}</span>
-        <span class="sla-val {cls}">{ms:.2f} ms</span>
-    </div>
-    <div class="sla-bar-track">
-        <div class="sla-bar-fill" style="width:{pct:.1f}%;background:{color}"></div>
-    </div>"""
-
-
-# ════════════════════════════════════════════════════════════════════════════
-#  HEADER
-# ════════════════════════════════════════════════════════════════════════════
-col_h, col_btn = st.columns([6, 1])
-with col_h:
-    st.markdown("""
-    <div style="padding-bottom:.75rem">
-        <h1 style="font-size:1.6rem;font-weight:800;color:#0F172A;
-                   letter-spacing:-.5px;margin:0;line-height:1.2">
-            🛵 FleetStream <span style="color:#6366F1">Analytics</span>
-        </h1>
-        <p style="font-size:13px;color:#64748B;margin:.35rem 0 0">
-            Architecture Lambda · Redis Hot Path &lt;10ms · DuckDB Cold Path · Apache Parquet
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
-with col_btn:
-    st.markdown(
-        "<div style='padding-top:1.1rem;text-align:right'>"
-        "<a href='http://localhost:8001/map' target='_blank' "
-        "style='background:#6366F1;color:#fff;padding:9px 18px;"
-        "border-radius:10px;font-size:13px;font-weight:600;"
-        "text-decoration:none;box-shadow:0 2px 8px rgb(99 102 241/.3)'>"
-        "🗺️ Carte live</a></div>",
-        unsafe_allow_html=True,
+    return (
+        f'<div class="sla-item">'
+        f'<div class="sla-item-row">'
+        f'<span class="sla-lbl">{label}</span>'
+        f'<span class="sla-ms {cls}">{ms:.2f} ms</span>'
+        f'</div>'
+        f'<div class="sla-track">'
+        f'<div class="sla-fill" style="width:{pct:.1f}%;background:{color}"></div>'
+        f'</div></div>'
     )
 
-st.divider()
+
+def traj_kpi(label: str, value: str, unit: str = "") -> str:
+    unit_html = f'<div class="tk-unit">{unit}</div>' if unit else ""
+    return (
+        f'<div class="traj-kpi">'
+        f'<div class="tk-lbl">{label}</div>'
+        f'<div class="tk-val">{value}</div>'
+        f'{unit_html}</div>'
+    )
+
+
+def cold_stat(label: str, value: str, sub: str = "") -> str:
+    sub_html = f'<div class="cs-sub">{sub}</div>' if sub else ""
+    return (
+        f'<div class="cold-stat">'
+        f'<div class="cs-lbl">{label}</div>'
+        f'<div class="cs-val">{value}</div>'
+        f'{sub_html}</div>'
+    )
+
 
 # ════════════════════════════════════════════════════════════════════════════
-#  SECTION HISTORIQUE — widgets déclarés UNE SEULE FOIS (hors boucle)
+#  NAVBAR — position: fixed via HTML
 # ════════════════════════════════════════════════════════════════════════════
 st.markdown("""
-<div class="card">
-    <div class="card-title">Cold Path · DuckDB → Parquet</div>
-    <div class="card-heading">📍 Trajectoire historique</div>
-    <div class="card-sub">
-        Analyse complète depuis le Data Lake — distance Haversine, vitesses, statut dominant.
+<div class="fs-navbar">
+    <div class="fs-logo">
+        <div class="fs-logo-badge">🛵</div>
+        <span class="fs-logo-name">Fleet<em>Stream</em></span>
+    </div>
+    <div class="fs-nav-right">
+        <span class="fs-pill">Architecture Lambda</span>
+        <span class="fs-pill">Redis · Parquet · DuckDB</span>
+        <a class="fs-btn-live" href="http://localhost:8001/map" target="_blank">
+            🗺️ Carte live
+        </a>
     </div>
 </div>
 """, unsafe_allow_html=True)
 
-ci, ch, cb = st.columns([3, 2, 1])
-with ci:
+
+# ════════════════════════════════════════════════════════════════════════════
+#  SECTION ANALYSE HISTORIQUE
+#  Widgets déclarés UNE SEULE FOIS hors boucle (anti-DuplicateWidgetID)
+# ════════════════════════════════════════════════════════════════════════════
+st.markdown("""
+<div class="fs-sh">
+    <div class="overline">Cold Path · DuckDB → Apache Parquet</div>
+    <div class="heading">Analyse de trajectoire</div>
+    <div class="sub">Historique complet depuis le Data Lake — distance Haversine, vitesses, statut dominant.</div>
+</div>
+""", unsafe_allow_html=True)
+
+# Spotlight search container (CSS override des widgets à l'intérieur)
+st.markdown('<div class="spotlight-container">', unsafe_allow_html=True)
+st.markdown(
+    '<div class="spotlight-header"><span>🔍</span> Rechercher un livreur</div>',
+    unsafe_allow_html=True,
+)
+col_id, col_h, col_btn = st.columns([3, 2, 1])
+with col_id:
     livreur_id = st.text_input(
-        "ID", value="L042", placeholder="ex: L007",
+        "ID", value="L042", placeholder="ex: L007, L042…",
         key="hist_livreur_id", label_visibility="collapsed",
     )
-with ch:
+with col_h:
     heures = st.selectbox(
         "Fenêtre", [1, 2, 4, 8, 24],
         format_func=lambda h: f"Dernière{'s' if h > 1 else ''} {h}h",
         key="hist_heures", label_visibility="collapsed",
     )
-with cb:
-    analyse = st.button("🔍 Analyser", key="hist_btn", use_container_width=True)
+with col_btn:
+    analyse = st.button("⚡ Analyser", key="hist_btn", use_container_width=True)
+st.markdown("</div>", unsafe_allow_html=True)
 
 ph_hist = st.empty()
 
@@ -346,236 +527,277 @@ with ph_hist.container():
         r    = hist["resume"]
         traj = hist.get("trajectory", [])
 
-        # ── KPIs trajectoire ──────────────────────────────────────────────────
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("📌 Points GPS",       f"{r.get('nb_points', 0):,}")
-        k2.metric("📏 Distance",         f"{r.get('distance_totale_km', 0):.2f} km")
-        k3.metric("⚡ Vitesse moyenne",  f"{r.get('vitesse_moy_kmh', 0):.1f} km/h")
-        k4.metric("🏁 Statut dominant",  r.get("statut_dominant", "—").capitalize())
+        # KPIs trajectoire — HTML pur
+        st.markdown(
+            '<div class="traj-kpis">'
+            + traj_kpi("Points GPS",      f"{r.get('nb_points', 0):,}")
+            + traj_kpi("Distance totale", f"{r.get('distance_totale_km', 0):.2f}", "km")
+            + traj_kpi("Vitesse moyenne", f"{r.get('vitesse_moy_kmh', 0):.1f}", "km/h")
+            + traj_kpi("Vitesse max",     f"{r.get('vitesse_max_kmh', 0):.1f}", "km/h")
+            + "</div>",
+            unsafe_allow_html=True,
+        )
 
         if traj:
             df = pd.DataFrame([
                 {
-                    "lat": p["lat"], "lon": p["lon"],
-                    "speed": p.get("speed_kmh") or 0.0,
+                    "lat":    p["lat"],
+                    "lon":    p["lon"],
+                    "speed":  p.get("speed_kmh") or 0.0,
                     "status": p.get("status", "idle"),
-                    "color": STATUS_COLOR_RGB.get(p.get("status", "idle"), [148, 163, 184, 160]),
+                    "color":  STATUS_COLOR_RGB.get(p.get("status", "idle"), [148, 163, 184, 150]),
                 }
                 for p in traj
             ])
             n = len(df)
 
-            # PathLayer — Indigo vibrant avec alpha croissant (début pâle → fin dense)
+            # Segments avec alpha progressif (temporel)
             step = max(1, n // 80)
-            segments = []
+            segs = []
             for i in range(0, n - step, step):
                 alpha = int(60 + 180 * (i / max(n - step, 1)))
-                segments.append({
-                    "path": [
-                        [df.iloc[i]["lon"],           df.iloc[i]["lat"]],
-                        [df.iloc[min(i+step,n-1)]["lon"], df.iloc[min(i+step,n-1)]["lat"]],
-                    ],
-                    "color": [99, 102, 241, alpha],   # #6366F1 Indigo
-                })
+                pt_a = [df.iloc[i]["lon"], df.iloc[i]["lat"]]
+                pt_b = [df.iloc[min(i + step, n - 1)]["lon"],
+                        df.iloc[min(i + step, n - 1)]["lat"]]
+                segs.append({"path": [pt_a, pt_b], "color": [99, 102, 241, alpha]})
 
-            path_layer = pdk.Layer(
-                "PathLayer",
-                data=segments,
-                get_path="path",
-                get_color="color",
-                get_width=4,
-                width_min_pixels=2,
-                width_max_pixels=8,
-                rounded=True,
-                joint_rounded=True,
+            # 3 couches pour l'effet néon (outer glow → inner glow → ligne nette)
+            layer_outer = pdk.Layer(
+                "PathLayer", data=segs,
+                get_path="path", get_color=[120, 80, 255, 20],
+                get_width=18, width_min_pixels=9,
+                rounded=True, joint_rounded=True,
+            )
+            layer_inner = pdk.Layer(
+                "PathLayer", data=segs,
+                get_path="path", get_color=[99, 102, 241, 55],
+                get_width=9, width_min_pixels=5,
+                rounded=True, joint_rounded=True,
+            )
+            layer_path = pdk.Layer(
+                "PathLayer", data=segs,
+                get_path="path", get_color="color",
+                get_width=3, width_min_pixels=2, width_max_pixels=7,
+                rounded=True, joint_rounded=True,
             )
 
-            scatter = pdk.Layer(
-                "ScatterplotLayer",
-                data=df,
+            # Points colorés par statut
+            layer_scatter = pdk.Layer(
+                "ScatterplotLayer", data=df,
                 get_position=["lon", "lat"],
                 get_fill_color="color",
-                get_radius=45,
-                radius_min_pixels=3,
-                radius_max_pixels=10,
-                pickable=True,
-                auto_highlight=True,
+                get_radius=40, radius_min_pixels=2, radius_max_pixels=9,
+                pickable=True, auto_highlight=True,
                 highlight_color=[99, 102, 241, 255],
             )
 
+            # Marqueurs début (vert) / fin (rouge)
             endpoints = pd.DataFrame([
-                {"lon": df.iloc[0]["lon"],   "lat": df.iloc[0]["lat"],
-                 "color": [16, 185, 129, 255], "r": 100},
-                {"lon": df.iloc[-1]["lon"],  "lat": df.iloc[-1]["lat"],
-                 "color": [239, 68, 68, 255],  "r": 100},
+                {"lon": df.iloc[0]["lon"],  "lat": df.iloc[0]["lat"],
+                 "color": [16, 185, 129, 255], "r": 90},
+                {"lon": df.iloc[-1]["lon"], "lat": df.iloc[-1]["lat"],
+                 "color": [239, 68, 68, 255],  "r": 90},
             ])
-            ep_layer = pdk.Layer(
-                "ScatterplotLayer",
-                data=endpoints,
+            layer_ep = pdk.Layer(
+                "ScatterplotLayer", data=endpoints,
                 get_position=["lon", "lat"],
-                get_fill_color="color",
-                get_radius="r",
-                radius_min_pixels=8,
-                radius_max_pixels=18,
-                stroked=True,
-                get_line_color=[255, 255, 255, 220],
+                get_fill_color="color", get_radius="r",
+                radius_min_pixels=8, radius_max_pixels=16,
+                stroked=True, get_line_color=[255, 255, 255, 220],
                 line_width_min_pixels=2,
-                pickable=False,
             )
 
             deck = pdk.Deck(
-                layers=[path_layer, scatter, ep_layer],
+                layers=[layer_outer, layer_inner, layer_path, layer_scatter, layer_ep],
                 initial_view_state=pdk.ViewState(
                     latitude=df["lat"].mean(),
                     longitude=df["lon"].mean(),
-                    zoom=13, pitch=30,
+                    zoom=13, pitch=35,
                 ),
                 tooltip={
                     "html": (
-                        "<div style='font-family:Inter,sans-serif;padding:4px 2px'>"
-                        "<b style='color:#6366F1'>{status}</b><br/>"
-                        "⚡ {speed:.1f} km/h</div>"
+                        "<div style='font-family:Inter,sans-serif;"
+                        "padding:6px 4px;min-width:130px'>"
+                        "<b style='color:#6366F1;font-size:13px'>{status}</b><br/>"
+                        "<span style='color:#64748B;font-size:12px'>⚡ {speed:.1f} km/h</span>"
+                        "</div>"
                     ),
                     "style": {
                         "background": "#FFFFFF",
                         "color": "#0F172A",
                         "fontSize": "12px",
-                        "borderRadius": "8px",
+                        "borderRadius": "10px",
                         "border": "1.5px solid #E2E8F0",
                         "padding": "8px 12px",
-                        "boxShadow": "0 4px 12px rgb(0 0 0/.1)",
+                        "boxShadow": "0 8px 24px rgba(0,0,0,0.1)",
                     },
                 },
-                # Fond clair (contraste avec la carte live dark)
                 map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
             )
 
+            # Map card wrapper
+            st.markdown("""
+            <div class="map-card">
+                <div class="map-card-header">
+                    <span>📍</span>
+                    <span>Trajectoire — CartoDB Positron · pydeck GL</span>
+                </div>
+            """, unsafe_allow_html=True)
             st.pydeck_chart(deck, use_container_width=True)
+            st.markdown("</div>", unsafe_allow_html=True)
 
-            # Légende compacte
-            st.markdown(
-                "<div style='margin-top:.5rem'>"
-                "<span class='legend-item'>"
-                "<span class='legend-dot' style='background:#6366F1'></span>Trajectoire (Indigo)</span>"
-                "<span class='legend-item'>"
-                "<span class='legend-dot' style='background:#FB923C'></span>En livraison</span>"
-                "<span class='legend-item'>"
-                "<span class='legend-dot' style='background:#34D399'></span>Disponible · Départ</span>"
-                "<span class='legend-item'>"
-                "<span class='legend-dot' style='background:#EF4444'></span>Arrivée</span>"
-                "</div>",
-                unsafe_allow_html=True,
-            )
+            # Légende
+            st.markdown("""
+            <div class="traj-legend">
+                <div class="tl-item"><div class="tl-line"></div> Trajectoire (néon Indigo)</div>
+                <div class="tl-item"><div class="tl-dot" style="background:#FB923C"></div> En livraison</div>
+                <div class="tl-item"><div class="tl-dot" style="background:#34D399"></div> Disponible · Départ</div>
+                <div class="tl-item"><div class="tl-dot" style="background:#EF4444"></div> Arrivée</div>
+                <div class="tl-item"><div class="tl-dot" style="background:#94A3B8"></div> Inactif</div>
+            </div>
+            """, unsafe_allow_html=True)
 
     elif "detail" in hist:
         st.info(f"ℹ️ {hist['detail']}")
     else:
+        st.markdown("""
+        <div class="empty-state">
+            <div class="es-icon">📡</div>
+            <div class="es-text">
+                Saisir un identifiant livreur (ex. <strong>L042</strong>)<br/>
+                et cliquer sur <strong>⚡ Analyser</strong>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  PLACEHOLDERS auto-refresh (créés une fois, mis à jour en boucle)
+# ════════════════════════════════════════════════════════════════════════════
+ph_bento = st.empty()
+ph_sla   = st.empty()
+ph_cold  = st.empty()
+ph_ts    = st.empty()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  BOUCLE — met à jour uniquement les placeholders
+# ════════════════════════════════════════════════════════════════════════════
+while True:
+    stats = fetch("/stats")
+    hp    = stats.get("hot_path", {})
+    cp    = stats.get("cold_path", {})
+    cts   = hp.get("statuts", {})
+
+    # ── Bento Grid ────────────────────────────────────────────────────────────
+    with ph_bento.container():
+        n_msgs = hp.get("messages_traites", 0)
+        st.markdown("""
+        <div class="fs-sh" style="margin-top:24px">
+            <div class="overline">Hot Path · Redis GEOSEARCH</div>
+            <div class="heading">Métriques temps réel</div>
+        </div>
+        """, unsafe_allow_html=True)
         st.markdown(
-            "<div style='text-align:center;padding:2.5rem 1rem;"
-            "color:#94A3B8;font-size:13px;background:#FAFAFA;"
-            "border-radius:12px;border:1.5px dashed #E2E8F0'>"
-            "Saisir un identifiant livreur et cliquer sur <strong>Analyser</strong>"
-            "</div>",
+            '<div class="bento-grid">'
+            + bento("indigo",  "🛵", "Livreurs actifs",
+                    str(hp.get("livreurs_actifs", 0)),
+                    "Redis TTL 30s", "🛵")
+            + bento("sky",     "📨", "Messages GPS",
+                    f"{n_msgs:,}" if isinstance(n_msgs, int) else "—",
+                    "Redpanda → Hot path", "📡")
+            + bento("amber",   "📦", "En livraison",
+                    str(cts.get("delivering", 0)),
+                    "Statut delivering", "🚀")
+            + bento("emerald", "✅", "Disponibles",
+                    str(cts.get("available", 0)),
+                    "Statut available", "✓")
+            + bento("slate",   "💤", "Inactifs",
+                    str(cts.get("idle", 0)),
+                    "Statut idle", "⏸")
+            + "</div>",
             unsafe_allow_html=True,
         )
 
-st.divider()
-
-# ════════════════════════════════════════════════════════════════════════════
-#  PLACEHOLDERS auto-refresh (créés une fois, mis à jour sans recréer)
-# ════════════════════════════════════════════════════════════════════════════
-ph_kpis = st.empty()
-ph_sla  = st.empty()
-ph_cold = st.empty()
-ph_ts   = st.empty()
-
-# ════════════════════════════════════════════════════════════════════════════
-#  BOUCLE — met à jour les placeholders UNIQUEMENT
-# ════════════════════════════════════════════════════════════════════════════
-while True:
-    stats     = fetch("/stats")
-    hp        = stats.get("hot_path", {})
-    cp        = stats.get("cold_path", {})
-    cts       = hp.get("statuts", {})
-
-    # ── KPIs ─────────────────────────────────────────────────────────────────
-    with ph_kpis.container():
-        st.markdown("""
-        <div class="card">
-            <div class="card-title">Hot Path · Redis GEOSEARCH</div>
-            <div class="card-heading">⚡ Métriques temps réel</div>
-        </div>
-        """, unsafe_allow_html=True)
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("🛵 Livreurs actifs",  hp.get("livreurs_actifs", "—"))
-        c2.metric("📨 Messages GPS",     f"{hp.get('messages_traites', 0):,}")
-        c3.metric("🟠 En livraison",     cts.get("delivering", 0))
-        c4.metric("🟢 Disponibles",      cts.get("available",  0))
-        c5.metric("⚫ Inactifs",         cts.get("idle",        0))
-
-    # ── SLA ──────────────────────────────────────────────────────────────────
+    # ── SLA GEOSEARCH ─────────────────────────────────────────────────────────
     perf  = fetch("/health/performance", {"samples": 100})
     bench = perf.get("geosearch_benchmark", {})
     rinfo = perf.get("redis_info", {})
+    p99   = bench.get("p99_ms")
+    sla_ok = p99 is not None and p99 < 10
 
     with ph_sla.container():
-        p99 = bench.get("p99_ms")
-        sla_ok = p99 is not None and p99 < 10
-        badge_html = (
-            "<span style='background:#D1FAE5;color:#065F46;"
-            "padding:3px 10px;border-radius:999px;font-size:11px;"
-            "font-weight:700;margin-left:10px'>✅ SLA OK</span>"
+        badge = (
+            '<span class="sla-badge-ok">✅ SLA OK — p99 &lt; 10 ms</span>'
             if sla_ok else
-            "<span style='background:#FEF3C7;color:#92400E;"
-            "padding:3px 10px;border-radius:999px;font-size:11px;"
-            "font-weight:700;margin-left:10px'>⚠️ SLA KO</span>"
+            '<span class="sla-badge-ko">⚠️ SLA KO</span>'
         )
-        st.markdown(f"""
-        <div class="card">
-            <div class="card-title">Performance · Redis</div>
-            <div class="card-heading">📊 SLA GEOSEARCH{badge_html}</div>
-            <div class="card-sub">Cible : p99 &lt; 10 ms — Redis Stack 7.2</div>
-        </div>
-        """, unsafe_allow_html=True)
+        bars = (
+            sla_row("P50", bench.get("p50_ms")) +
+            sla_row("P95", bench.get("p95_ms")) +
+            sla_row("P99", bench.get("p99_ms")) +
+            sla_row("Max", bench.get("max_ms"), target=15)
+        ) if bench else "<p style='color:#94A3B8;font-size:13px;padding:4px 0'>Chargement…</p>"
 
-        if bench:
-            bars_html = (
-                sla_bar("P50", bench.get("p50_ms")) +
-                sla_bar("P95", bench.get("p95_ms")) +
-                sla_bar("P99", bench.get("p99_ms")) +
-                sla_bar("Max", bench.get("max_ms"), target=15)
+        redis_extra = ""
+        if rinfo:
+            redis_extra = (
+                "<div style='display:flex;gap:20px;margin-top:14px;padding-top:14px;"
+                "border-top:1px solid #F1F5F9;flex-wrap:wrap'>"
+                + "".join(
+                    f"<div style='font-size:12px;color:#64748B'>"
+                    f"<span style='font-weight:700;color:#0F172A'>{v}</span>"
+                    f"<span style='margin-left:4px'>{lbl}</span></div>"
+                    for lbl, v in [
+                        ("version",  rinfo.get("version", "—")),
+                        ("mémoire",  rinfo.get("used_memory_human", "—")),
+                        ("ops/sec",  rinfo.get("ops_per_sec", "—")),
+                        ("clients",  rinfo.get("connected_clients", "—")),
+                    ]
+                )
+                + "</div>"
             )
-            left_col, right_col = st.columns([2, 1])
-            with left_col:
-                st.markdown(bars_html, unsafe_allow_html=True)
-            with right_col:
-                if rinfo:
-                    with st.expander("🔧 Redis INFO"):
-                        r1, r2 = st.columns(2)
-                        r1.metric("Version",   rinfo.get("version", "—"))
-                        r2.metric("Mémoire",   rinfo.get("used_memory_human", "—"))
-                        r1.metric("Ops/sec",   rinfo.get("ops_per_sec", "—"))
-                        r2.metric("Clients",   rinfo.get("connected_clients", "—"))
 
-    # ── Cold Path ─────────────────────────────────────────────────────────────
+        st.markdown(
+            f'<div class="sla-card">'
+            f'<div class="sla-card-header">'
+            f'<span class="sla-card-title">📊 SLA GEOSEARCH</span>'
+            f'{badge}'
+            f'<span style="font-size:11px;color:#94A3B8;margin-left:auto">Redis Stack 7.2</span>'
+            f'</div>'
+            f'{bars}{redis_extra}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── Cold Path Card ────────────────────────────────────────────────────────
     with ph_cold.container():
-        st.markdown("""
-        <div class="card">
-            <div class="card-title">Batch Layer · Parquet</div>
-            <div class="card-heading">🗄️ Data Lake</div>
-        </div>
-        """, unsafe_allow_html=True)
-        cc1, cc2, cc3, cc4 = st.columns(4)
-        cc1.metric("Fichiers Parquet",  cp.get("fichiers_parquet", 0))
-        cc2.metric("Taille totale",     f"{cp.get('taille_totale_mb', 0):.1f} MB")
-        cc3.metric("Compression",       "Snappy")
-        cc4.metric("Partitionnement",   "Hive y/m/d/h")
+        nb_files = cp.get("fichiers_parquet", 0)
+        taille   = cp.get("taille_totale_mb", 0)
+        st.markdown(
+            '<div class="cold-card">'
+            '<div class="cold-card-header">'
+            '<span style="font-size:18px">🗄️</span>'
+            '<span class="cold-card-title">Batch Layer · Apache Parquet</span>'
+            '</div>'
+            '<div class="cold-grid">'
+            + cold_stat("Fichiers Parquet", str(nb_files),       "Snappy compression")
+            + cold_stat("Taille totale",    f"{taille:.1f} MB",  "Data Lake local")
+            + cold_stat("Compression",      "Snappy",            "Ratio ~3×")
+            + cold_stat("Partitionnement",  "Hive",              "year/month/day/hour")
+            + "</div></div>",
+            unsafe_allow_html=True,
+        )
 
-    # ── Timestamp ────────────────────────────────────────────────────────────
+    # ── Footer timestamp ──────────────────────────────────────────────────────
     with ph_ts.container():
-        st.caption(
-            f"Dernière actualisation : {datetime.now().strftime('%H:%M:%S')} "
-            f"· Refresh toutes les {REFRESH_SECONDS} s"
+        st.markdown(
+            f'<div class="fs-footer">'
+            f'<span class="live-dot"></span>'
+            f'Mis à jour le {datetime.now().strftime("%d/%m/%Y à %H:%M:%S")}'
+            f' · Refresh toutes les {REFRESH_SECONDS} s'
+            f'</div>',
+            unsafe_allow_html=True,
         )
 
     time.sleep(REFRESH_SECONDS)
