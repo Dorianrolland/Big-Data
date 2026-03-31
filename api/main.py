@@ -317,7 +317,7 @@ async def history(
         rows = conn.execute(
             f"""
             SELECT lat, lon, speed_kmh, heading_deg, status, ts
-            FROM   read_parquet('{glob}', hive_partitioning := true)
+            FROM   read_parquet('{glob}', hive_partitioning = true)
             WHERE  livreur_id = ?
               AND  ts >= NOW() - INTERVAL (CAST(? AS INTEGER)) HOUR
             ORDER BY ts
@@ -339,7 +339,7 @@ async def history(
                 SELECT lat, lon,
                        LAG(lat) OVER (ORDER BY ts) AS prev_lat,
                        LAG(lon) OVER (ORDER BY ts) AS prev_lon
-                FROM   read_parquet('{glob}', hive_partitioning := true)
+                FROM   read_parquet('{glob}', hive_partitioning = true)
                 WHERE  livreur_id = ?
                   AND  ts >= NOW() - INTERVAL (CAST(? AS INTEGER)) HOUR
             )
@@ -413,7 +413,7 @@ async def heatmap(
                 ROUND(lon / ?, 0) * ?  AS lon_cell,
                 COUNT(*)               AS nb_passages,
                 AVG(speed_kmh)         AS avg_speed
-            FROM   read_parquet('{glob}', hive_partitioning := true)
+            FROM   read_parquet('{glob}', hive_partitioning = true)
             WHERE  ts >= NOW() - INTERVAL (CAST(? AS INTEGER)) HOUR
             GROUP  BY lat_cell, lon_cell
             ORDER  BY nb_passages DESC
