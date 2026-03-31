@@ -150,7 +150,7 @@ services:
     restart: unless-stopped
 
   # ────────────────────────────────────────────────────────────────────────────
-  # API — Serving Layer (Hot Path Redis + Cold Path DuckDB)
+  # API — Serving Layer (Hot Path Redis + Cold Path DuckDB + Prometheus /metrics)
   # ────────────────────────────────────────────────────────────────────────────
   api:
     build:
@@ -169,6 +169,80 @@ services:
       - "8001:8000"
     restart: unless-stopped
 
+  # ────────────────────────────────────────────────────────────────────────────
+  # Dashboard — Streamlit live map (pydeck + auto-refresh 2s)
+  # ────────────────────────────────────────────────────────────────────────────
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: fleetstream-dashboard
+    depends_on:
+      - api
+    environment:
+      API_URL: http://api:8000
+      REFRESH_SECONDS: "2"
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # RedisInsight — GUI Redis (visualisation des clés GEO et hashes)
+  # ────────────────────────────────────────────────────────────────────────────
+  redisinsight:
+    image: redis/redisinsight:latest
+    container_name: fleetstream-redisinsight
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "5540:5540"
+    volumes:
+      - redisinsight_data:/data
+    restart: unless-stopped
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Prometheus — Scrape API (/metrics) + Redpanda (port 9644)
+  # ────────────────────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    container_name: fleetstream-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Grafana — Dashboard auto-provisionné (datasource + dashboard JSON)
+  # ────────────────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: fleetstream-grafana
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: fleetstream
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/fleetstream.json
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
 volumes:
   redpanda_data:
   redis_data:
+  redisinsight_data:
+  prometheus_data:
+  grafana_data:

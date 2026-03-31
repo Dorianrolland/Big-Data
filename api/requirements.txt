@@ -4,3 +4,5 @@ redis[asyncio]==5.0.8
 duckdb==0.10.3
 python-dotenv==1.0.1
 pydantic==2.7.1
+prometheus-fastapi-instrumentator==6.1.0
+prometheus-client==0.20.0
