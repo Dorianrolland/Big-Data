@@ -377,6 +377,118 @@ button[kind="header"] { display: none !important; }
     50% { opacity: 0.4; transform: scale(0.7); }
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   BUSINESS INTELLIGENCE
+═══════════════════════════════════════════════════════════════════════════ */
+.bi-card {
+    background: #FFFFFF; border-radius: 20px;
+    border: 1px solid rgba(226,232,240,0.7);
+    box-shadow: 0 10px 15px -3px rgba(0,0,0,0.06);
+    padding: 22px 26px; margin-bottom: 22px;
+}
+.bi-card-header {
+    display: flex; align-items: center; gap: 10px; margin-bottom: 18px;
+}
+.bi-card-title { font-size: 14px; font-weight: 800; color: #0F172A; }
+
+/* Health score ring */
+.health-ring {
+    display: flex; align-items: center; gap: 28px; margin-bottom: 18px;
+}
+.health-score-circle {
+    width: 90px; height: 90px; border-radius: 50%;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    font-size: 2rem; font-weight: 900; line-height: 1;
+    border: 5px solid; flex-shrink: 0;
+}
+.hs-excellent { border-color: #10B981; color: #10B981; background: rgba(16,185,129,0.08); }
+.hs-bon       { border-color: #3B82F6; color: #3B82F6; background: rgba(59,130,246,0.08); }
+.hs-attention { border-color: #F59E0B; color: #F59E0B; background: rgba(245,158,11,0.08); }
+.hs-critique  { border-color: #EF4444; color: #EF4444; background: rgba(239,68,68,0.08); }
+.health-score-sub { font-size: 10px; font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; margin-top: 2px; }
+
+/* KPI row */
+.bi-kpi-row { display: grid; grid-template-columns: repeat(3,1fr); gap: 12px; }
+.bi-kpi {
+    background: #F8FAFC; border-radius: 14px; padding: 14px 16px;
+    border: 1px solid rgba(226,232,240,0.9);
+}
+.bi-kpi-lbl { font-size: 10px; font-weight: 700; color: #94A3B8; text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 5px; }
+.bi-kpi-val { font-size: 1.5rem; font-weight: 800; color: #0F172A; letter-spacing: -0.5px; }
+.bi-kpi-sub { font-size: 11px; color: #64748B; margin-top: 3px; }
+
+/* Driver score */
+.grade-badge {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 52px; height: 52px; border-radius: 14px;
+    font-size: 1.6rem; font-weight: 900; flex-shrink: 0;
+}
+.grade-A { background: #DCFCE7; color: #166534; }
+.grade-B { background: #DBEAFE; color: #1E40AF; }
+.grade-C { background: #FEF9C3; color: #854D0E; }
+.grade-D { background: #FED7AA; color: #9A3412; }
+.grade-E { background: #FEE2E2; color: #991B1B; }
+
+.score-bar-track {
+    height: 8px; background: #F1F5F9; border-radius: 999px;
+    overflow: hidden; margin-top: 6px;
+}
+.score-bar-fill { height: 100%; border-radius: 999px; transition: width .8s cubic-bezier(.4,0,.2,1); }
+
+.score-detail-grid { display: grid; grid-template-columns: repeat(2,1fr); gap: 10px; margin-top: 14px; }
+.score-detail-item {
+    background: #F8FAFC; border-radius: 12px; padding: 12px 14px;
+    border: 1px solid rgba(226,232,240,0.9);
+}
+.sd-lbl { font-size: 10px; font-weight: 700; color: #94A3B8; text-transform: uppercase; letter-spacing: 0.7px; }
+.sd-pts { font-size: 1.1rem; font-weight: 800; color: #0F172A; }
+.sd-detail { font-size: 11px; color: #64748B; margin-top: 2px; }
+
+/* Anomalies */
+.anomaly-item {
+    border-radius: 12px; padding: 14px 16px; margin-bottom: 10px;
+    border-left: 4px solid;
+}
+.anomaly-critique { background: #FEF2F2; border-color: #EF4444; }
+.anomaly-warning  { background: #FFFBEB; border-color: #F59E0B; }
+.anomaly-header { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.anomaly-id { font-size: 13px; font-weight: 800; color: #0F172A; }
+.anomaly-badge {
+    font-size: 9px; font-weight: 800; letter-spacing: 0.3px;
+    border-radius: 20px; padding: 2px 8px; text-transform: uppercase;
+}
+.ab-critique { background: #FEE2E2; color: #991B1B; }
+.ab-warning  { background: #FEF3C7; color: #92400E; }
+.anomaly-type { font-size: 11px; font-weight: 700; color: #475569; margin-bottom: 2px; }
+.anomaly-detail { font-size: 11px; color: #64748B; }
+.anomaly-risque { font-size: 10.5px; color: #94A3B8; margin-top: 3px; font-style: italic; }
+
+/* Zone coverage */
+.zone-grid-bi { display: grid; grid-template-columns: repeat(2,1fr); gap: 14px; margin-top: 4px; }
+.zone-col-title {
+    font-size: 11px; font-weight: 800; letter-spacing: 0.5px;
+    text-transform: uppercase; margin-bottom: 10px; padding: 5px 10px;
+    border-radius: 8px;
+}
+.zone-col-under { background: #FEF2F2; color: #991B1B; }
+.zone-col-over  { background: #DCFCE7; color: #166534; }
+.zone-item {
+    background: #F8FAFC; border-radius: 10px; padding: 10px 12px;
+    margin-bottom: 7px; border: 1px solid rgba(226,232,240,0.9);
+    font-size: 11px;
+}
+.zi-coords { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #64748B; }
+.zi-stat { font-weight: 700; color: #0F172A; margin-top: 3px; }
+.zi-gap  { font-size: 10px; color: #94A3B8; margin-top: 2px; }
+
+.reco-item {
+    background: #F0FDF4; border: 1px solid #BBF7D0; border-radius: 10px;
+    padding: 10px 14px; margin-bottom: 8px;
+    font-size: 12px; color: #166534; line-height: 1.5;
+}
+.reco-item.warn { background: #FFFBEB; border-color: #FDE68A; color: #92400E; }
+.reco-item.ok   { background: #F0FDF4; border-color: #BBF7D0; color: #166534; }
+
 /* ─── Divers Streamlit → invisible ───────────────────────────────────────── */
 [data-testid="stDivider"] { display: none !important; }
 .stDeckGlJsonChart { width: 100% !important; }
@@ -672,6 +784,55 @@ with ph_hist.container():
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  SECTION BUSINESS INTELLIGENCE
+#  Widgets déclarés UNE SEULE FOIS hors boucle
+# ════════════════════════════════════════════════════════════════════════════
+st.markdown("""
+<div class="fs-sh" style="margin-top:32px">
+    <div class="overline">Business Intelligence · DuckDB Analytics</div>
+    <div class="heading">Performance & Santé de la Flotte</div>
+    <div class="sub">
+        Indicateurs opérationnels temps réel, score de performance livreur,
+        couverture territoriale et détection d'anomalies comportementales.
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+# ── Driver Score — widget de recherche ──────────────────────────────────────
+st.markdown("""
+<div class="spotlight-container">
+    <div class="spotlight-header"><span>🏆</span> Score de performance — Analyse individuelle</div>
+""", unsafe_allow_html=True)
+col_ds_id, col_ds_h, col_ds_btn = st.columns([3, 2, 1])
+with col_ds_id:
+    ds_livreur_id = st.text_input(
+        "DS ID", value="L042", placeholder="ex: L007, L042…",
+        key="ds_livreur_id", label_visibility="collapsed",
+    )
+with col_ds_h:
+    ds_heures = st.selectbox(
+        "DS Fenêtre", [1, 2, 4, 8, 24],
+        format_func=lambda h: f"Dernière{'s' if h > 1 else ''} {h}h",
+        key="ds_heures", label_visibility="collapsed",
+    )
+with col_ds_btn:
+    ds_analyse = st.button("🏆 Scorer", key="ds_btn", use_container_width=True)
+st.markdown("</div>", unsafe_allow_html=True)
+
+if ds_analyse:
+    st.session_state.last_ds = fetch(
+        f"/analytics/driver-score/{ds_livreur_id}",
+        {"heures": ds_heures},
+    )
+
+ph_driver_score = st.empty()
+
+# ── Placeholders BI auto-refresh ─────────────────────────────────────────────
+ph_insights  = st.empty()
+ph_anomalies = st.empty()
+ph_zones     = st.empty()
+
+# ════════════════════════════════════════════════════════════════════════════
 #  PLACEHOLDERS auto-refresh (créés une fois, mis à jour en boucle)
 # ════════════════════════════════════════════════════════════════════════════
 ph_bento = st.empty()
@@ -788,6 +949,234 @@ while True:
             + "</div></div>",
             unsafe_allow_html=True,
         )
+
+    # ── Driver Score (résultat statique mis à jour sur clic) ─────────────────
+    ds = st.session_state.get("last_ds", {})
+    with ph_driver_score.container():
+        if ds and "score_global" in ds:
+            grade = ds.get("grade", "?")
+            score = ds.get("score_global", 0)
+            interp = ds.get("interpretation", "")
+            det = ds.get("details_score", {})
+            met = ds.get("metriques", {})
+            score_color = (
+                "#10B981" if grade == "A" else
+                "#3B82F6" if grade == "B" else
+                "#F59E0B" if grade == "C" else
+                "#EF4444"
+            )
+            prod = det.get("productivite", {}); sec = det.get("securite", {})
+            fid  = det.get("fiabilite", {});   act = det.get("activite", {})
+            st.markdown(
+                f'<div class="bi-card">'
+                f'<div class="bi-card-header">'
+                f'<span style="font-size:18px">🏆</span>'
+                f'<span class="bi-card-title">Score Livreur — {ds.get("livreur_id","?")} '
+                f'· {ds.get("periode_heures","?")}h</span>'
+                f'</div>'
+                f'<div class="health-ring">'
+                f'<div class="grade-badge grade-{grade}">{grade}</div>'
+                f'<div style="flex:1">'
+                f'<div style="font-size:2.2rem;font-weight:900;color:{score_color};line-height:1">{score}<span style="font-size:1rem;color:#94A3B8;font-weight:600">/100</span></div>'
+                f'<div style="font-size:12px;color:#475569;margin-top:4px">{interp}</div>'
+                f'<div class="score-bar-track" style="margin-top:10px">'
+                f'<div class="score-bar-fill" style="width:{score}%;background:{score_color}"></div>'
+                f'</div>'
+                f'</div>'
+                f'</div>'
+                f'<div class="score-detail-grid">'
+                f'<div class="score-detail-item"><div class="sd-lbl">🚀 Productivité</div>'
+                f'<div class="sd-pts">{prod.get("points","?")} <span style="font-size:11px;color:#94A3B8">/ {prod.get("max",40)} pts</span></div>'
+                f'<div class="sd-detail">{prod.get("detail","")}</div></div>'
+                f'<div class="score-detail-item"><div class="sd-lbl">🛡️ Sécurité</div>'
+                f'<div class="sd-pts">{sec.get("points","?")} <span style="font-size:11px;color:#94A3B8">/ {sec.get("max",30)} pts</span></div>'
+                f'<div class="sd-detail">{sec.get("detail","")}</div></div>'
+                f'<div class="score-detail-item"><div class="sd-lbl">🎯 Fiabilité</div>'
+                f'<div class="sd-pts">{fid.get("points","?")} <span style="font-size:11px;color:#94A3B8">/ {fid.get("max",20)} pts</span></div>'
+                f'<div class="sd-detail">{fid.get("detail","")}</div></div>'
+                f'<div class="score-detail-item"><div class="sd-lbl">⚡ Activité</div>'
+                f'<div class="sd-pts">{act.get("points","?")} <span style="font-size:11px;color:#94A3B8">/ {act.get("max",10)} pts</span></div>'
+                f'<div class="sd-detail">{act.get("detail","")}</div></div>'
+                f'</div>'
+                f'<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:14px">'
+                f'<div class="bi-kpi"><div class="bi-kpi-lbl">Distance</div>'
+                f'<div class="bi-kpi-val">{met.get("distance_parcourue_km","—")} <span style="font-size:11px;color:#94A3B8">km</span></div></div>'
+                f'<div class="bi-kpi"><div class="bi-kpi-lbl">Vitesse moy.</div>'
+                f'<div class="bi-kpi-val">{met.get("vitesse_moyenne_kmh","—")} <span style="font-size:11px;color:#94A3B8">km/h</span></div></div>'
+                f'<div class="bi-kpi"><div class="bi-kpi-lbl">Taux livraison</div>'
+                f'<div class="bi-kpi-val">{met.get("taux_livraison_pct","—")} <span style="font-size:11px;color:#94A3B8">%</span></div></div>'
+                f'</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        elif "detail" in ds:
+            st.info(f"ℹ️ {ds['detail']}")
+
+    # ── Fleet Insights (auto-refresh) ─────────────────────────────────────────
+    insights = fetch("/analytics/fleet-insights")
+    with ph_insights.container():
+        if insights and "sante_operationnelle" in insights:
+            sante = insights.get("sante_operationnelle", {})
+            score_s = sante.get("score", 0)
+            niveau  = sante.get("niveau", "bon")
+            hs_cls  = f"hs-{niveau}"
+            fleet   = insights.get("flotte_temps_reel", {})
+            prod_h  = insights.get("productivite_historique", {})
+            alertes = insights.get("alertes", {})
+            recos   = insights.get("recommandations", [])
+
+            suspects_html = ""
+            for s in alertes.get("detail_suspects", [])[:3]:
+                suspects_html += (
+                    f'<div style="font-size:11px;color:#991B1B;padding:4px 8px;'
+                    f'background:#FEE2E2;border-radius:7px;margin-bottom:4px">'
+                    f'⚠️ <b>{s.get("livreur_id")}</b> · {s.get("speed_kmh")} km/h · {s.get("status")}'
+                    f'</div>'
+                )
+
+            reco_html = "".join(
+                f'<div class="reco-item {"ok" if "nominale" in r else "warn"}">'
+                f'{"✅" if "nominale" in r else "⚠️"} {r}</div>'
+                for r in recos
+            )
+
+            st.markdown(
+                f'<div class="bi-card">'
+                f'<div class="bi-card-header">'
+                f'<span style="font-size:18px">📊</span>'
+                f'<span class="bi-card-title">Santé Opérationnelle · Temps Réel</span>'
+                f'<span style="margin-left:auto;font-size:10px;color:#94A3B8">'
+                f'Fenêtre {insights.get("periode_heures","?")}h</span>'
+                f'</div>'
+                f'<div class="health-ring">'
+                f'<div class="health-score-circle {hs_cls}">'
+                f'{score_s}<div class="health-score-sub">{niveau}</div>'
+                f'</div>'
+                f'<div style="flex:1">'
+                f'<div class="bi-kpi-row">'
+                f'<div class="bi-kpi"><div class="bi-kpi-lbl">Utilisation</div>'
+                f'<div class="bi-kpi-val">{fleet.get("taux_utilisation_pct","—")}<span style="font-size:11px;color:#94A3B8"> %</span></div>'
+                f'<div class="bi-kpi-sub">delivering / total</div></div>'
+                f'<div class="bi-kpi"><div class="bi-kpi-lbl">Disponibles</div>'
+                f'<div class="bi-kpi-val">{fleet.get("taux_disponibilite_pct","—")}<span style="font-size:11px;color:#94A3B8"> %</span></div>'
+                f'<div class="bi-kpi-sub">prêts à livrer</div></div>'
+                f'<div class="bi-kpi"><div class="bi-kpi-lbl">Vitesse moy.</div>'
+                f'<div class="bi-kpi-val">{prod_h.get("vitesse_moyenne_kmh","—")}<span style="font-size:11px;color:#94A3B8"> km/h</span></div>'
+                f'<div class="bi-kpi-sub">flotte complète</div></div>'
+                f'</div></div></div>'
+                + (f'<div style="margin-bottom:12px">'
+                   f'<div style="font-size:11px;font-weight:700;color:#EF4444;margin-bottom:6px">'
+                   f'🚨 {alertes.get("livreurs_immobiles_en_livraison",0)} livreur(s) suspect(s)</div>'
+                   f'{suspects_html}</div>' if alertes.get("livreurs_immobiles_en_livraison", 0) > 0 else "")
+                + reco_html
+                + f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    # ── Anomalies (auto-refresh) ──────────────────────────────────────────────
+    anomalies_data = fetch("/analytics/anomalies", {"fenetre_minutes": 10})
+    with ph_anomalies.container():
+        if anomalies_data:
+            resume = anomalies_data.get("resume", {})
+            anom_list = anomalies_data.get("anomalies", [])
+            nb_crit = resume.get("critiques", 0)
+            nb_warn = resume.get("warnings", 0)
+
+            anomalies_html = ""
+            if anom_list:
+                for a in anom_list[:6]:
+                    niv = a.get("niveau", "warning")
+                    cls = f"anomaly-{niv}"
+                    badge_cls = f"ab-{niv}"
+                    types_html = "".join(
+                        f'<div class="anomaly-type">▸ {t.get("type","")}</div>'
+                        f'<div class="anomaly-detail">{t.get("detail","")}</div>'
+                        f'<div class="anomaly-risque">{t.get("risque","")}</div>'
+                        for t in a.get("anomalies", [])
+                    )
+                    anomalies_html += (
+                        f'<div class="anomaly-item {cls}">'
+                        f'<div class="anomaly-header">'
+                        f'<span class="anomaly-id">{a.get("livreur_id","?")}</span>'
+                        f'<span class="anomaly-badge {badge_cls}">{niv.upper()}</span>'
+                        f'<span style="margin-left:auto;font-size:11px;color:#94A3B8">'
+                        f'z={a.get("z_score","?")} · {a.get("vitesse_max_kmh","?")} km/h max</span>'
+                        f'</div>{types_html}</div>'
+                    )
+            else:
+                anomalies_html = (
+                    '<div class="reco-item ok">✅ Aucune anomalie comportementale '
+                    f'détectée sur les {anomalies_data.get("fenetre_minutes",10)} dernières minutes '
+                    f'({resume.get("livreurs_scannes",0)} livreurs analysés).</div>'
+                )
+
+            header_color = "#EF4444" if nb_crit > 0 else "#F59E0B" if nb_warn > 0 else "#10B981"
+            st.markdown(
+                f'<div class="bi-card">'
+                f'<div class="bi-card-header">'
+                f'<span style="font-size:18px">🔬</span>'
+                f'<span class="bi-card-title">Détection d\'Anomalies · ML</span>'
+                f'<span style="margin-left:auto;font-size:10px;color:{header_color};font-weight:700">'
+                f'{len(anom_list)} anomalie(s) · {resume.get("livreurs_scannes",0)} livreurs scannés</span>'
+                f'</div>'
+                f'{anomalies_html}'
+                f'<div style="font-size:10px;color:#94A3B8;margin-top:10px;font-style:italic">'
+                f'Méthode : {anomalies_data.get("methodologie","")}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    # ── Zone Coverage (auto-refresh) ──────────────────────────────────────────
+    zones_data = fetch("/analytics/zone-coverage")
+    with ph_zones.container():
+        if zones_data and "alertes_dispatch" in zones_data:
+            res = zones_data.get("resume", {})
+            alertes_z = zones_data.get("alertes_dispatch", {})
+            sous = alertes_z.get("zones_prioritaires", [])
+            sur  = alertes_z.get("zones_saturees", [])
+
+            def zone_item(z):
+                return (
+                    f'<div class="zone-item">'
+                    f'<div class="zi-coords">lat {z.get("lat","?")} · lon {z.get("lon","?")}</div>'
+                    f'<div class="zi-stat">{z.get("livreurs_actifs",0)} livreur(s) · '
+                    f'{z.get("passages_historiques",0):,} passages hist.</div>'
+                    f'<div class="zi-gap">Écart : {z.get("ecart_couverture","?")}</div>'
+                    f'</div>'
+                )
+
+            sous_html = "".join(zone_item(z) for z in sous) or '<div style="font-size:12px;color:#94A3B8;padding:8px">Aucune</div>'
+            sur_html  = "".join(zone_item(z) for z in sur)  or '<div style="font-size:12px;color:#94A3B8;padding:8px">Aucune</div>'
+
+            st.markdown(
+                f'<div class="bi-card">'
+                f'<div class="bi-card-header">'
+                f'<span style="font-size:18px">🗺️</span>'
+                f'<span class="bi-card-title">Couverture Territoriale · Dispatch</span>'
+                f'<span style="margin-left:auto;font-size:10px;color:#94A3B8">'
+                f'{zones_data.get("nb_zones_analysees",0)} zones analysées</span>'
+                f'</div>'
+                f'<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:16px">'
+                f'<div class="bi-kpi"><div class="bi-kpi-lbl">🔴 Sous-couvertes</div>'
+                f'<div class="bi-kpi-val" style="color:#EF4444">{res.get("zones_sous_couvertes",0)}</div>'
+                f'<div class="bi-kpi-sub">priorité dispatch</div></div>'
+                f'<div class="bi-kpi"><div class="bi-kpi-lbl">✅ Équilibrées</div>'
+                f'<div class="bi-kpi-val" style="color:#10B981">{res.get("zones_equilibrees",0)}</div>'
+                f'<div class="bi-kpi-sub">couverture nominale</div></div>'
+                f'<div class="bi-kpi"><div class="bi-kpi-lbl">🟢 Sur-couvertes</div>'
+                f'<div class="bi-kpi-val" style="color:#3B82F6">{res.get("zones_sur_couvertes",0)}</div>'
+                f'<div class="bi-kpi-sub">redéploiement possible</div></div>'
+                f'</div>'
+                f'<div class="zone-grid-bi">'
+                f'<div>'
+                f'<div class="zone-col-title zone-col-under">🔴 Zones à couvrir en priorité</div>'
+                f'{sous_html}</div>'
+                f'<div>'
+                f'<div class="zone-col-title zone-col-over">🟢 Zones sur-dotées (redéployer)</div>'
+                f'{sur_html}</div>'
+                f'</div></div>',
+                unsafe_allow_html=True,
+            )
 
     # ── Footer timestamp ──────────────────────────────────────────────────────
     with ph_ts.container():
