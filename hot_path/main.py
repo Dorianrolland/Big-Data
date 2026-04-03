@@ -67,6 +67,7 @@ async def flush_to_redis(r: aioredis.Redis, batch: list[dict]) -> None:
                 "heading_deg": msg.get("heading_deg", 0),
                 "status":      msg.get("status", "unknown"),
                 "accuracy_m":  msg.get("accuracy_m", 0),
+                "battery_pct": msg.get("battery_pct", 0),
                 "ts":          msg.get("timestamp", ""),
             },
         )

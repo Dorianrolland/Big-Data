@@ -71,6 +71,7 @@ class Livreur:
     heading_deg: float
     status: str
     accuracy_m: float
+    battery_pct: float
     _status_ttl: float  # secondes avant prochain changement de statut
 
     @classmethod
@@ -90,6 +91,7 @@ class Livreur:
             heading_deg=random.uniform(0, 360),
             status=status,
             accuracy_m=round(random.uniform(3.0, 8.0), 1),
+            battery_pct=round(random.uniform(40.0, 100.0), 1),
             _status_ttl=random.uniform(30, 180),
         )
 
@@ -130,6 +132,10 @@ class Livreur:
         # Bruit GPS
         self.accuracy_m = round(random.uniform(3.0, 12.0), 1)
 
+        # Batterie : décharge ~0.02%/tick (delivering consomme plus)
+        drain = 0.03 if self.status == "delivering" else 0.015 if self.status == "available" else 0.005
+        self.battery_pct = round(max(5.0, self.battery_pct - drain * dt + random.gauss(0, 0.005)), 1)
+
         # Rotation de statut
         self._status_ttl -= dt
         if self._status_ttl <= 0:
@@ -148,6 +154,7 @@ class Livreur:
                 "heading_deg": round(self.heading_deg % 360, 1),
                 "status": self.status,
                 "accuracy_m": self.accuracy_m,
+                "battery_pct": self.battery_pct,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
             ensure_ascii=False,

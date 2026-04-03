@@ -59,6 +59,7 @@ SCHEMA = pa.schema([
     pa.field("heading_deg", pa.float32()),
     pa.field("status",      pa.dictionary(pa.int8(), pa.string())),
     pa.field("accuracy_m",  pa.float32()),
+    pa.field("battery_pct", pa.float32()),
     pa.field("ts",          pa.timestamp("ms", tz="UTC")),
 ])
 
@@ -108,6 +109,7 @@ def flush(records: list[dict]) -> None:
                 pa.dictionary(pa.int8(), pa.string())
             ),
             "accuracy_m":  pa.array([r.get("accuracy_m", 0.0) for r in records], type=pa.float32()),
+            "battery_pct": pa.array([r.get("battery_pct", 0.0) for r in records], type=pa.float32()),
             "ts": ts_array,
         },
         schema=SCHEMA,
