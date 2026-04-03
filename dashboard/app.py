@@ -610,7 +610,157 @@ st.markdown("""
 #  Placeholders créés dans l'ORDRE D'AFFICHAGE
 # ════════════════════════════════════════════════════════════════════════════
 ph_bento = st.empty()
-ph_map   = st.empty()
+
+# ── CARTE LIVE FLEET — composant HTML autonome (deck.gl JS) ─────────────
+# Rendu UNE SEULE FOIS, jamais remounté. Le JS interne fetch l'API
+# toutes les 3s et met à jour les layers deck.gl en place → 0 clignotement.
+import streamlit.components.v1 as components
+
+_MAP_API = os.getenv("MAP_API_URL", "http://localhost:8001")
+_FLEET_MAP_HTML = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<script src="https://unpkg.com/deck.gl@9.1.4/dist.min.js"></script>
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@500;700;800&display=swap" rel="stylesheet"/>
+<style>
+  * {{ margin:0; padding:0; }}
+  body {{ background: transparent; font-family: 'Inter', sans-serif; }}
+  #map {{ width:100%; height:430px; border-radius:12px; overflow:hidden; }}
+  #hud {{
+    position:absolute; top:12px; right:14px; z-index:10;
+    display:flex; gap:10px; font-size:11px; font-weight:700;
+  }}
+  .hud-pill {{
+    padding:4px 10px; border-radius:8px;
+    background:rgba(15,23,42,0.7); backdrop-filter:blur(8px);
+    color:#F8FAFC; display:flex; align-items:center; gap:5px;
+  }}
+  .hud-dot {{ width:8px; height:8px; border-radius:50%; }}
+  #tooltip {{
+    position:absolute; z-index:20; pointer-events:none;
+    background:#fff; border:1.5px solid #E2E8F0; border-radius:12px;
+    padding:10px 14px; box-shadow:0 8px 24px rgba(0,0,0,0.12);
+    font-size:12px; display:none; min-width:160px;
+  }}
+</style>
+</head>
+<body>
+<div style="position:relative">
+  <div id="hud">
+    <div class="hud-pill"><div class="hud-dot" style="background:#FB923C"></div><span id="n-del">0</span> delivering</div>
+    <div class="hud-pill"><div class="hud-dot" style="background:#34D399"></div><span id="n-av">0</span> available</div>
+    <div class="hud-pill"><div class="hud-dot" style="background:#94A3B8"></div><span id="n-idl">0</span> idle</div>
+  </div>
+  <div id="tooltip"></div>
+  <div id="map"></div>
+</div>
+<script>
+const API = "{_MAP_API}";
+const STATUS_COLORS = {{
+  delivering: [251,146,60,220],
+  available:  [52,211,153,220],
+  idle:       [148,163,184,150],
+}};
+
+const deckgl = new deck.DeckGL({{
+  container: 'map',
+  mapStyle: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
+  initialViewState: {{ latitude:48.8566, longitude:2.3522, zoom:12, pitch:25 }},
+  controller: true,
+  layers: [],
+  getTooltip: null,
+  onHover: (info) => {{
+    const tt = document.getElementById('tooltip');
+    if (info.object) {{
+      const d = info.object;
+      tt.innerHTML =
+        '<b style="color:#6366F1;font-size:14px">' + d.id + '</b><br/>' +
+        '<span style="color:#475569">' + d.status + '</span><br/>' +
+        '<span style="color:#64748B;font-size:11px">⚡ ' + d.speed.toFixed(1) + ' km/h · 🧭 ' + d.heading.toFixed(0) + '°</span><br/>' +
+        '<span style="color:#64748B;font-size:11px">🔋 ' + d.battery.toFixed(0) + '%</span>';
+      tt.style.display = 'block';
+      tt.style.left = (info.x + 12) + 'px';
+      tt.style.top  = (info.y + 12) + 'px';
+    }} else {{
+      tt.style.display = 'none';
+    }}
+  }}
+}});
+
+async function refresh() {{
+  try {{
+    const r = await fetch(API + '/livreurs-proches?lat=48.8566&lon=2.3522&rayon=15&limit=200');
+    const data = await r.json();
+    const livreurs = (data.livreurs || []).map(lv => ({{
+      position: [lv.lon, lv.lat],
+      color: STATUS_COLORS[lv.status] || [148,163,184,150],
+      id: lv.livreur_id,
+      status: lv.status,
+      speed: lv.speed_kmh || 0,
+      heading: lv.heading_deg || 0,
+      battery: lv.battery_pct || 0,
+    }}));
+
+    deckgl.setProps({{
+      layers: [
+        new deck.ScatterplotLayer({{
+          id: 'glow',
+          data: livreurs,
+          getPosition: d => d.position,
+          getFillColor: d => [...d.color.slice(0,3), 35],
+          getRadius: 300,
+          radiusMinPixels: 10,
+          radiusMaxPixels: 30,
+          transitions: {{ getPosition: 1500 }},
+        }}),
+        new deck.ScatterplotLayer({{
+          id: 'fleet',
+          data: livreurs,
+          getPosition: d => d.position,
+          getFillColor: d => d.color,
+          getRadius: 120,
+          radiusMinPixels: 5,
+          radiusMaxPixels: 14,
+          pickable: true,
+          autoHighlight: true,
+          highlightColor: [99,102,241,255],
+          transitions: {{ getPosition: 1500 }},
+        }}),
+      ]
+    }});
+
+    let nd=0, na=0, ni=0;
+    livreurs.forEach(l => {{
+      if (l.status==='delivering') nd++;
+      else if (l.status==='available') na++;
+      else ni++;
+    }});
+    document.getElementById('n-del').textContent = nd;
+    document.getElementById('n-av').textContent  = na;
+    document.getElementById('n-idl').textContent = ni;
+  }} catch(e) {{ console.warn('Fleet refresh error:', e); }}
+}}
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
+"""
+
+st.markdown("""
+<div class="map-card">
+    <div class="map-card-header">
+        <span>🗺️</span>
+        <span>Flotte en temps réel — Paris · Auto-refresh 3s</span>
+    </div>
+""", unsafe_allow_html=True)
+components.html(_FLEET_MAP_HTML, height=460, scrolling=False)
+st.markdown("</div>", unsafe_allow_html=True)
 
 # ── SLA + Cold Path côte à côte ──────────────────────────────────────────
 col_sla, col_cold = st.columns(2)
@@ -912,98 +1062,6 @@ while True:
             + "</div>",
             unsafe_allow_html=True,
         )
-
-    # ── LIVE FLEET MAP ────────────────────────────────────────────────────
-    nearby = fetch("/livreurs-proches", {"lat": 48.8566, "lon": 2.3522, "rayon": 15, "limit": 200})
-    with ph_map.container():
-        fleet_list = nearby.get("livreurs", [])
-        if fleet_list:
-            df_fleet = pd.DataFrame([
-                {
-                    "lat":     lv["lat"],
-                    "lon":     lv["lon"],
-                    "speed":   lv.get("speed_kmh", 0),
-                    "status":  lv.get("status", "idle"),
-                    "id":      lv.get("livreur_id", "?"),
-                    "color":   STATUS_COLOR_RGB.get(lv.get("status", "idle"), [148, 163, 184, 150]),
-                    "heading": lv.get("heading_deg", 0),
-                    "battery": lv.get("battery_pct", 0),
-                }
-                for lv in fleet_list
-            ])
-
-            # Couche principale — points des livreurs
-            layer_fleet = pdk.Layer(
-                "ScatterplotLayer",
-                data=df_fleet,
-                get_position=["lon", "lat"],
-                get_fill_color="color",
-                get_radius=120,
-                radius_min_pixels=5,
-                radius_max_pixels=14,
-                pickable=True,
-                auto_highlight=True,
-                highlight_color=[99, 102, 241, 255],
-            )
-
-            # Halo externe — glow effect
-            layer_glow = pdk.Layer(
-                "ScatterplotLayer",
-                data=df_fleet,
-                get_position=["lon", "lat"],
-                get_fill_color="color",
-                get_radius=300,
-                radius_min_pixels=10,
-                radius_max_pixels=30,
-                opacity=0.15,
-            )
-
-            nb_del = sum(1 for lv in fleet_list if lv.get("status") == "delivering")
-            nb_av  = sum(1 for lv in fleet_list if lv.get("status") == "available")
-            nb_idl = sum(1 for lv in fleet_list if lv.get("status") == "idle")
-
-            fleet_deck = pdk.Deck(
-                layers=[layer_glow, layer_fleet],
-                initial_view_state=pdk.ViewState(
-                    latitude=48.8566, longitude=2.3522,
-                    zoom=12, pitch=25, bearing=0,
-                ),
-                tooltip={
-                    "html": (
-                        "<div style='font-family:Inter,sans-serif;padding:8px 6px;min-width:160px'>"
-                        "<b style='color:#6366F1;font-size:14px'>{id}</b><br/>"
-                        "<span style='color:#475569;font-size:12px'>{status}</span><br/>"
-                        "<span style='color:#64748B;font-size:11px'>⚡ {speed:.1f} km/h · 🧭 {heading:.0f}°</span><br/>"
-                        "<span style='color:#64748B;font-size:11px'>🔋 {battery:.0f}%</span>"
-                        "</div>"
-                    ),
-                    "style": {
-                        "background": "#FFFFFF",
-                        "color": "#0F172A",
-                        "fontSize": "12px",
-                        "borderRadius": "12px",
-                        "border": "1.5px solid #E2E8F0",
-                        "padding": "8px 12px",
-                        "boxShadow": "0 8px 24px rgba(0,0,0,0.12)",
-                    },
-                },
-                map_style="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
-            )
-
-            st.markdown(f"""
-            <div class="map-card">
-                <div class="map-card-header">
-                    <span>🗺️</span>
-                    <span>Flotte en temps réel — {len(fleet_list)} livreurs · Paris</span>
-                    <span style="margin-left:auto;display:flex;gap:12px;font-size:10px">
-                        <span style="color:#FB923C;font-weight:700">● {nb_del} delivering</span>
-                        <span style="color:#34D399;font-weight:700">● {nb_av} available</span>
-                        <span style="color:#94A3B8;font-weight:700">● {nb_idl} idle</span>
-                    </span>
-                </div>
-            """, unsafe_allow_html=True)
-            st.pydeck_chart(fleet_deck, use_container_width=True)
-            st.markdown("</div>", unsafe_allow_html=True)
 
     # ── SLA GEOSEARCH ─────────────────────────────────────────────────────
     perf  = fetch("/health/performance", {"samples": 100})
