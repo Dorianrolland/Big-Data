@@ -489,6 +489,25 @@ button[kind="header"] { display: none !important; }
 .reco-item.warn { background: #FFFBEB; border-color: #FDE68A; color: #92400E; }
 .reco-item.ok   { background: #F0FDF4; border-color: #BBF7D0; color: #166534; }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   PREDICT DEMAND — Dispatch prédictif
+═══════════════════════════════════════════════════════════════════════════ */
+.demand-signal {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 10px; font-weight: 800; letter-spacing: 0.3px;
+    border-radius: 20px; padding: 3px 10px; text-transform: uppercase;
+}
+.ds-hausse { background: #FEE2E2; color: #991B1B; }
+.ds-stable { background: #F1F5F9; color: #64748B; }
+.ds-baisse { background: #DCFCE7; color: #166534; }
+.demand-zone {
+    background: #F8FAFC; border-radius: 12px; padding: 12px 14px;
+    border: 1px solid rgba(226,232,240,0.9); margin-bottom: 8px;
+}
+.dz-coords { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #64748B; }
+.dz-trend { font-size: 1.2rem; font-weight: 800; line-height: 1.2; }
+.dz-action { font-size: 11px; color: #475569; margin-top: 4px; font-style: italic; }
+
 /* ─── Divers Streamlit → invisible ───────────────────────────────────────── */
 [data-testid="stDivider"] { display: none !important; }
 .stDeckGlJsonChart { width: 100% !important; }
@@ -587,18 +606,87 @@ st.markdown("""
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  SECTION ANALYSE HISTORIQUE
-#  Widgets déclarés UNE SEULE FOIS hors boucle (anti-DuplicateWidgetID)
+#  SECTION 1 — HOT PATH KPIs (en HAUT, le plus important)
+#  Placeholders créés dans l'ORDRE D'AFFICHAGE
+# ════════════════════════════════════════════════════════════════════════════
+ph_bento = st.empty()
+ph_map   = st.empty()
+
+# ── SLA + Cold Path côte à côte ──────────────────────────────────────────
+col_sla, col_cold = st.columns(2)
+with col_sla:
+    ph_sla = st.empty()
+with col_cold:
+    ph_cold = st.empty()
+
+# ════════════════════════════════════════════════════════════════════════════
+#  SECTION 2 — BUSINESS INTELLIGENCE
 # ════════════════════════════════════════════════════════════════════════════
 st.markdown("""
-<div class="fs-sh">
+<div class="fs-sh" style="margin-top:32px">
+    <div class="overline">Business Intelligence · DuckDB Analytics</div>
+    <div class="heading">Performance & Sante de la Flotte</div>
+    <div class="sub">
+        Indicateurs operationnels temps reel, score de performance livreur,
+        couverture territoriale, detection d'anomalies et dispatch predictif.
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+# ── Driver Score — widget de recherche ──────────────────────────────────────
+st.markdown("""
+<div class="spotlight-container">
+    <div class="spotlight-header"><span>🏆</span> Score de performance — Analyse individuelle</div>
+""", unsafe_allow_html=True)
+col_ds_id, col_ds_h, col_ds_btn = st.columns([3, 2, 1])
+with col_ds_id:
+    ds_livreur_id = st.text_input(
+        "DS ID", value="L042", placeholder="ex: L007, L042…",
+        key="ds_livreur_id", label_visibility="collapsed",
+    )
+with col_ds_h:
+    ds_heures = st.selectbox(
+        "DS Fenêtre", [1, 2, 4, 8, 24],
+        format_func=lambda h: f"Dernière{'s' if h > 1 else ''} {h}h",
+        key="ds_heures", label_visibility="collapsed",
+    )
+with col_ds_btn:
+    ds_analyse = st.button("🏆 Scorer", key="ds_btn", use_container_width=True)
+st.markdown("</div>", unsafe_allow_html=True)
+
+if ds_analyse:
+    st.session_state.last_ds = fetch(
+        f"/analytics/driver-score/{ds_livreur_id}",
+        {"heures": ds_heures},
+    )
+
+ph_driver_score = st.empty()
+
+# ── Placeholders BI auto-refresh ─────────────────────────────────────────────
+ph_insights  = st.empty()
+
+col_anom, col_demand = st.columns(2)
+with col_anom:
+    ph_anomalies = st.empty()
+with col_demand:
+    ph_predict = st.empty()
+
+ph_fraud  = st.empty()
+ph_zones  = st.empty()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  SECTION 3 — COLD PATH — Analyse trajectoire
+# ════════════════════════════════════════════════════════════════════════════
+st.markdown("""
+<div class="fs-sh" style="margin-top:32px">
     <div class="overline">Cold Path · DuckDB → Apache Parquet</div>
     <div class="heading">Analyse de trajectoire</div>
     <div class="sub">Historique complet depuis le Data Lake — distance Haversine, vitesses, statut dominant.</div>
 </div>
 """, unsafe_allow_html=True)
 
-# Spotlight search container (CSS override des widgets à l'intérieur)
+# Spotlight search container
 st.markdown('<div class="spotlight-container">', unsafe_allow_html=True)
 st.markdown(
     '<div class="spotlight-header"><span>🔍</span> Rechercher un livreur</div>',
@@ -673,7 +761,6 @@ with ph_hist.container():
                         df.iloc[min(i + step, n - 1)]["lat"]]
                 segs.append({"path": [pt_a, pt_b], "color": [99, 102, 241, alpha]})
 
-            # 3 couches pour l'effet néon (outer glow → inner glow → ligne nette)
             layer_outer = pdk.Layer(
                 "PathLayer", data=segs,
                 get_path="path", get_color=[120, 80, 255, 20],
@@ -693,7 +780,6 @@ with ph_hist.container():
                 rounded=True, joint_rounded=True,
             )
 
-            # Points colorés par statut
             layer_scatter = pdk.Layer(
                 "ScatterplotLayer", data=df,
                 get_position=["lon", "lat"],
@@ -703,7 +789,6 @@ with ph_hist.container():
                 highlight_color=[99, 102, 241, 255],
             )
 
-            # Marqueurs début (vert) / fin (rouge)
             endpoints = pd.DataFrame([
                 {"lon": df.iloc[0]["lon"],  "lat": df.iloc[0]["lat"],
                  "color": [16, 185, 129, 255], "r": 90},
@@ -747,7 +832,6 @@ with ph_hist.container():
                 map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
             )
 
-            # Map card wrapper
             st.markdown("""
             <div class="map-card">
                 <div class="map-card-header">
@@ -758,7 +842,6 @@ with ph_hist.container():
             st.pydeck_chart(deck, use_container_width=True)
             st.markdown("</div>", unsafe_allow_html=True)
 
-            # Légende
             st.markdown("""
             <div class="traj-legend">
                 <div class="tl-item"><div class="tl-line"></div> Trajectoire (néon Indigo)</div>
@@ -784,61 +867,9 @@ with ph_hist.container():
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  SECTION BUSINESS INTELLIGENCE
-#  Widgets déclarés UNE SEULE FOIS hors boucle
+#  FOOTER placeholder
 # ════════════════════════════════════════════════════════════════════════════
-st.markdown("""
-<div class="fs-sh" style="margin-top:32px">
-    <div class="overline">Business Intelligence · DuckDB Analytics</div>
-    <div class="heading">Performance & Santé de la Flotte</div>
-    <div class="sub">
-        Indicateurs opérationnels temps réel, score de performance livreur,
-        couverture territoriale et détection d'anomalies comportementales.
-    </div>
-</div>
-""", unsafe_allow_html=True)
-
-# ── Driver Score — widget de recherche ──────────────────────────────────────
-st.markdown("""
-<div class="spotlight-container">
-    <div class="spotlight-header"><span>🏆</span> Score de performance — Analyse individuelle</div>
-""", unsafe_allow_html=True)
-col_ds_id, col_ds_h, col_ds_btn = st.columns([3, 2, 1])
-with col_ds_id:
-    ds_livreur_id = st.text_input(
-        "DS ID", value="L042", placeholder="ex: L007, L042…",
-        key="ds_livreur_id", label_visibility="collapsed",
-    )
-with col_ds_h:
-    ds_heures = st.selectbox(
-        "DS Fenêtre", [1, 2, 4, 8, 24],
-        format_func=lambda h: f"Dernière{'s' if h > 1 else ''} {h}h",
-        key="ds_heures", label_visibility="collapsed",
-    )
-with col_ds_btn:
-    ds_analyse = st.button("🏆 Scorer", key="ds_btn", use_container_width=True)
-st.markdown("</div>", unsafe_allow_html=True)
-
-if ds_analyse:
-    st.session_state.last_ds = fetch(
-        f"/analytics/driver-score/{ds_livreur_id}",
-        {"heures": ds_heures},
-    )
-
-ph_driver_score = st.empty()
-
-# ── Placeholders BI auto-refresh ─────────────────────────────────────────────
-ph_insights  = st.empty()
-ph_anomalies = st.empty()
-ph_zones     = st.empty()
-
-# ════════════════════════════════════════════════════════════════════════════
-#  PLACEHOLDERS auto-refresh (créés une fois, mis à jour en boucle)
-# ════════════════════════════════════════════════════════════════════════════
-ph_bento = st.empty()
-ph_sla   = st.empty()
-ph_cold  = st.empty()
-ph_ts    = st.empty()
+ph_ts = st.empty()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -850,7 +881,9 @@ while True:
     cp    = stats.get("cold_path", {})
     cts   = hp.get("statuts", {})
 
-    # ── Bento Grid ────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    #  BENTO GRID + LIVE MAP (Section 1 — en haut)
+    # ══════════════════════════════════════════════════════════════════════
     with ph_bento.container():
         n_msgs = hp.get("messages_traites", 0)
         st.markdown("""
@@ -880,7 +913,99 @@ while True:
             unsafe_allow_html=True,
         )
 
-    # ── SLA GEOSEARCH ─────────────────────────────────────────────────────────
+    # ── LIVE FLEET MAP ────────────────────────────────────────────────────
+    nearby = fetch("/livreurs-proches", {"lat": 48.8566, "lon": 2.3522, "rayon": 15, "limit": 200})
+    with ph_map.container():
+        fleet_list = nearby.get("livreurs", [])
+        if fleet_list:
+            df_fleet = pd.DataFrame([
+                {
+                    "lat":     lv["lat"],
+                    "lon":     lv["lon"],
+                    "speed":   lv.get("speed_kmh", 0),
+                    "status":  lv.get("status", "idle"),
+                    "id":      lv.get("livreur_id", "?"),
+                    "color":   STATUS_COLOR_RGB.get(lv.get("status", "idle"), [148, 163, 184, 150]),
+                    "heading": lv.get("heading_deg", 0),
+                    "battery": lv.get("battery_pct", 0),
+                }
+                for lv in fleet_list
+            ])
+
+            # Couche principale — points des livreurs
+            layer_fleet = pdk.Layer(
+                "ScatterplotLayer",
+                data=df_fleet,
+                get_position=["lon", "lat"],
+                get_fill_color="color",
+                get_radius=120,
+                radius_min_pixels=5,
+                radius_max_pixels=14,
+                pickable=True,
+                auto_highlight=True,
+                highlight_color=[99, 102, 241, 255],
+            )
+
+            # Halo externe — glow effect
+            layer_glow = pdk.Layer(
+                "ScatterplotLayer",
+                data=df_fleet,
+                get_position=["lon", "lat"],
+                get_fill_color="color",
+                get_radius=300,
+                radius_min_pixels=10,
+                radius_max_pixels=30,
+                opacity=0.15,
+            )
+
+            nb_del = sum(1 for lv in fleet_list if lv.get("status") == "delivering")
+            nb_av  = sum(1 for lv in fleet_list if lv.get("status") == "available")
+            nb_idl = sum(1 for lv in fleet_list if lv.get("status") == "idle")
+
+            fleet_deck = pdk.Deck(
+                layers=[layer_glow, layer_fleet],
+                initial_view_state=pdk.ViewState(
+                    latitude=48.8566, longitude=2.3522,
+                    zoom=12, pitch=25, bearing=0,
+                ),
+                tooltip={
+                    "html": (
+                        "<div style='font-family:Inter,sans-serif;padding:8px 6px;min-width:160px'>"
+                        "<b style='color:#6366F1;font-size:14px'>{id}</b><br/>"
+                        "<span style='color:#475569;font-size:12px'>{status}</span><br/>"
+                        "<span style='color:#64748B;font-size:11px'>⚡ {speed:.1f} km/h · 🧭 {heading:.0f}°</span><br/>"
+                        "<span style='color:#64748B;font-size:11px'>🔋 {battery:.0f}%</span>"
+                        "</div>"
+                    ),
+                    "style": {
+                        "background": "#FFFFFF",
+                        "color": "#0F172A",
+                        "fontSize": "12px",
+                        "borderRadius": "12px",
+                        "border": "1.5px solid #E2E8F0",
+                        "padding": "8px 12px",
+                        "boxShadow": "0 8px 24px rgba(0,0,0,0.12)",
+                    },
+                },
+                map_style="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+            )
+
+            st.markdown(f"""
+            <div class="map-card">
+                <div class="map-card-header">
+                    <span>🗺️</span>
+                    <span>Flotte en temps réel — {len(fleet_list)} livreurs · Paris</span>
+                    <span style="margin-left:auto;display:flex;gap:12px;font-size:10px">
+                        <span style="color:#FB923C;font-weight:700">● {nb_del} delivering</span>
+                        <span style="color:#34D399;font-weight:700">● {nb_av} available</span>
+                        <span style="color:#94A3B8;font-weight:700">● {nb_idl} idle</span>
+                    </span>
+                </div>
+            """, unsafe_allow_html=True)
+            st.pydeck_chart(fleet_deck, use_container_width=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── SLA GEOSEARCH ─────────────────────────────────────────────────────
     perf  = fetch("/health/performance", {"samples": 100})
     bench = perf.get("geosearch_benchmark", {})
     rinfo = perf.get("redis_info", {})
@@ -931,7 +1056,7 @@ while True:
             unsafe_allow_html=True,
         )
 
-    # ── Cold Path Card ────────────────────────────────────────────────────────
+    # ── Cold Path Card ────────────────────────────────────────────────────
     with ph_cold.container():
         nb_files = cp.get("fichiers_parquet", 0)
         taille   = cp.get("taille_totale_mb", 0)
@@ -950,7 +1075,11 @@ while True:
             unsafe_allow_html=True,
         )
 
-    # ── Driver Score (résultat statique mis à jour sur clic) ─────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    #  SECTION BI — auto-refresh
+    # ══════════════════════════════════════════════════════════════════════
+
+    # ── Driver Score (résultat statique mis à jour sur clic) ─────────────
     ds = st.session_state.get("last_ds", {})
     with ph_driver_score.container():
         if ds and "score_global" in ds:
@@ -1012,7 +1141,7 @@ while True:
         elif "detail" in ds:
             st.info(f"ℹ️ {ds['detail']}")
 
-    # ── Fleet Insights (auto-refresh) ─────────────────────────────────────────
+    # ── Fleet Insights (auto-refresh) ─────────────────────────────────────
     insights = fetch("/analytics/fleet-insights")
     with ph_insights.container():
         if insights and "sante_operationnelle" in insights:
@@ -1073,7 +1202,7 @@ while True:
                 unsafe_allow_html=True,
             )
 
-    # ── Anomalies (auto-refresh) ──────────────────────────────────────────────
+    # ── Anomalies (auto-refresh) ──────────────────────────────────────────
     anomalies_data = fetch("/analytics/anomalies", {"fenetre_minutes": 10})
     with ph_anomalies.container():
         if anomalies_data:
@@ -1115,9 +1244,9 @@ while True:
                 f'<div class="bi-card">'
                 f'<div class="bi-card-header">'
                 f'<span style="font-size:18px">🔬</span>'
-                f'<span class="bi-card-title">Détection d\'Anomalies · ML</span>'
+                f'<span class="bi-card-title">Anomalies · ML</span>'
                 f'<span style="margin-left:auto;font-size:10px;color:{header_color};font-weight:700">'
-                f'{len(anom_list)} anomalie(s) · {resume.get("livreurs_scannes",0)} livreurs scannés</span>'
+                f'{len(anom_list)} anomalie(s)</span>'
                 f'</div>'
                 f'{anomalies_html}'
                 f'<div style="font-size:10px;color:#94A3B8;margin-top:10px;font-style:italic">'
@@ -1126,7 +1255,136 @@ while True:
                 unsafe_allow_html=True,
             )
 
-    # ── Zone Coverage (auto-refresh) ──────────────────────────────────────────
+    # ── Predict Demand (auto-refresh) ─────────────────────────────────────
+    demand_data = fetch("/analytics/predict-demand", {"horizon_minutes": 30})
+    with ph_predict.container():
+        if demand_data and "resume" in demand_data:
+            d_resume = demand_data.get("resume", {})
+            dispatch = demand_data.get("dispatch_prioritaire", [])
+            cold_z   = demand_data.get("zones_a_decouvrir", [])
+
+            dispatch_html = ""
+            for z in dispatch[:4]:
+                trend = z.get("tendance_pct", 0)
+                dispatch_html += (
+                    f'<div class="demand-zone">'
+                    f'<div style="display:flex;justify-content:space-between;align-items:center">'
+                    f'<div class="dz-coords">lat {z.get("lat","?")} · lon {z.get("lon","?")}</div>'
+                    f'<span class="demand-signal ds-hausse">🔺 +{trend}%</span>'
+                    f'</div>'
+                    f'<div class="dz-action">→ {z.get("action","")}</div>'
+                    f'</div>'
+                )
+
+            if not dispatch:
+                dispatch_html = (
+                    '<div class="reco-item ok">✅ Aucune zone en hausse significative '
+                    '— couverture stable.</div>'
+                )
+
+            st.markdown(
+                f'<div class="bi-card">'
+                f'<div class="bi-card-header">'
+                f'<span style="font-size:18px">📡</span>'
+                f'<span class="bi-card-title">Dispatch Prédictif</span>'
+                f'<span style="margin-left:auto;font-size:10px;color:#94A3B8">'
+                f'Horizon 30 min</span>'
+                f'</div>'
+                f'<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px">'
+                f'<div class="bi-kpi"><div class="bi-kpi-lbl">🔺 Zones en hausse</div>'
+                f'<div class="bi-kpi-val" style="color:#EF4444">{d_resume.get("zones_en_hausse",0)}</div></div>'
+                f'<div class="bi-kpi"><div class="bi-kpi-lbl">➡️ Stables</div>'
+                f'<div class="bi-kpi-val" style="color:#64748B">{d_resume.get("zones_stables",0)}</div></div>'
+                f'<div class="bi-kpi"><div class="bi-kpi-lbl">🔻 En baisse</div>'
+                f'<div class="bi-kpi-val" style="color:#10B981">{d_resume.get("zones_en_baisse",0)}</div></div>'
+                f'</div>'
+                f'<div style="font-size:11px;font-weight:700;color:#0F172A;margin-bottom:8px">'
+                f'Zones prioritaires — envoi de livreurs recommandé</div>'
+                f'{dispatch_html}'
+                f'<div style="font-size:10px;color:#94A3B8;margin-top:10px;font-style:italic">'
+                f'Méthode : {demand_data.get("methode","")}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    # ── GPS Fraud Detection (auto-refresh) ───────────────────────────────
+    fraud_data = fetch("/analytics/gps-fraud", {"fenetre_minutes": 15})
+    with ph_fraud.container():
+        if fraud_data and "resume" in fraud_data:
+            f_resume = fraud_data.get("resume", {})
+            teleports = fraud_data.get("teleportations", [])
+            frozen_list = fraud_data.get("positions_figees", [])
+            total_frauds = f_resume.get("total_fraudes", 0)
+
+            fraud_html = ""
+            if teleports:
+                for t in teleports[:4]:
+                    niv = t.get("niveau", "warning")
+                    cls = f"anomaly-{niv}"
+                    badge_cls = f"ab-{niv}"
+                    fraud_html += (
+                        f'<div class="anomaly-item {cls}">'
+                        f'<div class="anomaly-header">'
+                        f'<span class="anomaly-id">{t.get("livreur_id","?")}</span>'
+                        f'<span class="anomaly-badge {badge_cls}">TELEPORTATION</span>'
+                        f'<span style="margin-left:auto;font-size:11px;color:#94A3B8">'
+                        f'{t.get("saut_km",0):.1f} km · {t.get("vitesse_implicite_kmh",0):.0f} km/h implicite</span>'
+                        f'</div>'
+                        f'<div class="anomaly-detail">Saut de {t.get("saut_km",0):.2f} km '
+                        f'— vitesse implicite {t.get("vitesse_implicite_kmh",0):.0f} km/h '
+                        f'(seuil: {t.get("seuil_kmh",90)} km/h)</div>'
+                        f'<div class="anomaly-risque">{t.get("risque","")}</div>'
+                        f'</div>'
+                    )
+
+            if frozen_list:
+                for f in frozen_list[:3]:
+                    fraud_html += (
+                        f'<div class="anomaly-item anomaly-warning">'
+                        f'<div class="anomaly-header">'
+                        f'<span class="anomaly-id">{f.get("livreur_id","?")}</span>'
+                        f'<span class="anomaly-badge ab-warning">GPS FIGÉ</span>'
+                        f'<span style="margin-left:auto;font-size:11px;color:#94A3B8">'
+                        f'{f.get("nb_repetitions",0)}× même position</span>'
+                        f'</div>'
+                        f'<div class="anomaly-detail">Coordonnées identiques '
+                        f'({f.get("lat","?")}, {f.get("lon","?")}) '
+                        f'sur {f.get("nb_repetitions",0)} mesures consécutives</div>'
+                        f'<div class="anomaly-risque">{f.get("risque","")}</div>'
+                        f'</div>'
+                    )
+
+            if not fraud_html:
+                fraud_html = (
+                    '<div class="reco-item ok">✅ Aucune fraude GPS détectée '
+                    f'— {f_resume.get("livreurs_scannes",0)} livreurs analysés.</div>'
+                )
+
+            fraud_color = "#EF4444" if total_frauds > 0 else "#10B981"
+            st.markdown(
+                f'<div class="bi-card">'
+                f'<div class="bi-card-header">'
+                f'<span style="font-size:18px">🛡️</span>'
+                f'<span class="bi-card-title">Détection Fraude GPS</span>'
+                f'<span style="margin-left:auto;font-size:10px;color:{fraud_color};font-weight:700">'
+                f'{total_frauds} alerte(s)</span>'
+                f'</div>'
+                f'<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px">'
+                f'<div class="bi-kpi"><div class="bi-kpi-lbl">🔴 Téléportations</div>'
+                f'<div class="bi-kpi-val" style="color:#EF4444">{f_resume.get("teleportations",0)}</div></div>'
+                f'<div class="bi-kpi"><div class="bi-kpi-lbl">⚠️ GPS figés</div>'
+                f'<div class="bi-kpi-val" style="color:#F59E0B">{f_resume.get("positions_figees",0)}</div></div>'
+                f'<div class="bi-kpi"><div class="bi-kpi-lbl">🔍 Livreurs scannés</div>'
+                f'<div class="bi-kpi-val">{f_resume.get("livreurs_scannes",0)}</div></div>'
+                f'</div>'
+                f'{fraud_html}'
+                f'<div style="font-size:10px;color:#94A3B8;margin-top:10px;font-style:italic">'
+                f'Méthode : {fraud_data.get("methodologie","")}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    # ── Zone Coverage (auto-refresh) ──────────────────────────────────────
     zones_data = fetch("/analytics/zone-coverage")
     with ph_zones.container():
         if zones_data and "alertes_dispatch" in zones_data:
@@ -1178,7 +1436,7 @@ while True:
                 unsafe_allow_html=True,
             )
 
-    # ── Footer timestamp ──────────────────────────────────────────────────────
+    # ── Footer timestamp ──────────────────────────────────────────────────
     with ph_ts.container():
         st.markdown(
             f'<div class="fs-footer">'

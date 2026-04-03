@@ -50,7 +50,7 @@ KAFKA_BOOTSTRAP = "localhost:19092"    # Port externe Redpanda
 # ── Simulation GPS minimaliste (optimisée pour la vitesse) ────────────────────────
 class FastLivreur:
     """Livreur ultra-léger pour stress test — pas de logique physique complexe."""
-    __slots__ = ("id", "lat", "lon", "heading", "speed", "status")
+    __slots__ = ("id", "lat", "lon", "heading", "speed", "status", "battery")
 
     def __init__(self, idx: int):
         self.id      = f"S{idx:05d}"
@@ -61,6 +61,7 @@ class FastLivreur:
         self.heading = random.uniform(0, 360)
         self.speed   = random.uniform(15, 30)
         self.status  = random.choice(["delivering", "delivering", "available"])
+        self.battery = random.uniform(40, 100)
 
     def next_payload(self) -> bytes:
         self.heading = (self.heading + random.gauss(0, 5)) % 360
@@ -68,6 +69,7 @@ class FastLivreur:
         hr = math.radians(self.heading)
         self.lat += (v * math.cos(hr)) / 111.32
         self.lon += (v * math.sin(hr)) / (111.32 * 0.669)
+        self.battery = max(5.0, self.battery - 0.02)
         return json.dumps({
             "livreur_id": self.id,
             "lat":         round(self.lat, 6),
@@ -77,6 +79,7 @@ class FastLivreur:
             "status":      self.status,
             "timestamp":   datetime.now(timezone.utc).isoformat(),
             "accuracy_m":  5.0,
+            "battery_pct": round(self.battery, 1),
         }).encode()
 
 
