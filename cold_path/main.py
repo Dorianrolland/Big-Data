@@ -38,12 +38,14 @@ import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 from aiokafka import AIOKafkaConsumer, TopicPartition
 from aiokafka.structs import OffsetAndMetadata
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field, ValidationError
 
 load_dotenv()
 
@@ -57,9 +59,29 @@ log = logging.getLogger("cold-consumer")
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "redpanda:9092")
 TOPIC = os.getenv("KAFKA_TOPIC", "livreurs-gps")
 DATA_PATH = Path(os.getenv("DATA_PATH", "/data/parquet"))
+DLQ_PATH = Path(os.getenv("DLQ_PATH", "/data/dlq"))
 BATCH_INTERVAL_S = int(os.getenv("BATCH_INTERVAL_SECONDS", "60"))
 MAX_BATCH_RECORDS = int(os.getenv("MAX_BATCH_RECORDS", "50000"))
 CONSUMER_GROUP = "cold-consumer"
+
+
+# ── Schéma Pydantic ──────────────────────────────────────────────────────────────
+# Validation stricte avant écriture Parquet. Sans cette barrière, un message
+# malformé corrompait silencieusement le data lake (ex : status='delivring'
+# au lieu de 'delivering' cassait le dictionary encoding du Parquet, ou bien
+# lat=None faisait crasher PyArrow lors du cast en float64).
+# Les rejets sont écrits en JSONL dans /data/dlq pour audit hors-ligne (DuckDB
+# peut requêter ces fichiers comme n'importe quel jeu Parquet/JSON).
+class Position(BaseModel):
+    livreur_id:  str = Field(..., min_length=1, max_length=64)
+    lat:         float = Field(..., ge=-90.0,  le=90.0)
+    lon:         float = Field(..., ge=-180.0, le=180.0)
+    speed_kmh:   float = Field(0.0, ge=0.0,    le=300.0)
+    heading_deg: float = Field(0.0, ge=0.0,    le=360.0)
+    status:      Literal["available", "delivering", "idle", "unknown"] = "unknown"
+    accuracy_m:  float = Field(0.0, ge=0.0,    le=10000.0)
+    battery_pct: float = Field(0.0, ge=0.0,    le=100.0)
+    timestamp:   str   = Field(..., min_length=1)
 
 # Schéma Arrow explicite — garantit la cohérence entre les fichiers
 # 'status' en dictionary encoding : très efficace pour les valeurs répétées
@@ -74,6 +96,43 @@ SCHEMA = pa.schema([
     pa.field("battery_pct", pa.float32()),
     pa.field("ts",          pa.timestamp("ms", tz="UTC")),
 ])
+
+
+def _validate(raw: dict) -> tuple[Position | None, str | None]:
+    """
+    Valide un payload Kafka via Pydantic.
+    Retourne (Position validée, None) ou (None, message d'erreur lisible).
+    """
+    try:
+        return Position(**raw), None
+    except ValidationError as exc:
+        return None, json.dumps(exc.errors(include_url=False, include_input=False), default=str)
+    except (TypeError, KeyError) as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _write_dlq_jsonl(rejected: list[tuple[dict, str]]) -> None:
+    """
+    Append-only JSONL — fichier journalier dans /data/dlq/cold-dlq-YYYY-MM-DD.jsonl.
+    Format JSONL = parsable par DuckDB (read_json_auto), Spark, jq, etc.
+    Chaque ligne : {"raw": <payload>, "reason": <err>, "ts_rejected": <iso>}.
+    """
+    if not rejected:
+        return
+    DLQ_PATH.mkdir(parents=True, exist_ok=True)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    path = DLQ_PATH / f"cold-dlq-{today}.jsonl"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with path.open("a", encoding="utf-8") as f:
+        for raw, reason in rejected:
+            f.write(json.dumps(
+                {"raw": raw, "reason": reason, "ts_rejected": now_iso},
+                default=str,
+            ) + "\n")
+    log.warning(
+        "DLQ : %d record(s) invalide(s) écrit(s) dans %s",
+        len(rejected), path.name,
+    )
 
 
 def _parse_ts(s: str | None) -> datetime | None:
@@ -254,6 +313,7 @@ async def main() -> None:
     pending_offsets: dict[TopicPartition, int] = {}
     last_flush = time.monotonic()
     total_flushed = 0
+    total_rejected = 0
 
     async def _flush_and_commit(reason: str) -> None:
         """Flush Parquet, puis commit Kafka. L'ordre est non-négociable."""
@@ -286,13 +346,34 @@ async def main() -> None:
     try:
         while not stop_event.is_set():
             raw = await consumer.getmany(timeout_ms=500, max_records=2_000)
+            rejected_chunk: list[tuple[dict, str]] = []
             for tp, msgs in raw.items():
                 for m in msgs:
-                    buffer.append(m.value)
-                    # Max-offset par partition pour le commit explicite post-flush
+                    payload = m.value
+                    pos, err = _validate(payload)
+                    if pos is None:
+                        # Rejet DLQ — on N'AVANCE PAS l'offset pour ce message ;
+                        # un message invalide ne peut pas être rejoué utilement,
+                        # mais on évite quand même de bloquer le commit en
+                        # incluant son offset dans pending_offsets : il sera
+                        # tracé dans la DLQ mais bien marqué comme "consommé".
+                        rejected_chunk.append((payload, err or "validation error"))
+                    else:
+                        # On stocke le dict normalisé via Pydantic (plus de champs
+                        # manquants ni de types douteux pour le writer Parquet).
+                        buffer.append(pos.model_dump())
+                    # Max-offset par partition pour le commit explicite post-flush.
+                    # On l'avance même pour les rejets (le message est dans la DLQ
+                    # JSONL → ne sera pas rejoué au prochain démarrage).
                     prev = pending_offsets.get(tp, -1)
                     if m.offset > prev:
                         pending_offsets[tp] = m.offset
+
+            if rejected_chunk:
+                # Écriture DLQ dans un thread pour ne pas bloquer la boucle
+                # asyncio sur les I/O disque (même si l'append est court).
+                await asyncio.to_thread(_write_dlq_jsonl, rejected_chunk)
+                total_rejected += len(rejected_chunk)
 
             now = time.monotonic()
             time_exceeded = (buffer and now - last_flush >= BATCH_INTERVAL_S)
@@ -313,7 +394,10 @@ async def main() -> None:
                     exc,
                 )
         await consumer.stop()
-        log.info("Cold consumer arrêté. Total flushé : %d enregistrements.", total_flushed)
+        log.info(
+            "Cold consumer arrêté. Total flushé : %d enregistrements (rejets DLQ : %d).",
+            total_flushed, total_rejected,
+        )
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ Monitoring : Prometheus via /metrics (prometheus-fastapi-instrumentator)
 Docs interactives : http://localhost:8001/docs
 """
 import asyncio
+import json
 import logging
 import math
 import os
@@ -47,6 +48,9 @@ DATA_PATH = Path(os.getenv("DATA_PATH", "/data/parquet"))
 GEO_KEY          = "fleet:geo"
 HASH_PREFIX      = "fleet:livreur:"
 STATS_MSGS_KEY   = "fleet:stats:total_messages"
+STATS_DLQ_KEY    = "fleet:stats:dlq_count"
+DLQ_KEY          = "fleet:dlq"
+DLQ_PATH         = Path(os.getenv("DLQ_PATH", "/data/dlq"))
 
 # ── Prometheus custom metrics ───────────────────────────────────────────────────
 gauge_active_livreurs = Gauge(
@@ -401,6 +405,99 @@ async def stats():
             ),
             "backend":            "Apache Parquet (Snappy) + DuckDB",
         },
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  DEAD LETTER QUEUE — observabilité des messages rejetés à la validation
+# ════════════════════════════════════════════════════════════════════════════════
+
+@app.get(
+    "/dlq/stats",
+    summary="Statistiques de la Dead Letter Queue (Hot + Cold Path)",
+    tags=["Hot Path"],
+)
+async def dlq_stats():
+    """
+    Synthèse des messages GPS rejetés par la validation Pydantic dans les
+    deux consumers. Chaque couche route ses rejets vers un sink différent
+    pour préserver l'indépendance Speed/Batch :
+
+    - Hot Path : Redis LIST `fleet:dlq` (LPUSH + LTRIM 1000) — fenêtre
+      glissante des derniers rejets, latency-friendly.
+    - Cold Path : fichiers JSONL append-only `/data/dlq/cold-dlq-<jour>.jsonl`
+      — audit hors-ligne, requêtable par DuckDB read_json_auto().
+
+    Cas d'usage : surveiller la qualité du flux producer, détecter une
+    régression de schéma, alimenter une alerte si le taux de rejet
+    dépasse un seuil métier.
+    """
+    r: aioredis.Redis = app.state.redis
+
+    # ── Hot Path : compteur Redis + taille de la liste DLQ ───────────────────
+    hot_count = int(await r.get(STATS_DLQ_KEY) or 0)
+    hot_window_size = await r.llen(DLQ_KEY)
+
+    # ── Cold Path : agrégation des fichiers DLQ JSONL ────────────────────────
+    cold_count = 0
+    cold_files: list[dict] = []
+    if DLQ_PATH.exists():
+        for f in sorted(DLQ_PATH.glob("cold-dlq-*.jsonl")):
+            try:
+                # Compte les lignes sans charger le fichier en mémoire
+                with f.open("rb") as fh:
+                    nb = sum(1 for _ in fh)
+                cold_count += nb
+                cold_files.append({
+                    "fichier": f.name,
+                    "rejets":  nb,
+                    "taille_kb": f.stat().st_size // 1024,
+                })
+            except OSError:
+                pass
+
+    return {
+        "hot_path": {
+            "source":            "Redis LIST fleet:dlq",
+            "rejets_cumules":    hot_count,
+            "fenetre_glissante": hot_window_size,
+            "cap_max":           1000,
+        },
+        "cold_path": {
+            "source":           "JSONL /data/dlq/cold-dlq-*.jsonl",
+            "rejets_cumules":   cold_count,
+            "fichiers":         cold_files,
+        },
+        "total_rejets": hot_count + cold_count,
+    }
+
+
+@app.get(
+    "/dlq/peek",
+    summary="Inspecter les N derniers messages rejetés (Hot Path)",
+    tags=["Hot Path"],
+)
+async def dlq_peek(
+    limit: int = Query(20, description="Nombre de rejets à retourner", ge=1, le=200),
+):
+    """
+    Retourne les `limit` derniers messages rejetés depuis la DLQ Redis.
+    Permet de diagnostiquer rapidement un producer bugué : on voit le
+    payload brut + la raison Pydantic (champ manquant, valeur hors borne...).
+    """
+    r: aioredis.Redis = app.state.redis
+    raw_items = await r.lrange(DLQ_KEY, 0, limit - 1)
+    items: list[dict] = []
+    for s in raw_items:
+        try:
+            items.append(json.loads(s))
+        except (ValueError, TypeError):
+            items.append({"raw": s, "reason": "DLQ entry not JSON-decodable"})
+    return {
+        "source":   "Redis LIST fleet:dlq (LPUSH + LTRIM 1000)",
+        "limit":    limit,
+        "returned": len(items),
+        "items":    items,
     }
 
 

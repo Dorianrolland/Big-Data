@@ -28,10 +28,12 @@ import logging
 import os
 import signal
 import time
+from typing import Literal
 
 import redis.asyncio as aioredis
 from aiokafka import AIOKafkaConsumer
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field, ValidationError
 
 load_dotenv()
 
@@ -54,14 +56,79 @@ HASH_PREFIX = "fleet:livreur:"
 STATS_MSGS_KEY = "fleet:stats:total_messages"
 STATS_ACTIVE_KEY = "fleet:stats:livreurs_actifs"
 STATS_PURGED_KEY = "fleet:stats:ghosts_purged"
+STATS_DLQ_KEY = "fleet:stats:dlq_count"
+DLQ_KEY = "fleet:dlq"               # List Redis : derniers messages invalides
+DLQ_MAX_LEN = 1000                  # LTRIM cap — DLQ n'est pas un stockage long terme
 
 # Fréquence de la boucle de purge des entrées fantômes (< TTL pour rester cohérent)
 PURGE_INTERVAL_S = float(os.getenv("GEO_PURGE_INTERVAL_S", "5.0"))
 
 
-async def flush_to_redis(r: aioredis.Redis, batch: list[dict]) -> None:
+# ── Schéma Pydantic ──────────────────────────────────────────────────────────────
+# Validation stricte à l'entrée du Speed Layer. Tout message qui ne passe pas est
+# routé vers la DLQ Redis (fleet:dlq) avec le payload brut + la raison du rejet.
+# Sans cette barrière, un producer bugué pouvait empoisonner le sorted set GEO
+# avec lat/lon NaN ou des status inconnus, et faire diverger les KPIs dashboard.
+class Position(BaseModel):
+    livreur_id:  str = Field(..., min_length=1, max_length=64)
+    lat:         float = Field(..., ge=-90.0,  le=90.0)
+    lon:         float = Field(..., ge=-180.0, le=180.0)
+    speed_kmh:   float = Field(0.0, ge=0.0,    le=300.0)   # 300 km/h = borne capteur
+    heading_deg: float = Field(0.0, ge=0.0,    le=360.0)
+    status:      Literal["available", "delivering", "idle", "unknown"] = "unknown"
+    accuracy_m:  float = Field(0.0, ge=0.0,    le=10000.0)
+    battery_pct: float = Field(0.0, ge=0.0,    le=100.0)
+    timestamp:   str   = Field(..., min_length=1)
+
+
+def _validate_batch(raw_batch: list[dict]) -> tuple[list[Position], list[dict]]:
     """
-    Écrit un batch de positions GPS en Redis via pipeline.
+    Sépare un batch brut en (messages valides, rejets DLQ) en UN seul passage.
+    Chaque rejet est un dict {"raw": <payload>, "reason": <message Pydantic>,
+    "ts_rejected": <iso>} prêt à être JSON-serialisé pour la DLQ Redis.
+    """
+    valid: list[Position] = []
+    rejected: list[dict] = []
+    for raw in raw_batch:
+        try:
+            valid.append(Position(**raw))
+        except ValidationError as exc:
+            rejected.append({
+                "raw":          raw,
+                "reason":       exc.errors(include_url=False, include_input=False),
+                "ts_rejected":  time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            })
+        except (TypeError, KeyError) as exc:
+            # Payload qui n'est même pas un dict cohérent — Pydantic n'a pas pu mapper
+            rejected.append({
+                "raw":          raw,
+                "reason":       str(exc),
+                "ts_rejected":  time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            })
+    return valid, rejected
+
+
+async def _push_dlq(r: aioredis.Redis, rejected: list[dict]) -> None:
+    """
+    Pousse les messages invalides dans la DLQ Redis (LPUSH + LTRIM cap).
+    LTRIM garantit que la DLQ ne grossit pas indéfiniment — c'est une fenêtre
+    de debug, pas un stockage long terme. Pour persister à long terme, brancher
+    Logstash / Vector dessus.
+    """
+    if not rejected:
+        return
+    pipe = r.pipeline(transaction=False)
+    for rej in rejected:
+        pipe.lpush(DLQ_KEY, json.dumps(rej, default=str))
+    pipe.ltrim(DLQ_KEY, 0, DLQ_MAX_LEN - 1)
+    pipe.incrby(STATS_DLQ_KEY, len(rejected))
+    await pipe.execute()
+    log.warning("DLQ : %d message(s) invalide(s) routé(s) vers %s", len(rejected), DLQ_KEY)
+
+
+async def flush_to_redis(r: aioredis.Redis, batch: list[Position]) -> None:
+    """
+    Écrit un batch de positions GPS DÉJÀ VALIDÉES en Redis via pipeline.
     Une seule requête réseau pour toutes les commandes du batch.
 
     Pour chaque message :
@@ -71,16 +138,16 @@ async def flush_to_redis(r: aioredis.Redis, batch: list[dict]) -> None:
       4. EXPIRE fleet:livreur:<id>      → TTL natif Redis sur le hash
 
     Le sorted set auxiliaire (2) est purgé périodiquement par _purge_ghosts_loop.
+    Le batch ne contient QUE des Position validées par Pydantic — plus besoin
+    de defensive coding (msg.get("lat", 0)) qui masquait des bugs producer.
     """
     now_ms = int(time.time() * 1000)
     pipe = r.pipeline(transaction=False)
     for msg in batch:
-        lid = msg["livreur_id"]
-        lon = msg["lon"]
-        lat = msg["lat"]
+        lid = msg.livreur_id
 
         # GEOADD : longitude EN PREMIER (convention Redis)
-        pipe.geoadd(GEO_KEY, [lon, lat, lid])
+        pipe.geoadd(GEO_KEY, [msg.lon, msg.lat, lid])
 
         # Marqueur "dernière vue" pour la purge déterministe (cohérence GEO ↔ hashes)
         pipe.zadd(GEO_TS_KEY, {lid: now_ms})
@@ -89,14 +156,14 @@ async def flush_to_redis(r: aioredis.Redis, batch: list[dict]) -> None:
         pipe.hset(
             f"{HASH_PREFIX}{lid}",
             mapping={
-                "lat":         lat,
-                "lon":         lon,
-                "speed_kmh":   msg.get("speed_kmh", 0),
-                "heading_deg": msg.get("heading_deg", 0),
-                "status":      msg.get("status", "unknown"),
-                "accuracy_m":  msg.get("accuracy_m", 0),
-                "battery_pct": msg.get("battery_pct", 0),
-                "ts":          msg.get("timestamp", ""),
+                "lat":         msg.lat,
+                "lon":         msg.lon,
+                "speed_kmh":   msg.speed_kmh,
+                "heading_deg": msg.heading_deg,
+                "status":      msg.status,
+                "accuracy_m":  msg.accuracy_m,
+                "battery_pct": msg.battery_pct,
+                "ts":          msg.timestamp,
             },
         )
         # TTL : données éphémères — expirent si le livreur disparaît
@@ -192,19 +259,31 @@ async def main() -> None:
     )
 
     processed = 0
+    rejected_total = 0
     try:
         while not stop_event.is_set():
             # getmany : récupère jusqu'à 500 messages sans bloquer plus de 100ms
             raw = await consumer.getmany(timeout_ms=100, max_records=500)
-            batch = [msg.value for msgs in raw.values() for msg in msgs]
-            if not batch:
+            raw_batch = [msg.value for msgs in raw.values() for msg in msgs]
+            if not raw_batch:
                 continue
 
-            await flush_to_redis(r, batch)
-            processed += len(batch)
+            # Validation Pydantic stricte — sépare valides / rejets DLQ
+            valid_batch, rejected_batch = _validate_batch(raw_batch)
 
-            if processed % 10_000 == 0:
-                log.info("Traités : %d messages (dernier batch : %d)", processed, len(batch))
+            if rejected_batch:
+                await _push_dlq(r, rejected_batch)
+                rejected_total += len(rejected_batch)
+
+            if valid_batch:
+                await flush_to_redis(r, valid_batch)
+                processed += len(valid_batch)
+
+            if processed and processed % 10_000 == 0:
+                log.info(
+                    "Traités : %d messages (dernier batch : %d, rejets cumul : %d)",
+                    processed, len(valid_batch), rejected_total,
+                )
     finally:
         purge_task.cancel()
         try:
