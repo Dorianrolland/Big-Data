@@ -370,12 +370,15 @@ async def stats():
     total_geo  = await r.zcard(GEO_KEY)
     total_msgs = int(await r.get(STATS_MSGS_KEY) or 0)
 
-    keys = await r.keys(f"{HASH_PREFIX}*")
+    # Source de vérité : sorted set GEO (purgé par _purge_ghosts_loop côté hot path).
+    # On évite KEYS HASH_PREFIX:* qui est O(N) bloquant sur Redis et inclut les hashes
+    # éphémères pas encore expirés alors que le livreur a déjà disparu de la flotte.
+    livreur_ids = await r.zrange(GEO_KEY, 0, -1)
     status_counts: dict[str, int] = {"available": 0, "delivering": 0, "idle": 0}
-    if keys:
+    if livreur_ids:
         pipe = r.pipeline(transaction=False)
-        for k in keys:
-            pipe.hget(k, "status")
+        for lid in livreur_ids:
+            pipe.hget(f"{HASH_PREFIX}{lid}", "status")
         for s in await pipe.execute():
             if s in status_counts:
                 status_counts[s] += 1
@@ -629,17 +632,20 @@ async def fleet_insights(
 
     # ── Hot Path : état instantané ───────────────────────────────────────────
     total_actifs = await r.zcard(GEO_KEY)
-    keys = await r.keys(f"{HASH_PREFIX}*")
+    # Liste source : sorted set GEO purgé en continu par le hot consumer.
+    # ZRANGE est O(log N + M) et garanti non-bloquant — KEYS HASH_PREFIX:*
+    # serait O(N) sur tout le keyspace Redis, à proscrire en prod.
+    livreur_ids = await r.zrange(GEO_KEY, 0, -1)
     status_counts: dict[str, int] = {"available": 0, "delivering": 0, "idle": 0}
     idle_suspects: list[dict] = []
     low_battery: list[dict] = []
 
-    if keys:
+    if livreur_ids:
         pipe = r.pipeline(transaction=False)
-        for k in keys:
-            pipe.hmget(k, "status", "speed_kmh", "ts", "lat", "lon", "battery_pct")
+        for lid in livreur_ids:
+            pipe.hmget(f"{HASH_PREFIX}{lid}", "status", "speed_kmh", "ts", "lat", "lon", "battery_pct")
         results = await pipe.execute()
-        for k, vals in zip(keys, results):
+        for lid, vals in zip(livreur_ids, results):
             status, speed, ts, lat, lon, battery = vals
             if status in status_counts:
                 status_counts[status] += 1
@@ -647,7 +653,7 @@ async def fleet_insights(
                 # Livreur "delivering" mais vitesse quasi nulle → suspect
                 if status == "delivering" and float(speed or 0) < 1.5:
                     idle_suspects.append({
-                        "livreur_id": k.replace(HASH_PREFIX, ""),
+                        "livreur_id": lid,
                         "status": status,
                         "speed_kmh": round(float(speed or 0), 1),
                         "ts": ts,
@@ -656,7 +662,7 @@ async def fleet_insights(
                 batt = float(battery or 0)
                 if batt > 0 and batt < 20:
                     low_battery.append({
-                        "livreur_id": k.replace(HASH_PREFIX, ""),
+                        "livreur_id": lid,
                         "battery_pct": round(batt, 1),
                         "status": status,
                     })
@@ -1468,7 +1474,11 @@ async def feedback_loop_status():
     quelques exemples de clés, et la dernière mise à jour.
     """
     r: aioredis.Redis = app.state.redis
-    keys = await r.keys("fleet:context:zone:*")
+    # SCAN cursor-based, non-bloquant — KEYS bloquerait Redis sur tout le keyspace.
+    # COUNT=200 = compromis entre nombre de round-trips et taille des batches.
+    keys: list[str] = []
+    async for k in r.scan_iter(match="fleet:context:zone:*", count=200):
+        keys.append(k)
 
     if not keys:
         return {
