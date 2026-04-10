@@ -41,7 +41,8 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from aiokafka import AIOKafkaConsumer
+from aiokafka import AIOKafkaConsumer, TopicPartition
+from aiokafka.structs import OffsetAndMetadata
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -223,7 +224,14 @@ async def main() -> None:
         group_id=CONSUMER_GROUP,
         value_deserializer=lambda m: json.loads(m.decode()),
         auto_offset_reset="earliest",   # Cold path : lit depuis le début de la rétention
-        enable_auto_commit=True,
+        # IMPORTANT : commit MANUEL après flush Parquet réussi.
+        # Avec enable_auto_commit=True, Kafka committait les offsets en arrière-plan
+        # (toutes les 5s par défaut) AVANT que le buffer ne soit flushé sur disque.
+        # En cas de crash consumer entre l'auto-commit et le prochain flush, tous les
+        # records bufferisés étaient perdus définitivement (at-most-once silencieux).
+        # Le commit explicite post-flush garantit une sémantique effectively-once :
+        # si le flush échoue ou le process meurt, Kafka rejoue le batch au redémarrage.
+        enable_auto_commit=False,
         fetch_max_bytes=10_485_760,     # 10MB fetch — optimise le throughput
         max_poll_records=2_000,
     )
@@ -241,33 +249,69 @@ async def main() -> None:
         return
 
     buffer: list[dict] = []
+    # Suit le plus haut offset vu par partition depuis le dernier commit.
+    # On commit (offset + 1) — convention Kafka pour "prochaine position à lire".
+    pending_offsets: dict[TopicPartition, int] = {}
     last_flush = time.monotonic()
     total_flushed = 0
+
+    async def _flush_and_commit(reason: str) -> None:
+        """Flush Parquet, puis commit Kafka. L'ordre est non-négociable."""
+        nonlocal buffer, pending_offsets, total_flushed, last_flush
+        if not buffer:
+            return
+        log.info(
+            "Déclenchement flush [%s] : %d enregistrements en buffer",
+            reason,
+            len(buffer),
+        )
+        # 1. Écriture disque — peut lever une exception (disque plein, S3 down, ...)
+        flush(buffer)
+        # 2. Commit Kafka UNIQUEMENT si le flush a réussi
+        if pending_offsets:
+            commit_payload = {
+                tp: OffsetAndMetadata(off + 1, "")
+                for tp, off in pending_offsets.items()
+            }
+            await consumer.commit(commit_payload)
+            log.info(
+                "Offsets committés : %s",
+                {str(tp): off + 1 for tp, off in pending_offsets.items()},
+            )
+        total_flushed += len(buffer)
+        buffer = []
+        pending_offsets = {}
+        last_flush = time.monotonic()
 
     try:
         while not stop_event.is_set():
             raw = await consumer.getmany(timeout_ms=500, max_records=2_000)
-            for msgs in raw.values():
-                buffer.extend(m.value for m in msgs)
+            for tp, msgs in raw.items():
+                for m in msgs:
+                    buffer.append(m.value)
+                    # Max-offset par partition pour le commit explicite post-flush
+                    prev = pending_offsets.get(tp, -1)
+                    if m.offset > prev:
+                        pending_offsets[tp] = m.offset
 
             now = time.monotonic()
             time_exceeded = (buffer and now - last_flush >= BATCH_INTERVAL_S)
             size_exceeded = len(buffer) >= MAX_BATCH_RECORDS
 
             if time_exceeded or size_exceeded:
-                reason = "taille" if size_exceeded else "timer"
-                log.info("Déclenchement flush [%s] : %d enregistrements en buffer", reason, len(buffer))
-                flush(buffer)
-                total_flushed += len(buffer)
-                buffer = []
-                last_flush = now
+                await _flush_and_commit("taille" if size_exceeded else "timer")
 
     finally:
-        # Flush final pour ne rien perdre à l'arrêt
+        # Flush final pour ne rien perdre à l'arrêt — commit inclus
         if buffer:
-            log.info("Flush final : %d enregistrements restants...", len(buffer))
-            flush(buffer)
-            total_flushed += len(buffer)
+            try:
+                await _flush_and_commit("arrêt")
+            except Exception as exc:
+                log.error(
+                    "Flush final échoué — offsets NON committés, "
+                    "le batch sera rejoué au prochain démarrage : %s",
+                    exc,
+                )
         await consumer.stop()
         log.info("Cold consumer arrêté. Total flushé : %d enregistrements.", total_flushed)
 
