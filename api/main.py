@@ -13,6 +13,7 @@ Docs interactives : http://localhost:8001/docs
 """
 import asyncio
 import logging
+import math
 import os
 import statistics
 import time
@@ -1460,6 +1461,229 @@ async def predict_demand(
         "dispatch_prioritaire": hot[:5],
         "zones_a_decouvrir":    cold[:3],
         "toutes_zones":         zones,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  SURGE PRICING — Pièce maîtresse business
+#  Combine Hot Path (offre instantanée) + Cold Path (demande historique)
+#  pour calculer un multiplicateur de prix dynamique explicable.
+# ════════════════════════════════════════════════════════════════════════════════
+
+@app.get(
+    "/analytics/surge-price",
+    summary="Tarification dynamique — multiplicateur surge explicable (Hot ⨯ Cold)",
+    tags=["Business Intelligence"],
+)
+async def surge_price(
+    lat:    float = Query(..., description="Latitude du point de demande", ge=-90, le=90),
+    lon:    float = Query(..., description="Longitude du point de demande", ge=-180, le=180),
+    rayon:  float = Query(2.0, description="Rayon de la zone (km)", ge=0.5, le=10.0),
+    base_price_eur: float = Query(5.0, description="Prix de base de la course en euros", ge=1.0, le=100.0),
+):
+    """
+    Calcule un multiplicateur de prix dynamique (surge) à la Uber/Deliveroo.
+
+    Le surge n'est pas une boîte noire : il est décomposé en deux pressions
+    indépendantes, chacune calculée à partir d'une couche distincte de
+    l'architecture Lambda — c'est précisément ce qui rend l'endpoint
+    explicable et défendable face au régulateur (DGCCRF en France impose
+    la transparence des prix dynamiques sur les plateformes de livraison) :
+
+      • PRESSION DEMANDE (Cold Path)
+        Compare l'activité GPS dans la zone sur les 15 dernières minutes
+        avec la baseline horaire historique (1h glissante normalisée).
+        Une activité actuelle 2× supérieure à la baseline = forte demande.
+        Source : DuckDB sur Parquet partitionné par event time.
+
+      • PRESSION OFFRE (Hot Path)
+        Ratio livreurs disponibles / livreurs totaux dans le rayon.
+        Source : Redis GEOSEARCH (<10ms).
+        Plus la part de livreurs "delivering" est élevée, plus l'offre
+        disponible est rare → surge plus élevé.
+
+    Formule (additive, plafonnée) :
+        multiplier = 1.0 + α·demand_pressure + β·supply_scarcity
+        avec α=1.0, β=0.8, plafond 3.0× (au-delà = manipulation déloyale).
+
+    Cas d'usage : pricing dynamique des courses, allocation d'incentives
+    aux livreurs en zone tendue, alerte congestion pour le dispatch.
+    """
+    r: aioredis.Redis = app.state.redis
+    glob = _parquet_glob()
+
+    # ── 1. HOT PATH : photographie instantanée de l'offre dans le rayon ──────
+    raw_drivers = await r.geosearch(
+        GEO_KEY,
+        longitude=lon, latitude=lat,
+        radius=rayon, unit="km",
+        withcoord=False, count=500,
+    )
+    nb_total_zone = len(raw_drivers)
+
+    nb_available = 0
+    nb_delivering = 0
+    nb_idle = 0
+    if raw_drivers:
+        pipe = r.pipeline(transaction=False)
+        for lid in raw_drivers:
+            pipe.hget(f"{HASH_PREFIX}{lid}", "status")
+        for status in await pipe.execute():
+            if status == "available":
+                nb_available += 1
+            elif status == "delivering":
+                nb_delivering += 1
+            elif status == "idle":
+                nb_idle += 1
+
+    # Pression offre : 0.0 (beaucoup de livreurs dispos) → 1.0 (aucun dispo)
+    # On ne peut pas diviser par 0 — si la zone est désertée, scarcity = 1.0 max.
+    if nb_total_zone == 0:
+        supply_scarcity = 1.0
+        supply_label = "désert"
+    else:
+        ratio_available = nb_available / nb_total_zone
+        supply_scarcity = round(1.0 - ratio_available, 3)
+        if ratio_available >= 0.5:
+            supply_label = "abondante"
+        elif ratio_available >= 0.25:
+            supply_label = "modérée"
+        elif ratio_available > 0:
+            supply_label = "tendue"
+        else:
+            supply_label = "saturée"
+
+    # ── 2. COLD PATH : pression demande sur la zone (~rayon en degrés) ───────
+    # Conversion approximative km → degrés (1° lat ≈ 111.32 km, lon dépend du cos)
+    dlat = rayon / 111.32
+    dlon = rayon / (111.32 * max(math.cos(math.radians(lat)), 0.01))
+
+    demand_pressure = 0.0
+    recent_count = 0
+    baseline_count = 0.0
+    try:
+        rows = await _dq(
+            f"""
+            WITH zone_filter AS (
+                SELECT speed_kmh, status, ts
+                FROM read_parquet('{glob}', hive_partitioning = true)
+                WHERE ts >= NOW() - INTERVAL 1 HOUR
+                  AND lat BETWEEN ? AND ?
+                  AND lon BETWEEN ? AND ?
+            ),
+            recent AS (
+                SELECT COUNT(*) AS n
+                FROM zone_filter
+                WHERE ts >= NOW() - INTERVAL 15 MINUTE
+            ),
+            baseline AS (
+                -- Baseline : moyenne 15-min sur l'heure écoulée (normalisée)
+                SELECT COUNT(*) / 4.0 AS n
+                FROM zone_filter
+                WHERE ts <  NOW() - INTERVAL 15 MINUTE
+            )
+            SELECT recent.n, baseline.n
+            FROM recent, baseline
+            """,
+            [lat - dlat, lat + dlat, lon - dlon, lon + dlon],
+        )
+        if rows and rows[0]:
+            recent_count = int(rows[0][0] or 0)
+            baseline_count = float(rows[0][1] or 0.0)
+            if baseline_count >= 1.0:
+                # Ratio recent / baseline, recentré : 1.0 = stable, 2.0 = doublé
+                # On clamp à [0, 2] puis on divise par 2 pour rester dans [0, 1]
+                ratio = recent_count / baseline_count
+                demand_pressure = round(min(max(ratio - 1.0, 0.0), 2.0) / 2.0, 3)
+            elif recent_count > 5:
+                # Pas de baseline mais activité réelle → demande émergente
+                demand_pressure = 0.3
+    except Exception as exc:
+        log.warning("surge-price cold path error: %s", exc)
+        demand_pressure = 0.0
+
+    # ── 3. CALCUL DU MULTIPLICATEUR (formule additive plafonnée) ─────────────
+    ALPHA_DEMAND  = 1.0   # Poids de la pression demande
+    BETA_SUPPLY   = 0.8   # Poids de la rareté offre
+    SURGE_FLOOR   = 1.0   # Pas de réduction sous le prix de base
+    SURGE_CAP     = 3.0   # Plafond légal/éthique (DGCCRF)
+
+    raw_multiplier = 1.0 + ALPHA_DEMAND * demand_pressure + BETA_SUPPLY * supply_scarcity
+    multiplier = round(max(SURGE_FLOOR, min(raw_multiplier, SURGE_CAP)), 2)
+    surge_price_eur = round(base_price_eur * multiplier, 2)
+
+    # ── 4. NIVEAU & EXPLICATION HUMAINE ──────────────────────────────────────
+    if multiplier >= 2.0:
+        niveau = "extrême"
+    elif multiplier >= 1.5:
+        niveau = "élevé"
+    elif multiplier >= 1.2:
+        niveau = "modéré"
+    else:
+        niveau = "normal"
+
+    raisons = []
+    if demand_pressure >= 0.5:
+        raisons.append(
+            f"Demande {round(recent_count / max(baseline_count, 1), 1)}× supérieure "
+            f"à la baseline horaire ({recent_count} positions vs {round(baseline_count,1)} attendues)"
+        )
+    elif demand_pressure > 0:
+        raisons.append(
+            f"Demande légèrement au-dessus de la baseline ({recent_count} vs {round(baseline_count,1)})"
+        )
+    if supply_scarcity >= 0.6:
+        raisons.append(
+            f"Offre {supply_label} : {nb_available}/{nb_total_zone} livreurs disponibles dans le rayon"
+        )
+    elif supply_scarcity > 0:
+        raisons.append(
+            f"Offre {supply_label} : {nb_available} disponibles sur {nb_total_zone} présents"
+        )
+    if not raisons:
+        raisons.append("Marché équilibré — aucune pression détectée")
+
+    return {
+        "zone": {
+            "lat": lat,
+            "lon": lon,
+            "rayon_km": rayon,
+        },
+        "pricing": {
+            "base_price_eur":   base_price_eur,
+            "multiplier":       multiplier,
+            "surge_price_eur":  surge_price_eur,
+            "niveau":           niveau,
+            "cap_atteint":      multiplier >= SURGE_CAP,
+        },
+        "supply": {
+            "source":            "Redis Hot Path (GEOSEARCH)",
+            "livreurs_total":    nb_total_zone,
+            "available":         nb_available,
+            "delivering":        nb_delivering,
+            "idle":              nb_idle,
+            "scarcity_score":    supply_scarcity,
+            "label":             supply_label,
+        },
+        "demand": {
+            "source":            "DuckDB Cold Path (Parquet 15min vs baseline 1h)",
+            "recent_15min":      recent_count,
+            "baseline_15min":    round(baseline_count, 1),
+            "pressure_score":    demand_pressure,
+        },
+        "decomposition": {
+            "alpha_demand":      ALPHA_DEMAND,
+            "beta_supply":       BETA_SUPPLY,
+            "raw_multiplier":    round(raw_multiplier, 3),
+            "floor":             SURGE_FLOOR,
+            "cap":               SURGE_CAP,
+            "formule":           "1.0 + α·demand_pressure + β·supply_scarcity",
+        },
+        "explication":           " ; ".join(raisons),
+        "compliance": (
+            "Multiplicateur plafonné à 3.0× — décomposition complète exposée "
+            "pour transparence DGCCRF (loi française sur les prix dynamiques)."
+        ),
     }
 
 
