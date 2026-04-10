@@ -4,11 +4,21 @@ FleetStream — Cold Path Consumer (Batch Layer)
 Consomme le flux GPS Kafka et écrit des fichiers Parquet optimisés
 pour l'analytics et le Machine Learning.
 
-Stratégie de stockage (Hive-partitioning) :
+Stratégie de stockage (Hive-partitioning par EVENT TIME) :
   /data/parquet/
     year=2024/month=01/day=15/hour=14/
       batch_1705323600123.parquet     ← compression Snappy
       batch_1705323660456.parquet
+
+IMPORTANT — partitionnement par event time (pas par processing time) :
+  Chaque record est rangé dans la partition Hive correspondant au champ
+  `timestamp` DU MESSAGE, pas à l'heure à laquelle le consumer écrit
+  physiquement le fichier. C'est la seule stratégie qui :
+    - garantit que le predicate pushdown DuckDB (WHERE ts >= ...) bénéficie
+      du partition pruning (même heure logique ↔ même dossier) ;
+    - survit à un rejeu depuis `earliest` sans corruption de la data lake
+      (autrement tout l'historique rejoué atterrirait dans la partition now()) ;
+    - reste aligné avec l'approche Kleppmann / Beam / Flink (event time + watermark).
 
 Avantages de ce format :
   - DuckDB peut filter par partition SANS lire les données (predicate pushdown)
@@ -25,6 +35,7 @@ import logging
 import os
 import signal
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -64,52 +75,72 @@ SCHEMA = pa.schema([
 ])
 
 
-def flush(records: list[dict]) -> None:
+def _parse_ts(s: str | None) -> datetime | None:
+    """Parse une chaîne ISO-8601 → datetime aware UTC. Retourne None si invalide."""
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt
+
+
+def _partition_dir(key: tuple[int, int, int, int] | None) -> Path:
     """
-    Sérialise un buffer en Parquet Snappy dans la bonne partition temporelle.
-    Utilise PyArrow directement (pas pandas) — ~3x plus rapide pour l'écriture.
+    Construit le chemin Hive-partitionné pour une clé (year, month, day, hour).
+    La clé None est réservée aux records dont le timestamp n'a pas pu être parsé.
     """
-    now = datetime.now(timezone.utc)
-    partition = (
+    if key is None:
+        return (
+            DATA_PATH
+            / "year=unknown"
+            / "month=unknown"
+            / "day=unknown"
+            / "hour=unknown"
+        )
+    y, m, d, h = key
+    return (
         DATA_PATH
-        / f"year={now.year}"
-        / f"month={now.month:02d}"
-        / f"day={now.day:02d}"
-        / f"hour={now.hour:02d}"
+        / f"year={y}"
+        / f"month={m:02d}"
+        / f"day={d:02d}"
+        / f"hour={h:02d}"
     )
+
+
+def _write_parquet(
+    key: tuple[int, int, int, int] | None,
+    records: list[tuple[dict, datetime | None]],
+) -> None:
+    """
+    Sérialise un sous-batch déjà groupé par (year, month, day, hour) en event time.
+    Chaque entrée est (record_dict, parsed_datetime) pour éviter un second parse.
+    """
+    partition = _partition_dir(key)
     partition.mkdir(parents=True, exist_ok=True)
 
-    # Conversion des timestamps ISO 8601 → datetime → Arrow timestamp
-    # pa.array() ne parse pas les strings ISO directement : on parse manuellement
-    def _parse_ts(s: str | None) -> datetime | None:
-        if not s:
-            return None
-        try:
-            return datetime.fromisoformat(s)
-        except ValueError:
-            return None
-
-    try:
-        ts_array = pa.array(
-            [_parse_ts(r.get("timestamp")) for r in records],
-            type=pa.timestamp("ms", tz="UTC"),
-        )
-    except Exception:
-        log.warning("Timestamps invalides dans le batch — fallback None")
-        ts_array = pa.array([None] * len(records), type=pa.timestamp("ms", tz="UTC"))
+    ts_array = pa.array(
+        [dt for _, dt in records],
+        type=pa.timestamp("ms", tz="UTC"),
+    )
 
     table = pa.table(
         {
-            "livreur_id":  pa.array([r.get("livreur_id", "")  for r in records]),
-            "lat":         pa.array([r.get("lat",  0.0)        for r in records], type=pa.float64()),
-            "lon":         pa.array([r.get("lon",  0.0)        for r in records], type=pa.float64()),
-            "speed_kmh":   pa.array([r.get("speed_kmh",   0.0) for r in records], type=pa.float32()),
-            "heading_deg": pa.array([r.get("heading_deg", 0.0) for r in records], type=pa.float32()),
-            "status":      pa.array([r.get("status", "")       for r in records]).cast(
+            "livreur_id":  pa.array([r.get("livreur_id", "") for r, _ in records]),
+            "lat":         pa.array([r.get("lat",  0.0)       for r, _ in records], type=pa.float64()),
+            "lon":         pa.array([r.get("lon",  0.0)       for r, _ in records], type=pa.float64()),
+            "speed_kmh":   pa.array([r.get("speed_kmh",   0.0) for r, _ in records], type=pa.float32()),
+            "heading_deg": pa.array([r.get("heading_deg", 0.0) for r, _ in records], type=pa.float32()),
+            "status":      pa.array([r.get("status", "")       for r, _ in records]).cast(
                 pa.dictionary(pa.int8(), pa.string())
             ),
-            "accuracy_m":  pa.array([r.get("accuracy_m", 0.0) for r in records], type=pa.float32()),
-            "battery_pct": pa.array([r.get("battery_pct", 0.0) for r in records], type=pa.float32()),
+            "accuracy_m":  pa.array([r.get("accuracy_m", 0.0) for r, _ in records], type=pa.float32()),
+            "battery_pct": pa.array([r.get("battery_pct", 0.0) for r, _ in records], type=pa.float32()),
             "ts": ts_array,
         },
         schema=SCHEMA,
@@ -125,9 +156,52 @@ def flush(records: list[dict]) -> None:
     size_kb = path.stat().st_size // 1024
     log.info(
         "Flush → %s | %d enregistrements | %d KB | partition %s",
-        path.name, len(records), size_kb,
-        f"year={now.year}/month={now.month:02d}/day={now.day:02d}/hour={now.hour:02d}",
+        path.name,
+        len(records),
+        size_kb,
+        partition.relative_to(DATA_PATH),
     )
+
+
+def flush(records: list[dict]) -> None:
+    """
+    Sérialise un buffer en Parquet Snappy, partitionné par EVENT TIME.
+
+    Les records sont groupés par (year, month, day, hour) dérivés du champ
+    `timestamp` de chaque message. Chaque bucket produit un fichier Parquet
+    distinct dans la bonne partition Hive — indispensable pour :
+      - le predicate pushdown DuckDB (WHERE ts >= ...) ;
+      - la tolérance aux rejeux Kafka depuis `earliest` ;
+      - l'alignement avec les conventions Flink / Beam / Spark Structured
+        Streaming (event time vs processing time).
+    """
+    # Groupage par event time en UN SEUL passage sur le buffer
+    buckets: dict[tuple[int, int, int, int] | None, list[tuple[dict, datetime | None]]] = defaultdict(list)
+    for r in records:
+        dt = _parse_ts(r.get("timestamp"))
+        if dt is None:
+            # Timestamp manquant / invalide → partition "unknown" (jamais silencieux)
+            buckets[None].append((r, None))
+        else:
+            key = (dt.year, dt.month, dt.day, dt.hour)
+            buckets[key].append((r, dt))
+
+    nb_invalid = len(buckets.get(None, []))
+    if nb_invalid:
+        log.warning(
+            "flush: %d record(s) sans timestamp valide → partition year=unknown",
+            nb_invalid,
+        )
+
+    for key, sub_records in buckets.items():
+        _write_parquet(key, sub_records)
+
+    if len(buckets) > 1:
+        log.info(
+            "Flush réparti sur %d partitions event-time (buffer=%d records)",
+            len(buckets),
+            len(records),
+        )
 
 
 async def main() -> None:
