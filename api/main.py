@@ -75,6 +75,20 @@ async def lifespan(app: FastAPI):
     # Connexion Redis
     app.state.redis = aioredis.from_url(REDIS_URL, decode_responses=True)
 
+    # Connexion DuckDB persistante — source de vérité pour tous les endpoints
+    # Cold Path. Chaque requête obtient son propre cursor (thread-safe), ce qui
+    # évite (1) la latence de setup d'une connexion DuckDB par requête
+    # (~20-50ms), (2) le re-chargement des extensions (parquet, httpfs) et
+    # (3) le re-scan du cache de métadonnées Parquet. L'extension httpfs est
+    # pré-chargée pour préparer la future migration vers MinIO/S3.
+    app.state.duckdb = duckdb.connect(":memory:")
+    try:
+        app.state.duckdb.execute("INSTALL parquet; LOAD parquet;")
+        app.state.duckdb.execute("INSTALL httpfs; LOAD httpfs;")
+    except Exception as exc:
+        log.warning("DuckDB extension preload partiel : %s", exc)
+    log.info("Connexion DuckDB persistante initialisée (:memory:)")
+
     # Expose /metrics AVANT de lancer la boucle d'events
     instrumentator.expose(app, endpoint="/metrics", include_in_schema=False)
 
@@ -109,8 +123,7 @@ async def lifespan(app: FastAPI):
         while True:
             try:
                 glob_path = str(DATA_PATH / "**" / "*.parquet")
-                conn = duckdb.connect()
-                rows = conn.execute(
+                rows = await _dq(
                     f"""
                     SELECT
                         ROUND(ROUND(lat / 0.02, 0) * 0.02, 3) AS lat_cell,
@@ -123,8 +136,7 @@ async def lifespan(app: FastAPI):
                     GROUP BY lat_cell, lon_cell
                     HAVING COUNT(*) >= 20
                     """
-                ).fetchall()
-                conn.close()
+                )
 
                 r: aioredis.Redis = app.state.redis
                 pipe = r.pipeline(transaction=False)
@@ -150,6 +162,10 @@ async def lifespan(app: FastAPI):
     yield
     task.cancel()
     task2.cancel()
+    try:
+        app.state.duckdb.close()
+    except Exception:
+        pass
     await app.state.redis.aclose()
     log.info("API arrêtée proprement.")
 
@@ -230,6 +246,25 @@ class HistoryResponse(BaseModel):
 # ── Utilitaires ─────────────────────────────────────────────────────────────────
 def _parquet_glob() -> str:
     return str(DATA_PATH / "**" / "*.parquet")
+
+
+async def _dq(sql: str, params: list | None = None) -> list[tuple]:
+    """
+    Exécute une requête SQL sur la connexion DuckDB partagée dans un thread.
+
+    Chaque appel obtient son propre cursor via app.state.duckdb.cursor(), ce qui
+    isole l'état d'exécution (prepared statements, résultats) de la connexion
+    parente tout en partageant le catalogue et le cache. C'est le pattern
+    recommandé par DuckDB pour les serveurs HTTP multi-requêtes.
+
+    L'exécution est déportée via asyncio.to_thread pour ne pas bloquer la boucle
+    d'événements uvicorn pendant les scans Parquet (qui peuvent durer plusieurs
+    dizaines de millisecondes et saturaient auparavant toute l'API).
+    """
+    def _run() -> list[tuple]:
+        cur = app.state.duckdb.cursor()
+        return cur.execute(sql, params or []).fetchall()
+    return await asyncio.to_thread(_run)
 
 
 def _percentile(data: list[float], pct: int) -> float:
@@ -387,11 +422,9 @@ async def history(
     """
     glob = _parquet_glob()
     try:
-        conn = duckdb.connect()
-
         # glob vient de DATA_PATH (config serveur, pas entrée user) → interpolation safe
         # livreur_id et heures restent paramétrés (protection injection)
-        rows = conn.execute(
+        rows = await _dq(
             f"""
             SELECT lat, lon, speed_kmh, heading_deg, status, ts
             FROM   read_parquet('{glob}', hive_partitioning = true)
@@ -400,17 +433,16 @@ async def history(
             ORDER BY ts
             """,
             [livreur_id, heures],
-        ).fetchall()
+        )
 
         if not rows:
-            conn.close()
             raise HTTPException(
                 status_code=404,
                 detail=f"Aucune donnée historique pour '{livreur_id}' sur {heures}h.",
             )
 
         # Distance totale (Haversine vectorisé côté DuckDB)
-        dist_row = conn.execute(
+        dist_rows = await _dq(
             f"""
             WITH ordered AS (
                 SELECT lat, lon,
@@ -430,9 +462,8 @@ async def history(
             FROM ordered WHERE prev_lat IS NOT NULL
             """,
             [livreur_id, heures],
-        ).fetchone()
-
-        conn.close()
+        )
+        dist_row = dist_rows[0] if dist_rows else (0.0,)
 
     except HTTPException:
         raise
@@ -482,8 +513,7 @@ async def heatmap(
 ):
     glob = _parquet_glob()
     try:
-        conn = duckdb.connect()
-        rows = conn.execute(
+        rows = await _dq(
             f"""
             SELECT
                 ROUND(lat / ?, 0) * ?  AS lat_cell,
@@ -497,8 +527,7 @@ async def heatmap(
             LIMIT  500
             """,
             [resolution, resolution, resolution, resolution, heures],
-        ).fetchall()
-        conn.close()
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Erreur DuckDB : {exc}")
 
@@ -647,8 +676,7 @@ async def fleet_insights(
     # ── Cold Path : productivité historique ──────────────────────────────────
     cold_stats = {}
     try:
-        conn = duckdb.connect()
-        row = conn.execute(
+        rows = await _dq(
             f"""
             SELECT
                 COUNT(DISTINCT livreur_id)                              AS nb_livreurs,
@@ -662,8 +690,8 @@ async def fleet_insights(
             WHERE ts >= NOW() - INTERVAL (CAST(? AS INTEGER)) HOUR
             """,
             [heures],
-        ).fetchone()
-        conn.close()
+        )
+        row = rows[0] if rows else None
         if row:
             cold_stats = {
                 "livreurs_actifs_periode": row[0],
@@ -772,8 +800,7 @@ async def driver_score(
     """
     glob = _parquet_glob()
     try:
-        conn = duckdb.connect()
-        row = conn.execute(
+        rows = await _dq(
             f"""
             WITH ordered AS (
                 SELECT
@@ -809,8 +836,8 @@ async def driver_score(
             SELECT * FROM stats
             """,
             [livreur_id, heures],
-        ).fetchone()
-        conn.close()
+        )
+        row = rows[0] if rows else None
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Erreur DuckDB : {exc}")
 
@@ -927,8 +954,7 @@ async def zone_coverage(
     # ── Cold Path : densité historique par cellule ───────────────────────────
     demand: dict[tuple, int] = {}
     try:
-        conn = duckdb.connect()
-        rows = conn.execute(
+        rows = await _dq(
             f"""
             SELECT
                 ROUND(ROUND(lat / ?, 0) * ?, 4)  AS lat_cell,
@@ -939,8 +965,7 @@ async def zone_coverage(
             GROUP BY lat_cell, lon_cell
             """,
             [resolution, resolution, resolution, resolution, heures],
-        ).fetchall()
-        conn.close()
+        )
         for lat_c, lon_c, passages in rows:
             demand[(lat_c, lon_c)] = passages
     except Exception as exc:
@@ -1023,10 +1048,8 @@ async def detect_anomalies(
     """
     glob = _parquet_glob()
     try:
-        conn = duckdb.connect()
-
         # Récupère les stats par livreur sur la fenêtre demandée
-        rows = conn.execute(
+        rows = await _dq(
             f"""
             WITH base AS (
                 SELECT
@@ -1067,16 +1090,16 @@ async def detect_anomalies(
             ORDER BY z_score DESC, nb_exces_vitesse DESC
             """,
             [fenetre_minutes, seuil_vitesse, seuil_immobile, fenetre_minutes],
-        ).fetchall()
-        total_scanned = conn.execute(
+        )
+        scanned_rows = await _dq(
             f"""
             SELECT COUNT(DISTINCT livreur_id)
             FROM read_parquet('{glob}', hive_partitioning = true)
             WHERE ts >= NOW() - INTERVAL (CAST(? AS INTEGER)) MINUTE
             """,
             [fenetre_minutes],
-        ).fetchone()[0]
-        conn.close()
+        )
+        total_scanned = scanned_rows[0][0] if scanned_rows else 0
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Erreur DuckDB : {exc}")
 
@@ -1174,8 +1197,7 @@ async def detect_gps_fraud(
     """
     glob = _parquet_glob()
     try:
-        conn = duckdb.connect()
-        rows = conn.execute(
+        rows = await _dq(
             f"""
             WITH ordered AS (
                 SELECT
@@ -1225,10 +1247,10 @@ async def detect_gps_fraud(
             LIMIT 50
             """,
             [fenetre_minutes, seuil_teleport_km, vitesse_max_physique_kmh],
-        ).fetchall()
+        )
 
         # Positions figées : même lat/lon sur >5 mesures consécutives
-        frozen = conn.execute(
+        frozen = await _dq(
             f"""
             WITH numbered AS (
                 SELECT
@@ -1259,17 +1281,17 @@ async def detect_gps_fraud(
             LIMIT 20
             """,
             [fenetre_minutes],
-        ).fetchall()
+        )
 
-        total_scanned = conn.execute(
+        scanned_rows = await _dq(
             f"""
             SELECT COUNT(DISTINCT livreur_id)
             FROM read_parquet('{glob}', hive_partitioning = true)
             WHERE ts >= NOW() - INTERVAL (CAST(? AS INTEGER)) MINUTE
             """,
             [fenetre_minutes],
-        ).fetchone()[0]
-        conn.close()
+        )
+        total_scanned = scanned_rows[0][0] if scanned_rows else 0
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Erreur DuckDB : {exc}")
 
@@ -1354,8 +1376,7 @@ async def predict_demand(
     """
     glob = _parquet_glob()
     try:
-        conn = duckdb.connect()
-        rows = conn.execute(
+        rows = await _dq(
             f"""
             WITH recent AS (
                 SELECT
@@ -1393,8 +1414,7 @@ async def predict_demand(
             ORDER BY tendance_pct DESC
             LIMIT 30
             """,
-        ).fetchall()
-        conn.close()
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Erreur DuckDB : {exc}")
 
