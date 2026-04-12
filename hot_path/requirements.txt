@@ -3,4 +3,7 @@ cramjam>=2.8.0
 redis[asyncio]==5.0.8
 python-dotenv==1.0.1
 pydantic==2.8.2
+<<<<<<< HEAD
 protobuf==5.27.3
+=======
+>>>>>>> 1e748612d6bf2a042e5d2f6a6384e77bbc69a8c8
