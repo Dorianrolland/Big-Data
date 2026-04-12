@@ -12,6 +12,7 @@ Monitoring : Prometheus via /metrics (prometheus-fastapi-instrumentator)
 Docs interactives : http://localhost:8001/docs
 """
 import asyncio
+import json
 import logging
 import math
 import os
@@ -32,6 +33,8 @@ from prometheus_client import Gauge
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
 
+from copilot_router import copilot_router, start_copilot_background_tasks, stop_copilot_background_tasks
+
 load_dotenv()
 
 logging.basicConfig(
@@ -47,6 +50,9 @@ DATA_PATH = Path(os.getenv("DATA_PATH", "/data/parquet"))
 GEO_KEY          = "fleet:geo"
 HASH_PREFIX      = "fleet:livreur:"
 STATS_MSGS_KEY   = "fleet:stats:total_messages"
+STATS_DLQ_KEY    = "fleet:stats:dlq_count"
+DLQ_KEY          = "fleet:dlq"
+DLQ_PATH         = Path(os.getenv("DLQ_PATH", "/data/dlq"))
 
 # ── Prometheus custom metrics ───────────────────────────────────────────────────
 gauge_active_livreurs = Gauge(
@@ -157,12 +163,14 @@ async def lifespan(app: FastAPI):
                 log.warning("Feedback loop error: %s", exc)
             await asyncio.sleep(300)  # 5 minutes
 
-    task  = asyncio.create_task(_update_fleet_metrics())
+    task = asyncio.create_task(_update_fleet_metrics())
     task2 = asyncio.create_task(_feedback_loop())
+    copilot_tasks = start_copilot_background_tasks(app)
     log.info("FleetStream API v2 démarrée — Redis: %s | Data: %s", REDIS_URL, DATA_PATH)
     yield
     task.cancel()
     task2.cancel()
+    stop_copilot_background_tasks(copilot_tasks)
     try:
         app.state.duckdb.close()
     except Exception:
@@ -189,7 +197,7 @@ instrumentator.instrument(app)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -197,6 +205,8 @@ app.add_middleware(
 _DASHBOARD_DIR = Path(__file__).parent / "static"
 if _DASHBOARD_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(_DASHBOARD_DIR)), name="static")
+
+app.include_router(copilot_router)
 
 @app.get("/map", include_in_schema=False)
 async def live_map():
@@ -287,11 +297,11 @@ def _percentile(data: list[float], pct: int) -> float:
     tags=["Hot Path"],
 )
 async def livreurs_proches(
-    lat:    float = Query(..., description="Latitude",  example=48.8566),
-    lon:    float = Query(..., description="Longitude", example=2.3522),
+    lat:    float = Query(..., description="Latitude",  example=40.7580),
+    lon:    float = Query(..., description="Longitude", example=-73.9855),
     rayon:  float = Query(1.5, description="Rayon en km", ge=0.1, le=50.0),
     statut: Optional[Literal["available", "delivering", "idle"]] = Query(None),
-    limit:  int   = Query(50, ge=1, le=200),
+    limit:  int   = Query(50, ge=1, le=1000),
 ):
     r: aioredis.Redis = app.state.redis
 
@@ -401,6 +411,99 @@ async def stats():
             ),
             "backend":            "Apache Parquet (Snappy) + DuckDB",
         },
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  DEAD LETTER QUEUE — observabilité des messages rejetés à la validation
+# ════════════════════════════════════════════════════════════════════════════════
+
+@app.get(
+    "/dlq/stats",
+    summary="Statistiques de la Dead Letter Queue (Hot + Cold Path)",
+    tags=["Hot Path"],
+)
+async def dlq_stats():
+    """
+    Synthèse des messages GPS rejetés par la validation Pydantic dans les
+    deux consumers. Chaque couche route ses rejets vers un sink différent
+    pour préserver l'indépendance Speed/Batch :
+
+    - Hot Path : Redis LIST `fleet:dlq` (LPUSH + LTRIM 1000) — fenêtre
+      glissante des derniers rejets, latency-friendly.
+    - Cold Path : fichiers JSONL append-only `/data/dlq/cold-dlq-<jour>.jsonl`
+      — audit hors-ligne, requêtable par DuckDB read_json_auto().
+
+    Cas d'usage : surveiller la qualité du flux producer, détecter une
+    régression de schéma, alimenter une alerte si le taux de rejet
+    dépasse un seuil métier.
+    """
+    r: aioredis.Redis = app.state.redis
+
+    # ── Hot Path : compteur Redis + taille de la liste DLQ ───────────────────
+    hot_count = int(await r.get(STATS_DLQ_KEY) or 0)
+    hot_window_size = await r.llen(DLQ_KEY)
+
+    # ── Cold Path : agrégation des fichiers DLQ JSONL ────────────────────────
+    cold_count = 0
+    cold_files: list[dict] = []
+    if DLQ_PATH.exists():
+        for f in sorted(DLQ_PATH.glob("cold-dlq-*.jsonl")):
+            try:
+                # Compte les lignes sans charger le fichier en mémoire
+                with f.open("rb") as fh:
+                    nb = sum(1 for _ in fh)
+                cold_count += nb
+                cold_files.append({
+                    "fichier": f.name,
+                    "rejets":  nb,
+                    "taille_kb": f.stat().st_size // 1024,
+                })
+            except OSError:
+                pass
+
+    return {
+        "hot_path": {
+            "source":            "Redis LIST fleet:dlq",
+            "rejets_cumules":    hot_count,
+            "fenetre_glissante": hot_window_size,
+            "cap_max":           1000,
+        },
+        "cold_path": {
+            "source":           "JSONL /data/dlq/cold-dlq-*.jsonl",
+            "rejets_cumules":   cold_count,
+            "fichiers":         cold_files,
+        },
+        "total_rejets": hot_count + cold_count,
+    }
+
+
+@app.get(
+    "/dlq/peek",
+    summary="Inspecter les N derniers messages rejetés (Hot Path)",
+    tags=["Hot Path"],
+)
+async def dlq_peek(
+    limit: int = Query(20, description="Nombre de rejets à retourner", ge=1, le=200),
+):
+    """
+    Retourne les `limit` derniers messages rejetés depuis la DLQ Redis.
+    Permet de diagnostiquer rapidement un producer bugué : on voit le
+    payload brut + la raison Pydantic (champ manquant, valeur hors borne...).
+    """
+    r: aioredis.Redis = app.state.redis
+    raw_items = await r.lrange(DLQ_KEY, 0, limit - 1)
+    items: list[dict] = []
+    for s in raw_items:
+        try:
+            items.append(json.loads(s))
+        except (ValueError, TypeError):
+            items.append({"raw": s, "reason": "DLQ entry not JSON-decodable"})
+    return {
+        "source":   "Redis LIST fleet:dlq (LPUSH + LTRIM 1000)",
+        "limit":    limit,
+        "returned": len(items),
+        "items":    items,
     }
 
 
@@ -566,16 +669,16 @@ async def performance_check(
 
     # Warm-up (5 requêtes ignorées)
     for _ in range(5):
-        await r.geosearch(GEO_KEY, longitude=2.3522, latitude=48.8566,
-                          radius=15, unit="km", count=10)
+        await r.geosearch(GEO_KEY, longitude=-73.9855, latitude=40.7580,
+                          radius=20, unit="km", count=10)
 
     latencies_ms: list[float] = []
     for _ in range(samples):
         t0 = time.perf_counter()
         await r.geosearch(
             GEO_KEY,
-            longitude=2.3522, latitude=48.8566,
-            radius=15, unit="km",
+            longitude=-73.9855, latitude=40.7580,
+            radius=20, unit="km",
             withcoord=False, withdist=False,
             count=100,
         )
@@ -946,8 +1049,8 @@ async def zone_coverage(
     # ── Hot Path : positions actuelles → agrégation par cellule ─────────────
     raw = await r.geosearch(
         GEO_KEY,
-        longitude=2.3522, latitude=48.8566,
-        radius=15, unit="km",
+        longitude=-73.9855, latitude=40.7580,
+        radius=20, unit="km",
         withcoord=True, count=500,
     )
     supply: dict[tuple, int] = {}

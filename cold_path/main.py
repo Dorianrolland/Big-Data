@@ -1,33 +1,8 @@
 """
-FleetStream — Cold Path Consumer (Batch Layer)
-==============================================
-Consomme le flux GPS Kafka et écrit des fichiers Parquet optimisés
-pour l'analytics et le Machine Learning.
+FleetStream cold consumer for lambda batch layer.
 
-Stratégie de stockage (Hive-partitioning par EVENT TIME) :
-  /data/parquet/
-    year=2024/month=01/day=15/hour=14/
-      batch_1705323600123.parquet     ← compression Snappy
-      batch_1705323660456.parquet
-
-IMPORTANT — partitionnement par event time (pas par processing time) :
-  Chaque record est rangé dans la partition Hive correspondant au champ
-  `timestamp` DU MESSAGE, pas à l'heure à laquelle le consumer écrit
-  physiquement le fichier. C'est la seule stratégie qui :
-    - garantit que le predicate pushdown DuckDB (WHERE ts >= ...) bénéficie
-      du partition pruning (même heure logique ↔ même dossier) ;
-    - survit à un rejeu depuis `earliest` sans corruption de la data lake
-      (autrement tout l'historique rejoué atterrirait dans la partition now()) ;
-    - reste aligné avec l'approche Kleppmann / Beam / Flink (event time + watermark).
-
-Avantages de ce format :
-  - DuckDB peut filter par partition SANS lire les données (predicate pushdown)
-  - Compatible Spark / Hive / Athena pour un passage en production
-  - Chaque fichier est autonome (row groups de 10k lignes)
-
-Déclenchement du flush :
-  - Toutes les BATCH_INTERVAL_SECONDS secondes (défaut : 60s), OU
-  - Dès que le buffer atteint MAX_BATCH_RECORDS enregistrements
+- keeps existing position parquet layout for backward compatibility
+- writes copilot events to a dedicated parquet_events lake
 """
 import asyncio
 import json
@@ -45,171 +20,313 @@ from aiokafka import AIOKafkaConsumer, TopicPartition
 from aiokafka.structs import OffsetAndMetadata
 from dotenv import load_dotenv
 
+from copilot_events_pb2 import ContextSignalV1, CourierPositionV1, OrderEventV1, OrderOfferV1
+
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("cold-consumer")
 
-# ── Config ──────────────────────────────────────────────────────────────────────
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "redpanda:9092")
-TOPIC = os.getenv("KAFKA_TOPIC", "livreurs-gps")
+COURIER_TOPIC = os.getenv("KAFKA_TOPIC", "livreurs-gps")
+ORDER_OFFERS_TOPIC = os.getenv("ORDER_OFFERS_TOPIC", "order-offers-v1")
+ORDER_EVENTS_TOPIC = os.getenv("ORDER_EVENTS_TOPIC", "order-events-v1")
+CONTEXT_SIGNALS_TOPIC = os.getenv("CONTEXT_SIGNALS_TOPIC", "context-signals-v1")
+
 DATA_PATH = Path(os.getenv("DATA_PATH", "/data/parquet"))
+EVENTS_PATH = Path(os.getenv("EVENTS_PATH", "/data/parquet_events"))
+DLQ_PATH = Path(os.getenv("DLQ_PATH", "/data/dlq"))
 BATCH_INTERVAL_S = int(os.getenv("BATCH_INTERVAL_SECONDS", "60"))
 MAX_BATCH_RECORDS = int(os.getenv("MAX_BATCH_RECORDS", "50000"))
 CONSUMER_GROUP = "cold-consumer"
 
-# Schéma Arrow explicite — garantit la cohérence entre les fichiers
-# 'status' en dictionary encoding : très efficace pour les valeurs répétées
-SCHEMA = pa.schema([
-    pa.field("livreur_id",  pa.string()),
-    pa.field("lat",         pa.float64()),
-    pa.field("lon",         pa.float64()),
-    pa.field("speed_kmh",   pa.float32()),
-    pa.field("heading_deg", pa.float32()),
-    pa.field("status",      pa.dictionary(pa.int8(), pa.string())),
-    pa.field("accuracy_m",  pa.float32()),
-    pa.field("battery_pct", pa.float32()),
-    pa.field("ts",          pa.timestamp("ms", tz="UTC")),
-])
+POSITION_SCHEMA = pa.schema(
+    [
+        pa.field("livreur_id", pa.string()),
+        pa.field("lat", pa.float64()),
+        pa.field("lon", pa.float64()),
+        pa.field("speed_kmh", pa.float32()),
+        pa.field("heading_deg", pa.float32()),
+        pa.field("status", pa.dictionary(pa.int8(), pa.string())),
+        pa.field("accuracy_m", pa.float32()),
+        pa.field("battery_pct", pa.float32()),
+        pa.field("ts", pa.timestamp("ms", tz="UTC")),
+    ]
+)
+
+EVENT_SCHEMA = pa.schema(
+    [
+        pa.field("topic", pa.string()),
+        pa.field("event_type", pa.string()),
+        pa.field("event_id", pa.string()),
+        pa.field("offer_id", pa.string()),
+        pa.field("order_id", pa.string()),
+        pa.field("courier_id", pa.string()),
+        pa.field("status", pa.string()),
+        pa.field("zone_id", pa.string()),
+        pa.field("pickup_lat", pa.float64()),
+        pa.field("pickup_lon", pa.float64()),
+        pa.field("dropoff_lat", pa.float64()),
+        pa.field("dropoff_lon", pa.float64()),
+        pa.field("estimated_fare_eur", pa.float32()),
+        pa.field("estimated_distance_km", pa.float32()),
+        pa.field("estimated_duration_min", pa.float32()),
+        pa.field("actual_fare_eur", pa.float32()),
+        pa.field("actual_distance_km", pa.float32()),
+        pa.field("actual_duration_min", pa.float32()),
+        pa.field("demand_index", pa.float32()),
+        pa.field("supply_index", pa.float32()),
+        pa.field("weather_factor", pa.float32()),
+        pa.field("traffic_factor", pa.float32()),
+        pa.field("source", pa.string()),
+        pa.field("ts", pa.timestamp("ms", tz="UTC")),
+    ]
+)
 
 
-def _parse_ts(s: str | None) -> datetime | None:
-    """Parse une chaîne ISO-8601 → datetime aware UTC. Retourne None si invalide."""
-    if not s:
+def parse_ts(ts_text: str | None) -> datetime | None:
+    if not ts_text:
         return None
     try:
-        dt = datetime.fromisoformat(s)
+        dt = datetime.fromisoformat(ts_text)
     except ValueError:
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt = dt.astimezone(timezone.utc)
-    return dt
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
-def _partition_dir(key: tuple[int, int, int, int] | None) -> Path:
-    """
-    Construit le chemin Hive-partitionné pour une clé (year, month, day, hour).
-    La clé None est réservée aux records dont le timestamp n'a pas pu être parsé.
-    """
-    if key is None:
-        return (
-            DATA_PATH
-            / "year=unknown"
-            / "month=unknown"
-            / "day=unknown"
-            / "hour=unknown"
-        )
-    y, m, d, h = key
-    return (
-        DATA_PATH
-        / f"year={y}"
-        / f"month={m:02d}"
-        / f"day={d:02d}"
-        / f"hour={h:02d}"
-    )
+def write_dlq_jsonl(rejected: list[tuple[str, bytes, str]]) -> None:
+    if not rejected:
+        return
+    DLQ_PATH.mkdir(parents=True, exist_ok=True)
+    path = DLQ_PATH / f"cold-dlq-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.jsonl"
+    ts_rejected = datetime.now(timezone.utc).isoformat()
+    with path.open("a", encoding="utf-8") as fh:
+        for topic, raw, reason in rejected:
+            record = {
+                "topic": topic,
+                "reason": reason,
+                "raw_hex": raw.hex()[:8000],
+                "ts_rejected": ts_rejected,
+            }
+            fh.write(json.dumps(record) + "\n")
+    log.warning("wrote %d invalid events to %s", len(rejected), path.name)
 
 
-def _write_parquet(
-    key: tuple[int, int, int, int] | None,
-    records: list[tuple[dict, datetime | None]],
-) -> None:
-    """
-    Sérialise un sous-batch déjà groupé par (year, month, day, hour) en event time.
-    Chaque entrée est (record_dict, parsed_datetime) pour éviter un second parse.
-    """
-    partition = _partition_dir(key)
-    partition.mkdir(parents=True, exist_ok=True)
-
-    ts_array = pa.array(
-        [dt for _, dt in records],
-        type=pa.timestamp("ms", tz="UTC"),
-    )
-
-    table = pa.table(
-        {
-            "livreur_id":  pa.array([r.get("livreur_id", "") for r, _ in records]),
-            "lat":         pa.array([r.get("lat",  0.0)       for r, _ in records], type=pa.float64()),
-            "lon":         pa.array([r.get("lon",  0.0)       for r, _ in records], type=pa.float64()),
-            "speed_kmh":   pa.array([r.get("speed_kmh",   0.0) for r, _ in records], type=pa.float32()),
-            "heading_deg": pa.array([r.get("heading_deg", 0.0) for r, _ in records], type=pa.float32()),
-            "status":      pa.array([r.get("status", "")       for r, _ in records]).cast(
-                pa.dictionary(pa.int8(), pa.string())
-            ),
-            "accuracy_m":  pa.array([r.get("accuracy_m", 0.0) for r, _ in records], type=pa.float32()),
-            "battery_pct": pa.array([r.get("battery_pct", 0.0) for r, _ in records], type=pa.float32()),
-            "ts": ts_array,
-        },
-        schema=SCHEMA,
-    )
-
-    path = partition / f"batch_{int(time.time() * 1000)}.parquet"
-    pq.write_table(
-        table,
-        path,
-        compression="snappy",     # Snappy : bon ratio compression/vitesse décompression
-        row_group_size=10_000,    # Optimal pour DuckDB (predicate pushdown par row group)
-    )
-    size_kb = path.stat().st_size // 1024
-    log.info(
-        "Flush → %s | %d enregistrements | %d KB | partition %s",
-        path.name,
-        len(records),
-        size_kb,
-        partition.relative_to(DATA_PATH),
-    )
+def partition_dir(root: Path, dt: datetime | None) -> Path:
+    if dt is None:
+        return root / "year=unknown" / "month=unknown" / "day=unknown" / "hour=unknown"
+    return root / f"year={dt.year}" / f"month={dt.month:02d}" / f"day={dt.day:02d}" / f"hour={dt.hour:02d}"
 
 
-def flush(records: list[dict]) -> None:
-    """
-    Sérialise un buffer en Parquet Snappy, partitionné par EVENT TIME.
+def write_positions(records: list[dict]) -> None:
+    buckets: dict[tuple[int, int, int, int] | None, list[dict]] = defaultdict(list)
+    for rec in records:
+        dt = parse_ts(rec.get("ts"))
+        key = None if dt is None else (dt.year, dt.month, dt.day, dt.hour)
+        buckets[key].append(rec)
 
-    Les records sont groupés par (year, month, day, hour) dérivés du champ
-    `timestamp` de chaque message. Chaque bucket produit un fichier Parquet
-    distinct dans la bonne partition Hive — indispensable pour :
-      - le predicate pushdown DuckDB (WHERE ts >= ...) ;
-      - la tolérance aux rejeux Kafka depuis `earliest` ;
-      - l'alignement avec les conventions Flink / Beam / Spark Structured
-        Streaming (event time vs processing time).
-    """
-    # Groupage par event time en UN SEUL passage sur le buffer
-    buckets: dict[tuple[int, int, int, int] | None, list[tuple[dict, datetime | None]]] = defaultdict(list)
-    for r in records:
-        dt = _parse_ts(r.get("timestamp"))
-        if dt is None:
-            # Timestamp manquant / invalide → partition "unknown" (jamais silencieux)
-            buckets[None].append((r, None))
+    for key, items in buckets.items():
+        if key is None:
+            dt = None
         else:
-            key = (dt.year, dt.month, dt.day, dt.hour)
-            buckets[key].append((r, dt))
+            dt = datetime(key[0], key[1], key[2], key[3], tzinfo=timezone.utc)
+        folder = partition_dir(DATA_PATH, dt)
+        folder.mkdir(parents=True, exist_ok=True)
 
-    nb_invalid = len(buckets.get(None, []))
-    if nb_invalid:
-        log.warning(
-            "flush: %d record(s) sans timestamp valide → partition year=unknown",
-            nb_invalid,
+        ts_array = pa.array([parse_ts(x.get("ts")) for x in items], type=pa.timestamp("ms", tz="UTC"))
+        table = pa.table(
+            {
+                "livreur_id": pa.array([x.get("livreur_id", "") for x in items]),
+                "lat": pa.array([x.get("lat", 0.0) for x in items], type=pa.float64()),
+                "lon": pa.array([x.get("lon", 0.0) for x in items], type=pa.float64()),
+                "speed_kmh": pa.array([x.get("speed_kmh", 0.0) for x in items], type=pa.float32()),
+                "heading_deg": pa.array([x.get("heading_deg", 0.0) for x in items], type=pa.float32()),
+                "status": pa.array([x.get("status", "unknown") for x in items]).cast(pa.dictionary(pa.int8(), pa.string())),
+                "accuracy_m": pa.array([x.get("accuracy_m", 0.0) for x in items], type=pa.float32()),
+                "battery_pct": pa.array([x.get("battery_pct", 0.0) for x in items], type=pa.float32()),
+                "ts": ts_array,
+            },
+            schema=POSITION_SCHEMA,
         )
+        out = folder / f"batch_{int(time.time() * 1000)}.parquet"
+        pq.write_table(table, out, compression="snappy", row_group_size=10_000)
 
-    for key, sub_records in buckets.items():
-        _write_parquet(key, sub_records)
 
-    if len(buckets) > 1:
-        log.info(
-            "Flush réparti sur %d partitions event-time (buffer=%d records)",
-            len(buckets),
-            len(records),
+def write_events(records: list[dict]) -> None:
+    buckets: dict[tuple[int, int, int, int, str] | tuple[None, None, None, None, str], list[dict]] = defaultdict(list)
+    for rec in records:
+        dt = parse_ts(rec.get("ts"))
+        topic = rec.get("topic", "unknown")
+        if dt is None:
+            key = (None, None, None, None, topic)
+        else:
+            key = (dt.year, dt.month, dt.day, dt.hour, topic)
+        buckets[key].append(rec)
+
+    for key, items in buckets.items():
+        if key[0] is None:
+            dt = None
+            topic = key[4]
+        else:
+            dt = datetime(key[0], key[1], key[2], key[3], tzinfo=timezone.utc)
+            topic = key[4]
+
+        folder = partition_dir(EVENTS_PATH / f"topic={topic}", dt)
+        folder.mkdir(parents=True, exist_ok=True)
+
+        ts_array = pa.array([parse_ts(x.get("ts")) for x in items], type=pa.timestamp("ms", tz="UTC"))
+        def arr(name: str, typ):
+            return pa.array([x.get(name) for x in items], type=typ)
+
+        table = pa.table(
+            {
+                "topic": pa.array([x.get("topic", "") for x in items]),
+                "event_type": pa.array([x.get("event_type", "") for x in items]),
+                "event_id": pa.array([x.get("event_id", "") for x in items]),
+                "offer_id": pa.array([x.get("offer_id", "") for x in items]),
+                "order_id": pa.array([x.get("order_id", "") for x in items]),
+                "courier_id": pa.array([x.get("courier_id", "") for x in items]),
+                "status": pa.array([x.get("status", "") for x in items]),
+                "zone_id": pa.array([x.get("zone_id", "") for x in items]),
+                "pickup_lat": arr("pickup_lat", pa.float64()),
+                "pickup_lon": arr("pickup_lon", pa.float64()),
+                "dropoff_lat": arr("dropoff_lat", pa.float64()),
+                "dropoff_lon": arr("dropoff_lon", pa.float64()),
+                "estimated_fare_eur": arr("estimated_fare_eur", pa.float32()),
+                "estimated_distance_km": arr("estimated_distance_km", pa.float32()),
+                "estimated_duration_min": arr("estimated_duration_min", pa.float32()),
+                "actual_fare_eur": arr("actual_fare_eur", pa.float32()),
+                "actual_distance_km": arr("actual_distance_km", pa.float32()),
+                "actual_duration_min": arr("actual_duration_min", pa.float32()),
+                "demand_index": arr("demand_index", pa.float32()),
+                "supply_index": arr("supply_index", pa.float32()),
+                "weather_factor": arr("weather_factor", pa.float32()),
+                "traffic_factor": arr("traffic_factor", pa.float32()),
+                "source": pa.array([x.get("source", "") for x in items]),
+                "ts": ts_array,
+            },
+            schema=EVENT_SCHEMA,
         )
+        out = folder / f"batch_{int(time.time() * 1000)}.parquet"
+        pq.write_table(table, out, compression="snappy", row_group_size=10_000)
+
+
+def parse_position(raw: bytes) -> dict:
+    msg = CourierPositionV1()
+    msg.ParseFromString(raw)
+    return {
+        "livreur_id": msg.courier_id,
+        "lat": msg.lat,
+        "lon": msg.lon,
+        "speed_kmh": msg.speed_kmh,
+        "heading_deg": msg.heading_deg,
+        "status": msg.status or "unknown",
+        "accuracy_m": msg.accuracy_m,
+        "battery_pct": msg.battery_pct,
+        "ts": msg.ts,
+    }
+
+
+def parse_offer(raw: bytes, topic: str) -> dict:
+    msg = OrderOfferV1()
+    msg.ParseFromString(raw)
+    return {
+        "topic": topic,
+        "event_type": msg.event_type,
+        "event_id": msg.event_id,
+        "offer_id": msg.offer_id,
+        "order_id": "",
+        "courier_id": msg.courier_id,
+        "status": "offered",
+        "zone_id": msg.zone_id,
+        "pickup_lat": msg.pickup_lat,
+        "pickup_lon": msg.pickup_lon,
+        "dropoff_lat": msg.dropoff_lat,
+        "dropoff_lon": msg.dropoff_lon,
+        "estimated_fare_eur": msg.estimated_fare_eur,
+        "estimated_distance_km": msg.estimated_distance_km,
+        "estimated_duration_min": msg.estimated_duration_min,
+        "actual_fare_eur": None,
+        "actual_distance_km": None,
+        "actual_duration_min": None,
+        "demand_index": msg.demand_index,
+        "supply_index": None,
+        "weather_factor": msg.weather_factor,
+        "traffic_factor": msg.traffic_factor,
+        "source": "synthetic-marketplace",
+        "ts": msg.ts,
+    }
+
+
+def parse_order_event(raw: bytes, topic: str) -> dict:
+    msg = OrderEventV1()
+    msg.ParseFromString(raw)
+    return {
+        "topic": topic,
+        "event_type": msg.event_type,
+        "event_id": msg.event_id,
+        "offer_id": msg.offer_id,
+        "order_id": msg.order_id,
+        "courier_id": msg.courier_id,
+        "status": msg.status,
+        "zone_id": msg.zone_id,
+        "pickup_lat": None,
+        "pickup_lon": None,
+        "dropoff_lat": None,
+        "dropoff_lon": None,
+        "estimated_fare_eur": None,
+        "estimated_distance_km": None,
+        "estimated_duration_min": None,
+        "actual_fare_eur": msg.actual_fare_eur,
+        "actual_distance_km": msg.actual_distance_km,
+        "actual_duration_min": msg.actual_duration_min,
+        "demand_index": None,
+        "supply_index": None,
+        "weather_factor": None,
+        "traffic_factor": None,
+        "source": "synthetic-marketplace",
+        "ts": msg.ts,
+    }
+
+
+def parse_context(raw: bytes, topic: str) -> dict:
+    msg = ContextSignalV1()
+    msg.ParseFromString(raw)
+    return {
+        "topic": topic,
+        "event_type": msg.event_type,
+        "event_id": msg.event_id,
+        "offer_id": "",
+        "order_id": "",
+        "courier_id": "",
+        "status": "signal",
+        "zone_id": msg.zone_id,
+        "pickup_lat": None,
+        "pickup_lon": None,
+        "dropoff_lat": None,
+        "dropoff_lon": None,
+        "estimated_fare_eur": None,
+        "estimated_distance_km": None,
+        "estimated_duration_min": None,
+        "actual_fare_eur": None,
+        "actual_distance_km": None,
+        "actual_duration_min": None,
+        "demand_index": msg.demand_index,
+        "supply_index": msg.supply_index,
+        "weather_factor": msg.weather_factor,
+        "traffic_factor": msg.traffic_factor,
+        "source": msg.source,
+        "ts": msg.ts,
+    }
 
 
 async def main() -> None:
     stop_event = asyncio.Event()
 
     def _on_signal(*_: object) -> None:
-        log.info("Signal reçu — arrêt du cold consumer...")
+        log.info("signal received, stopping cold consumer")
         stop_event.set()
 
     loop = asyncio.get_running_loop()
@@ -217,103 +334,111 @@ async def main() -> None:
         loop.add_signal_handler(sig, _on_signal)
 
     DATA_PATH.mkdir(parents=True, exist_ok=True)
+    EVENTS_PATH.mkdir(parents=True, exist_ok=True)
+
+    topics = [COURIER_TOPIC, ORDER_OFFERS_TOPIC, ORDER_EVENTS_TOPIC, CONTEXT_SIGNALS_TOPIC]
 
     consumer = AIOKafkaConsumer(
-        TOPIC,
+        *topics,
         bootstrap_servers=KAFKA_BOOTSTRAP,
         group_id=CONSUMER_GROUP,
-        value_deserializer=lambda m: json.loads(m.decode()),
-        auto_offset_reset="earliest",   # Cold path : lit depuis le début de la rétention
-        # IMPORTANT : commit MANUEL après flush Parquet réussi.
-        # Avec enable_auto_commit=True, Kafka committait les offsets en arrière-plan
-        # (toutes les 5s par défaut) AVANT que le buffer ne soit flushé sur disque.
-        # En cas de crash consumer entre l'auto-commit et le prochain flush, tous les
-        # records bufferisés étaient perdus définitivement (at-most-once silencieux).
-        # Le commit explicite post-flush garantit une sémantique effectively-once :
-        # si le flush échoue ou le process meurt, Kafka rejoue le batch au redémarrage.
+        auto_offset_reset="earliest",
         enable_auto_commit=False,
-        fetch_max_bytes=10_485_760,     # 10MB fetch — optimise le throughput
-        max_poll_records=2_000,
+        fetch_max_bytes=10_485_760,
+        max_poll_records=2000,
     )
 
     for attempt in range(1, 11):
         try:
             await consumer.start()
-            log.info("Cold consumer connecté sur topic '%s'", TOPIC)
+            log.info("connected to topics=%s", topics)
             break
-        except Exception as exc:
-            log.warning("Tentative %d/10 — %s. Nouvel essai dans 3s...", attempt, exc)
+        except Exception as exc:  # pragma: no cover
+            log.warning("attempt %d/10 failed: %s", attempt, exc)
             await asyncio.sleep(3)
     else:
-        log.error("Impossible de se connecter. Abandon.")
+        log.error("unable to connect to kafka")
         return
 
-    buffer: list[dict] = []
-    # Suit le plus haut offset vu par partition depuis le dernier commit.
-    # On commit (offset + 1) — convention Kafka pour "prochaine position à lire".
+    positions_buffer: list[dict] = []
+    events_buffer: list[dict] = []
     pending_offsets: dict[TopicPartition, int] = {}
+    rejected_total = 0
+    flushed_total = 0
     last_flush = time.monotonic()
-    total_flushed = 0
 
-    async def _flush_and_commit(reason: str) -> None:
-        """Flush Parquet, puis commit Kafka. L'ordre est non-négociable."""
-        nonlocal buffer, pending_offsets, total_flushed, last_flush
-        if not buffer:
+    async def flush_and_commit(reason: str) -> None:
+        nonlocal positions_buffer, events_buffer, pending_offsets, flushed_total, last_flush
+        if not positions_buffer and not events_buffer:
             return
-        log.info(
-            "Déclenchement flush [%s] : %d enregistrements en buffer",
-            reason,
-            len(buffer),
-        )
-        # 1. Écriture disque — peut lever une exception (disque plein, S3 down, ...)
-        flush(buffer)
-        # 2. Commit Kafka UNIQUEMENT si le flush a réussi
+
+        if positions_buffer:
+            write_positions(positions_buffer)
+        if events_buffer:
+            write_events(events_buffer)
+
         if pending_offsets:
-            commit_payload = {
-                tp: OffsetAndMetadata(off + 1, "")
-                for tp, off in pending_offsets.items()
-            }
-            await consumer.commit(commit_payload)
-            log.info(
-                "Offsets committés : %s",
-                {str(tp): off + 1 for tp, off in pending_offsets.items()},
-            )
-        total_flushed += len(buffer)
-        buffer = []
+            payload = {tp: OffsetAndMetadata(off + 1, "") for tp, off in pending_offsets.items()}
+            await consumer.commit(payload)
+
+        flushed_total += len(positions_buffer) + len(events_buffer)
+        log.info(
+            "flush[%s] positions=%d events=%d total_flushed=%d",
+            reason,
+            len(positions_buffer),
+            len(events_buffer),
+            flushed_total,
+        )
+
+        positions_buffer = []
+        events_buffer = []
         pending_offsets = {}
         last_flush = time.monotonic()
 
     try:
         while not stop_event.is_set():
-            raw = await consumer.getmany(timeout_ms=500, max_records=2_000)
-            for tp, msgs in raw.items():
-                for m in msgs:
-                    buffer.append(m.value)
-                    # Max-offset par partition pour le commit explicite post-flush
+            raw_batch = await consumer.getmany(timeout_ms=500, max_records=2000)
+            rejected_chunk: list[tuple[str, bytes, str]] = []
+
+            for tp, msgs in raw_batch.items():
+                for msg in msgs:
+                    try:
+                        if tp.topic == COURIER_TOPIC:
+                            positions_buffer.append(parse_position(msg.value))
+                        elif tp.topic == ORDER_OFFERS_TOPIC:
+                            events_buffer.append(parse_offer(msg.value, tp.topic))
+                        elif tp.topic == ORDER_EVENTS_TOPIC:
+                            events_buffer.append(parse_order_event(msg.value, tp.topic))
+                        elif tp.topic == CONTEXT_SIGNALS_TOPIC:
+                            events_buffer.append(parse_context(msg.value, tp.topic))
+                        else:
+                            raise ValueError(f"unsupported topic={tp.topic}")
+                    except Exception as exc:
+                        rejected_chunk.append((tp.topic, msg.value, str(exc)))
+
                     prev = pending_offsets.get(tp, -1)
-                    if m.offset > prev:
-                        pending_offsets[tp] = m.offset
+                    if msg.offset > prev:
+                        pending_offsets[tp] = msg.offset
 
-            now = time.monotonic()
-            time_exceeded = (buffer and now - last_flush >= BATCH_INTERVAL_S)
-            size_exceeded = len(buffer) >= MAX_BATCH_RECORDS
+            if rejected_chunk:
+                await asyncio.to_thread(write_dlq_jsonl, rejected_chunk)
+                rejected_total += len(rejected_chunk)
 
+            current_size = len(positions_buffer) + len(events_buffer)
+            time_exceeded = current_size > 0 and (time.monotonic() - last_flush >= BATCH_INTERVAL_S)
+            size_exceeded = current_size >= MAX_BATCH_RECORDS
             if time_exceeded or size_exceeded:
-                await _flush_and_commit("taille" if size_exceeded else "timer")
+                await flush_and_commit("size" if size_exceeded else "timer")
 
     finally:
-        # Flush final pour ne rien perdre à l'arrêt — commit inclus
-        if buffer:
+        if positions_buffer or events_buffer:
             try:
-                await _flush_and_commit("arrêt")
+                await flush_and_commit("shutdown")
             except Exception as exc:
-                log.error(
-                    "Flush final échoué — offsets NON committés, "
-                    "le batch sera rejoué au prochain démarrage : %s",
-                    exc,
-                )
+                log.error("final flush failed, offsets not committed: %s", exc)
+
         await consumer.stop()
-        log.info("Cold consumer arrêté. Total flushé : %d enregistrements.", total_flushed)
+        log.info("cold consumer stopped flushed_total=%d rejected=%d", flushed_total, rejected_total)
 
 
 if __name__ == "__main__":

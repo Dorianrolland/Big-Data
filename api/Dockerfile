@@ -16,7 +16,7 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Récupère seulement les packages installés, pas les outils de build
+# Recupere seulement les packages installes, pas les outils de build
 COPY --from=builder /install /usr/local
 
 # duckdb + pyarrow ont besoin de libgomp
@@ -24,9 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY main.py .
-# Dashboard HTML servi à /map (même origin → pas de CORS)
-COPY static/ ./static/
+COPY . .
 
 EXPOSE 8000
 

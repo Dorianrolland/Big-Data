@@ -1,41 +1,48 @@
-version: "3.9"
-
-# ── Shared env blocks ──────────────────────────────────────────────────────────
+﻿
 x-kafka-env: &kafka-env
   KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
   KAFKA_TOPIC: livreurs-gps
+  ORDER_OFFERS_TOPIC: order-offers-v1
+  ORDER_EVENTS_TOPIC: order-events-v1
+  CONTEXT_SIGNALS_TOPIC: context-signals-v1
 
 x-common-env: &common-env
   <<: *kafka-env
   REDIS_URL: redis://redis:6379
 
 services:
-
-  # ────────────────────────────────────────────────────────────────────────────
-  # Message Broker — Redpanda (Kafka-compatible, sans Zookeeper, ultra-léger)
-  # ────────────────────────────────────────────────────────────────────────────
   redpanda:
     image: redpandadata/redpanda:v23.3.18
     container_name: fleetstream-redpanda
     command:
       - redpanda
       - start
-      - --kafka-addr       internal://0.0.0.0:9092,external://0.0.0.0:19092
-      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
-      - --pandaproxy-addr  internal://0.0.0.0:8082,external://0.0.0.0:18082
-      - --advertise-pandaproxy-addr internal://redpanda:8082,external://localhost:18082
-      - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
-      - --rpc-addr         redpanda:33145
-      - --advertise-rpc-addr redpanda:33145
-      - --mode             dev-container
-      - --smp              2
-      - --memory           512M
+      - --kafka-addr
+      - internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr
+      - internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr
+      - internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr
+      - internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr
+      - internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr
+      - redpanda:33145
+      - --advertise-rpc-addr
+      - redpanda:33145
+      - --mode
+      - dev-container
+      - --smp
+      - "2"
+      - --memory
+      - 512M
       - --default-log-level=warn
     ports:
-      - "19092:19092"   # Kafka externe (accès depuis l'hôte)
-      - "18082:18082"   # Pandaproxy REST
-      - "18081:18081"   # Schema Registry
-      - "9644:9644"     # Admin API / métriques Prometheus
+      - "19092:19092"
+      - "18082:18082"
+      - "18081:18081"
+      - "9644:9644"
     volumes:
       - redpanda_data:/var/lib/redpanda/data
     healthcheck:
@@ -45,7 +52,6 @@ services:
       retries: 5
       start_period: 30s
 
-  # Interface web Redpanda — visualisation des topics en live
   redpanda-console:
     image: docker.redpanda.com/redpandadata/console:v2.4.6
     container_name: fleetstream-console
@@ -59,7 +65,6 @@ services:
     ports:
       - "8080:8080"
 
-  # Initialisation du topic (tourne une fois, puis s'arrête)
   redpanda-init:
     image: redpandadata/redpanda:v23.3.18
     container_name: fleetstream-init
@@ -67,14 +72,33 @@ services:
       redpanda:
         condition: service_healthy
     entrypoint: ["/bin/bash", "-c"]
-    # || true : idempotent — pas d'erreur si le topic existe déjà
     command:
-      - "rpk topic create livreurs-gps --brokers redpanda:9092 --partitions 3 --replicas 1 --topic-config retention.ms=86400000 --topic-config compression.type=lz4 || true && echo '✓ Topic livreurs-gps prêt'"
+      - >-
+        rpk topic create livreurs-gps --brokers redpanda:9092 --partitions 3 --replicas 1 --topic-config retention.ms=86400000 --topic-config compression.type=lz4 || true
+        && rpk topic create order-offers-v1 --brokers redpanda:9092 --partitions 3 --replicas 1 --topic-config retention.ms=86400000 --topic-config compression.type=lz4 || true
+        && rpk topic create order-events-v1 --brokers redpanda:9092 --partitions 3 --replicas 1 --topic-config retention.ms=86400000 --topic-config compression.type=lz4 || true
+        && rpk topic create context-signals-v1 --brokers redpanda:9092 --partitions 3 --replicas 1 --topic-config retention.ms=86400000 --topic-config compression.type=lz4 || true
+        && echo 'topics ready'
     restart: "no"
 
-  # ────────────────────────────────────────────────────────────────────────────
-  # In-Memory Store — Redis Stack (GEO + JSON + Search intégrés)
-  # ────────────────────────────────────────────────────────────────────────────
+  schema-init:
+    image: python:3.12-slim
+    container_name: fleetstream-schema-init
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./schemas:/schemas:ro
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        pip install --no-cache-dir requests==2.32.3 &&
+        python /schemas/register_schemas.py --registry http://redpanda:8081 --proto /schemas/copilot_events.proto
+    restart: "no"
+
   redis:
     image: redis/redis-stack-server:7.2.0-v10
     container_name: fleetstream-redis
@@ -88,9 +112,6 @@ services:
       timeout: 3s
       retries: 5
 
-  # ────────────────────────────────────────────────────────────────────────────
-  # Producer — Simulation 100 livreurs dans Paris (asyncio)
-  # ────────────────────────────────────────────────────────────────────────────
   producer:
     build:
       context: ./producer
@@ -101,15 +122,15 @@ services:
         condition: service_healthy
       redpanda-init:
         condition: service_completed_successfully
+      schema-init:
+        condition: service_completed_successfully
     environment:
       <<: *kafka-env
-      NUM_LIVREURS: "${NUM_LIVREURS:-100}"
+      NUM_LIVREURS: "${NUM_LIVREURS:-300}"
       EMIT_INTERVAL_MS: "${EMIT_INTERVAL_MS:-1000}"
+      OFFER_PROBABILITY: "${OFFER_PROBABILITY:-0.14}"
     restart: unless-stopped
 
-  # ────────────────────────────────────────────────────────────────────────────
-  # Hot Consumer — Speed Layer → Redis GEOADD (TTL 30s)
-  # ────────────────────────────────────────────────────────────────────────────
   hot-consumer:
     build:
       context: ./hot_path
@@ -122,14 +143,13 @@ services:
         condition: service_healthy
       redpanda-init:
         condition: service_completed_successfully
+      schema-init:
+        condition: service_completed_successfully
     environment:
       <<: *common-env
       GPS_TTL_SECONDS: "${GPS_TTL_SECONDS:-30}"
     restart: unless-stopped
 
-  # ────────────────────────────────────────────────────────────────────────────
-  # Cold Consumer — Batch Layer → Parquet Snappy (hive-partitionné)
-  # ────────────────────────────────────────────────────────────────────────────
   cold-consumer:
     build:
       context: ./cold_path
@@ -140,18 +160,66 @@ services:
         condition: service_healthy
       redpanda-init:
         condition: service_completed_successfully
+      schema-init:
+        condition: service_completed_successfully
     environment:
       <<: *kafka-env
       DATA_PATH: /data/parquet
+      EVENTS_PATH: /data/parquet_events
       BATCH_INTERVAL_SECONDS: "${BATCH_INTERVAL_SECONDS:-60}"
       MAX_BATCH_RECORDS: "${MAX_BATCH_RECORDS:-50000}"
     volumes:
       - ./data:/data
     restart: unless-stopped
 
-  # ────────────────────────────────────────────────────────────────────────────
-  # API — Serving Layer (Hot Path Redis + Cold Path DuckDB + Prometheus /metrics)
-  # ────────────────────────────────────────────────────────────────────────────
+  copilot-features:
+    build:
+      context: ./copilot_features
+      dockerfile: Dockerfile
+    container_name: fleetstream-copilot-features
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
+      schema-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *common-env
+      COPILOT_OFFER_TTL_SECONDS: "${COPILOT_OFFER_TTL_SECONDS:-21600}"
+      COPILOT_MAX_OFFERS_PER_DRIVER: "${COPILOT_MAX_OFFERS_PER_DRIVER:-100}"
+      FUEL_COST_EUR_PER_KM: "${FUEL_COST_EUR_PER_KM:-0.35}"
+    restart: unless-stopped
+
+  tlc-replay:
+    build:
+      context: ./tlc_replay
+      dockerfile: Dockerfile
+    container_name: fleetstream-tlc-replay
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
+      schema-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *common-env
+      TLC_DATA_DIR: /data/tlc
+      TLC_MONTH: "${TLC_MONTH:-2024-01}"
+      TLC_BASE_URL: "${TLC_BASE_URL:-https://d37ci6vzurychx.cloudfront.net/trip-data}"
+      TLC_LICENSE_FILTER: "${TLC_LICENSE_FILTER:-HV0003}"
+      TLC_SPEED_FACTOR: "${TLC_SPEED_FACTOR:-60}"
+      TLC_BATCH_SIZE: "${TLC_BATCH_SIZE:-500}"
+      TLC_LOOP_ON_FINISH: "${TLC_LOOP_ON_FINISH:-true}"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+
   api:
     build:
       context: ./api
@@ -160,18 +228,23 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      copilot-features:
+        condition: service_started
     environment:
       <<: *common-env
       DATA_PATH: /data/parquet
+      EVENTS_PATH: /data/parquet_events
+      MODEL_PATH: /data/models/copilot_model.joblib
+      COPILOT_MODEL_MIN_ROWS: "${COPILOT_MODEL_MIN_ROWS:-300}"
+      COPILOT_MODEL_MIN_AUC: "${COPILOT_MODEL_MIN_AUC:-0.62}"
+      COPILOT_MODEL_MIN_AVG_PRECISION: "${COPILOT_MODEL_MIN_AVG_PRECISION:-0.45}"
+      OSRM_URL: "${OSRM_URL:-http://osrm:5000}"
     volumes:
       - ./data:/data
     ports:
       - "8001:8000"
     restart: unless-stopped
 
-  # ────────────────────────────────────────────────────────────────────────────
-  # Dashboard — Streamlit live map (pydeck + auto-refresh 2s)
-  # ────────────────────────────────────────────────────────────────────────────
   dashboard:
     build:
       context: ./dashboard
@@ -186,9 +259,6 @@ services:
       - "8501:8501"
     restart: unless-stopped
 
-  # ────────────────────────────────────────────────────────────────────────────
-  # RedisInsight — GUI Redis (visualisation des clés GEO et hashes)
-  # ────────────────────────────────────────────────────────────────────────────
   redisinsight:
     image: redis/redisinsight:latest
     container_name: fleetstream-redisinsight
@@ -201,9 +271,18 @@ services:
       - redisinsight_data:/data
     restart: unless-stopped
 
-  # ────────────────────────────────────────────────────────────────────────────
-  # Prometheus — Scrape API (/metrics) + Redpanda (port 9644)
-  # ────────────────────────────────────────────────────────────────────────────
+  osrm:
+    image: osrm/osrm-backend:v5.27.1
+    container_name: fleetstream-osrm
+    command: osrm-routed --algorithm mld /data/new-york-latest.osrm --max-table-size 100
+    volumes:
+      - ./data/osrm:/data:ro
+    ports:
+      - "5000:5000"
+    profiles:
+      - routing
+    restart: unless-stopped
+
   prometheus:
     image: prom/prometheus:v2.51.2
     container_name: fleetstream-prometheus
@@ -219,9 +298,6 @@ services:
       - "9090:9090"
     restart: unless-stopped
 
-  # ────────────────────────────────────────────────────────────────────────────
-  # Grafana — Dashboard auto-provisionné (datasource + dashboard JSON)
-  # ────────────────────────────────────────────────────────────────────────────
   grafana:
     image: grafana/grafana:10.4.2
     container_name: fleetstream-grafana

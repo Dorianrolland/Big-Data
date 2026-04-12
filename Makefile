@@ -1,4 +1,4 @@
-.PHONY: up down logs build clean restart status
+.PHONY: up down logs build clean restart status train-copilot demo-copilot bench-copilot smoke-e2e perf-lot4 proof-lot4
 
 ## Lance l'intégralité du stack (build + démarrage)
 up:
@@ -44,8 +44,8 @@ redis-cli:
 
 ## Test de l'API (requiert curl + python3)
 demo:
-	@echo "→ Livreurs proches de Notre-Dame (rayon 2km):"
-	curl -s "http://localhost:8001/livreurs-proches?lat=48.8530&lon=2.3499&rayon=2" | python3 -m json.tool
+	@echo "→ Livreurs proches de Times Square (rayon 2km):"
+	curl -s "http://localhost:8001/livreurs-proches?lat=40.7580&lon=-73.9855&rayon=2" | python3 -m json.tool
 	@echo ""
 	@echo "→ Stats temps réel:"
 	curl -s "http://localhost:8001/stats" | python3 -m json.tool
@@ -62,3 +62,28 @@ stress-5k:
 
 stress-api:
 	python3 stress_test.py --skip-kafka --api-requests 1000
+
+## Entraînement du modèle copilot (local)
+train-copilot:
+	python3 ml/train_copilot_model.py --data ./data/parquet_events --out ./data/models/copilot_model.joblib
+
+## Demo rapide des endpoints copilot
+demo-copilot:
+	@echo "→ Score d'offre (fallback si modèle absent):"
+	curl -s -X POST "http://localhost:8001/copilot/score-offer" -H "Content-Type: application/json" -d "{\"estimated_fare_eur\":12.4,\"estimated_distance_km\":3.2,\"estimated_duration_min\":18,\"demand_index\":1.3,\"supply_index\":0.8,\"weather_factor\":1.0,\"traffic_factor\":1.1}" | python3 -m json.tool
+	@echo ""
+	@echo "→ Zones recommandées:"
+	curl -s "http://localhost:8001/copilot/driver/L001/next-best-zone" | python3 -m json.tool
+
+bench-copilot:
+	python3 scripts/benchmark-copilot.py --url http://localhost:8001 --requests 300 --concurrency 40
+
+smoke-e2e:
+	python scripts/smoke-e2e.py --url http://localhost:8001
+
+perf-lot4:
+	python scripts/perf-lot4.py --url http://localhost:8001 --ingest-window 20 --score-requests 300 --score-concurrency 30
+
+proof-lot4:
+	python scripts/smoke-e2e.py --url http://localhost:8001
+	python scripts/perf-lot4.py --url http://localhost:8001 --ingest-window 20 --score-requests 300 --score-concurrency 30

@@ -1,0 +1,513 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>FleetStream Copilot</title>
+  <meta name="theme-color" content="#0f172a" />
+  <link rel="manifest" href="/static/copilot/manifest.webmanifest" />
+  <style>
+    :root {
+      --bg: #f3f6ef;
+      --ink: #0f172a;
+      --ink-soft: #334155;
+      --line: rgba(15, 23, 42, 0.16);
+      --panel: rgba(255, 255, 255, 0.86);
+      --accent: #0ea5a4;
+      --accent-strong: #0b7285;
+      --good: #15803d;
+      --bad: #b42318;
+      --warn: #b45309;
+      --amber: #f59e0b;
+      --shadow: 0 12px 28px rgba(2, 12, 27, 0.12);
+      --radius-lg: 18px;
+      --radius-md: 12px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      min-height: 100%;
+      color: var(--ink);
+      font-family: "Space Grotesk", "Avenir Next", "Trebuchet MS", sans-serif;
+      background:
+        radial-gradient(circle at 88% 8%, rgba(14, 165, 164, 0.16), transparent 32%),
+        radial-gradient(circle at 4% 20%, rgba(245, 158, 11, 0.16), transparent 34%),
+        linear-gradient(165deg, #eef4e7 0%, #f7f4ed 52%, #eef5f7 100%);
+    }
+
+    .page {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 14px 12px 32px;
+      display: grid;
+      gap: 12px;
+    }
+
+    .glass {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(8px);
+    }
+
+    .header {
+      padding: 14px;
+      display: grid;
+      gap: 10px;
+    }
+
+    .header-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .brand {
+      display: grid;
+      gap: 4px;
+    }
+
+    .title {
+      font-size: 1.2rem;
+      font-weight: 800;
+      letter-spacing: 0.01em;
+    }
+
+    .subtitle {
+      color: var(--ink-soft);
+      font-size: 0.86rem;
+    }
+
+    .chip-row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .chip {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-size: 0.74rem;
+      font-weight: 700;
+      background: rgba(255, 255, 255, 0.65);
+    }
+
+    .chip.good { color: var(--good); border-color: rgba(21, 128, 61, 0.28); }
+    .chip.bad { color: var(--bad); border-color: rgba(180, 35, 24, 0.28); }
+    .chip.warn { color: var(--warn); border-color: rgba(180, 83, 9, 0.28); }
+
+    .auto-refresh {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.78rem;
+      color: var(--ink-soft);
+      margin-left: auto;
+    }
+
+    .layout {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: 1.05fr 1.2fr;
+    }
+
+    .col {
+      display: grid;
+      gap: 12px;
+      align-content: start;
+    }
+
+    .card {
+      padding: 12px;
+      display: grid;
+      gap: 10px;
+    }
+
+    .card h2 {
+      margin: 0;
+      font-size: 0.95rem;
+      letter-spacing: 0.02em;
+    }
+
+    .muted {
+      color: var(--ink-soft);
+      font-size: 0.8rem;
+    }
+
+    .grid {
+      display: grid;
+      gap: 8px;
+    }
+
+    .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+
+    label {
+      display: grid;
+      gap: 5px;
+      font-size: 0.74rem;
+      color: var(--ink-soft);
+    }
+
+    input,
+    select,
+    button {
+      font-family: inherit;
+      font-size: 0.93rem;
+    }
+
+    input,
+    select {
+      width: 100%;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.92);
+      color: var(--ink);
+      padding: 8px 10px;
+    }
+
+    button {
+      border: none;
+      border-radius: 11px;
+      padding: 10px 12px;
+      font-weight: 700;
+      cursor: pointer;
+      background: linear-gradient(135deg, #17bebb 0%, #0b7285 100%);
+      color: #f8fafc;
+      box-shadow: 0 8px 18px rgba(11, 114, 133, 0.24);
+    }
+
+    button.alt {
+      background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+      box-shadow: 0 8px 18px rgba(217, 119, 6, 0.2);
+    }
+
+    button.ghost {
+      background: #fff;
+      color: var(--ink);
+      border: 1px solid var(--line);
+      box-shadow: none;
+    }
+
+    .quick-row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .quick-row button {
+      padding: 8px 10px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      box-shadow: none;
+    }
+
+    .kpi-grid {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+
+    .kpi {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px;
+      display: grid;
+      gap: 4px;
+      min-height: 68px;
+    }
+
+    .kpi .k { font-size: 0.71rem; color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.04em; }
+    .kpi .v { font-size: 1.03rem; font-weight: 800; }
+
+    .score-board {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .score-pill {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px;
+      text-align: center;
+      display: grid;
+      gap: 3px;
+    }
+
+    .score-pill .k { font-size: 0.7rem; color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.04em; }
+    .score-pill .v { font-size: 1.12rem; font-weight: 800; }
+
+    .info-line {
+      background: rgba(14, 165, 164, 0.08);
+      border: 1px solid rgba(11, 114, 133, 0.2);
+      color: #0f3b4f;
+      border-radius: 10px;
+      padding: 8px 10px;
+      font-size: 0.8rem;
+    }
+
+    .list {
+      display: grid;
+      gap: 8px;
+      max-height: 430px;
+      overflow: auto;
+      padding-right: 2px;
+    }
+
+    .offer {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fff;
+      padding: 10px;
+      display: grid;
+      gap: 7px;
+    }
+
+    .offer-top,
+    .offer-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .badge {
+      border-radius: 999px;
+      padding: 3px 8px;
+      border: 1px solid var(--line);
+      font-size: 0.7rem;
+      font-weight: 700;
+      background: #f8fafc;
+    }
+
+    .badge.accept { color: var(--good); border-color: rgba(21, 128, 61, 0.25); }
+    .badge.reject { color: var(--bad); border-color: rgba(180, 35, 24, 0.25); }
+
+    .chips {
+      display: flex;
+      gap: 5px;
+      flex-wrap: wrap;
+    }
+
+    .chips span {
+      background: rgba(15, 23, 42, 0.06);
+      border: 1px solid rgba(15, 23, 42, 0.1);
+      border-radius: 999px;
+      padding: 3px 7px;
+      font-size: 0.69rem;
+      color: var(--ink-soft);
+    }
+
+    .offer-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .offer-actions button {
+      padding: 8px 10px;
+      font-size: 0.78rem;
+      box-shadow: none;
+      border-radius: 9px;
+    }
+
+    .zone {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px;
+      background: #fff;
+      display: grid;
+      gap: 6px;
+    }
+
+    .zone-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 0.82rem;
+    }
+
+    .zone-meter {
+      width: 100%;
+      height: 8px;
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.12);
+      overflow: hidden;
+    }
+
+    .zone-meter > div {
+      height: 100%;
+      background: linear-gradient(90deg, #f59e0b 0%, #0ea5a4 100%);
+    }
+
+    .timeline {
+      display: grid;
+      gap: 8px;
+      max-height: 300px;
+      overflow: auto;
+    }
+
+    .event-row {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 8px;
+      display: grid;
+      gap: 4px;
+      font-size: 0.78rem;
+    }
+
+    .event-row strong { font-size: 0.8rem; }
+
+    .footer {
+      text-align: center;
+      font-size: 0.73rem;
+      color: var(--ink-soft);
+      padding-top: 4px;
+    }
+
+    @media (max-width: 920px) {
+      .layout { grid-template-columns: 1fr; }
+      .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 680px) {
+      .grid.two,
+      .grid.three,
+      .score-board {
+        grid-template-columns: 1fr;
+      }
+
+      .kpi-grid { grid-template-columns: 1fr; }
+
+      .title {
+        font-size: 1.08rem;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="header glass">
+      <div class="header-top">
+        <div class="brand">
+          <div class="title">FleetStream Driver Copilot</div>
+          <div class="subtitle">Uber NYC - MVP local - decision revenu en temps reel</div>
+        </div>
+        <div class="chip-row">
+          <span class="chip" id="healthMode">syncing</span>
+          <span class="chip" id="healthGate">quality gate: pending</span>
+          <label class="auto-refresh"><input id="autoRefresh" type="checkbox" checked /> auto refresh 12s</label>
+        </div>
+      </div>
+      <div class="chip-row" id="healthMetrics"></div>
+    </section>
+
+    <section class="layout">
+      <div class="col">
+        <section class="card glass">
+          <h2>Session Controls</h2>
+          <div class="grid three">
+            <label>Driver ID<input id="driverId" value="L001" /></label>
+            <label>From (UTC)<input id="fromTs" /></label>
+            <label>To (UTC)<input id="toTs" /></label>
+          </div>
+          <div class="quick-row">
+            <button class="ghost" id="window30">Last 30m</button>
+            <button class="ghost" id="window120">Last 2h</button>
+            <button class="ghost" id="windowToday">Today</button>
+          </div>
+          <div class="grid two">
+            <button id="refreshBtn">Refresh Driver Data</button>
+            <button class="alt" id="replayBtn">Replay Session</button>
+          </div>
+          <div class="kpi-grid">
+            <div class="kpi"><div class="k">Offers</div><div class="v" id="kpiOffers">-</div></div>
+            <div class="kpi"><div class="k">Accept Rate</div><div class="v" id="kpiAcceptRate">-</div></div>
+            <div class="kpi"><div class="k">Avg EUR/h</div><div class="v" id="kpiAvgNet">-</div></div>
+            <div class="kpi"><div class="k">Replay Events</div><div class="v" id="kpiReplay">-</div></div>
+          </div>
+        </section>
+
+        <section class="card glass">
+          <h2>Manual Offer Score</h2>
+          <div class="score-board">
+            <div class="score-pill"><div class="k">Probability</div><div class="v" id="scoreProb">-</div></div>
+            <div class="score-pill"><div class="k">Decision</div><div class="v" id="scoreDecision">-</div></div>
+            <div class="score-pill"><div class="k">Net EUR/h</div><div class="v" id="scoreEur">-</div></div>
+          </div>
+          <div class="quick-row">
+            <button class="ghost" id="presetSafe">Preset Safe</button>
+            <button class="ghost" id="presetBalanced">Preset Balanced</button>
+            <button class="ghost" id="presetSurge">Preset Surge</button>
+          </div>
+          <div class="grid three">
+            <label>Fare EUR<input id="fare" type="number" step="0.1" value="12.8" /></label>
+            <label>Distance km<input id="distance" type="number" step="0.1" value="3.1" /></label>
+            <label>Duration min<input id="duration" type="number" step="0.1" value="16" /></label>
+          </div>
+          <div class="grid three">
+            <label>Demand index<input id="demand" type="number" step="0.1" value="1.3" /></label>
+            <label>Supply index<input id="supply" type="number" step="0.1" value="0.9" /></label>
+            <label>Traffic factor<input id="traffic" type="number" step="0.1" value="1.1" /></label>
+          </div>
+          <button id="scoreBtn">Score Offer</button>
+          <div class="info-line" id="scoreReasons">No score yet.</div>
+        </section>
+      </div>
+
+      <div class="col">
+        <section class="card glass">
+          <h2>Latest Offers</h2>
+          <div class="grid two">
+            <label>Filter
+              <select id="offerFilter">
+                <option value="all">All</option>
+                <option value="accept">Accept only</option>
+                <option value="reject">Reject only</option>
+              </select>
+            </label>
+            <label>Limit
+              <select id="offerLimit">
+                <option value="8">8</option>
+                <option value="12" selected>12</option>
+                <option value="20">20</option>
+              </select>
+            </label>
+          </div>
+          <div class="list" id="offers"></div>
+        </section>
+
+        <section class="card glass">
+          <h2>Next Best Zones</h2>
+          <div class="list" id="zones"></div>
+        </section>
+
+        <section class="card glass">
+          <h2>Replay Timeline</h2>
+          <div class="info-line" id="replaySummary">No replay requested yet.</div>
+          <div class="timeline" id="replayTimeline"></div>
+        </section>
+      </div>
+    </section>
+
+    <div class="footer">MVP local - no paid dependencies - lot 3 UX</div>
+  </main>
+
+  <script src="/static/copilot/app.js"></script>
+</body>
+</html>
+

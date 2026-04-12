@@ -21,7 +21,6 @@ import asyncio
 import json
 import math
 import random
-import sys
 import time
 from datetime import datetime, timezone
 
@@ -42,8 +41,8 @@ except ImportError:
     print("[WARN] aiohttp non installé — benchmark API désactivé")
     print("       pip install aiohttp")
 
-# ── Géographie Paris ─────────────────────────────────────────────────────────────
-PARIS_LAT, PARIS_LON = 48.8566, 2.3522
+# ── Géographie New York City ─────────────────────────────────────────────────────
+NYC_LAT, NYC_LON = 40.7580, -73.9855
 KAFKA_BOOTSTRAP = "localhost:19092"    # Port externe Redpanda
 
 
@@ -56,8 +55,8 @@ class FastLivreur:
         self.id      = f"S{idx:05d}"
         angle        = random.uniform(0, 2 * math.pi)
         r_km         = random.uniform(0.5, 8.0)
-        self.lat     = PARIS_LAT + (r_km / 111.32) * math.cos(angle)
-        self.lon     = PARIS_LON + (r_km / (111.32 * 0.669)) * math.sin(angle)
+        self.lat     = NYC_LAT + (r_km / 111.32) * math.cos(angle)
+        self.lon     = NYC_LON + (r_km / (111.32 * 0.766)) * math.sin(angle)
         self.heading = random.uniform(0, 360)
         self.speed   = random.uniform(15, 30)
         self.status  = random.choice(["delivering", "delivering", "available"])
@@ -68,7 +67,7 @@ class FastLivreur:
         v = self.speed / 3600.0
         hr = math.radians(self.heading)
         self.lat += (v * math.cos(hr)) / 111.32
-        self.lon += (v * math.sin(hr)) / (111.32 * 0.669)
+        self.lon += (v * math.sin(hr)) / (111.32 * 0.766)
         self.battery = max(5.0, self.battery - 0.02)
         return json.dumps({
             "livreur_id": self.id,
@@ -126,7 +125,7 @@ async def run_kafka_stress(
         await producer.start()
     except Exception as exc:
         print(f"  [ERREUR] Impossible de se connecter à Kafka: {exc}")
-        print(f"  → Vérifiez que Redpanda tourne (docker compose ps)")
+        print("  -> Verifiez que Redpanda tourne (docker compose ps)")
         return {"error": str(exc)}
 
     sent        = 0
@@ -189,7 +188,7 @@ async def run_api_benchmark(api_url: str, num_requests: int = 500) -> dict:
     _banner(f"API BENCHMARK — {num_requests} requêtes GEOSEARCH parallèles")
 
     url    = f"{api_url}/livreurs-proches"
-    params = {"lat": PARIS_LAT, "lon": PARIS_LON, "rayon": 5, "limit": 50}
+    params = {"lat": NYC_LAT, "lon": NYC_LON, "rayon": 5, "limit": 50}
     print(f"  {'Endpoint':<28}: GET /livreurs-proches?rayon=5km")
     print(f"  {'Requêtes':<28}: {num_requests}")
     print(f"  {'Concurrence max':<28}: 30")
