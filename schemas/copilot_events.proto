@@ -1,0 +1,62 @@
+﻿syntax = "proto3";
+
+package fleetstream.copilot.v1;
+
+message CourierPositionV1 {
+  string event_id = 1;
+  string event_type = 2;
+  string ts = 3;
+  string courier_id = 4;
+  double lat = 5;
+  double lon = 6;
+  float speed_kmh = 7;
+  float heading_deg = 8;
+  string status = 9;
+  float accuracy_m = 10;
+  float battery_pct = 11;
+}
+
+message OrderOfferV1 {
+  string event_id = 1;
+  string event_type = 2;
+  string ts = 3;
+  string offer_id = 4;
+  string courier_id = 5;
+  double pickup_lat = 6;
+  double pickup_lon = 7;
+  double dropoff_lat = 8;
+  double dropoff_lon = 9;
+  float estimated_fare_eur = 10;
+  float estimated_distance_km = 11;
+  float estimated_duration_min = 12;
+  float demand_index = 13;
+  float weather_factor = 14;
+  float traffic_factor = 15;
+  string zone_id = 16;
+}
+
+message OrderEventV1 {
+  string event_id = 1;
+  string event_type = 2;
+  string ts = 3;
+  string offer_id = 4;
+  string order_id = 5;
+  string courier_id = 6;
+  string status = 7;
+  float actual_fare_eur = 8;
+  float actual_distance_km = 9;
+  float actual_duration_min = 10;
+  string zone_id = 11;
+}
+
+message ContextSignalV1 {
+  string event_id = 1;
+  string event_type = 2;
+  string ts = 3;
+  string zone_id = 4;
+  float demand_index = 5;
+  float supply_index = 6;
+  float weather_factor = 7;
+  float traffic_factor = 8;
+  string source = 9;
+}

@@ -2,7 +2,7 @@
 
 > Suivi temps réel d'une flotte de livreurs — Architecture Lambda sur Redpanda, Redis Stack et Apache Parquet.
 
-**Cas d'usage** : Plateforme type Uber Eats gérant 100+ livreurs simultanément à Paris.
+**Cas d'usage** : Plateforme type Uber Eats gérant 100+ livreurs simultanément à New York City.
 **Problème adressé** : Le SQL classique ne peut pas ingérer des milliers de coordonnées GPS par seconde tout en servant des requêtes géospatiales à faible latence.
 
 ---
@@ -98,8 +98,8 @@ make up
 ### Hot Path (Redis — <10ms)
 
 ```bash
-# Livreurs dans un rayon autour de Notre-Dame
-curl "http://localhost:8001/livreurs-proches?lat=48.8530&lon=2.3499&rayon=2"
+# Livreurs dans un rayon autour de Times Square
+curl "http://localhost:8001/livreurs-proches?lat=40.7580&lon=-73.9855&rayon=2"
 
 # Position d'un livreur précis
 curl "http://localhost:8001/livreurs/L007"
@@ -161,7 +161,7 @@ La carte utilise Leaflet.js avec une technique anti-clignotement :
 
 | Métrique | Valeur |
 |---|---|
-| Throughput producer | 100 msg/s (configurable) |
+| Throughput TLC replay | ~250-800 courses concurrentes (sample rate configurable) |
 | Latence GEOSEARCH p50 | ~0.8 ms |
 | Latence GEOSEARCH p99 | ~2.3 ms ✅ (SLA < 10ms) |
 | Taille Parquet (1h) | ~8-12 MB (Snappy) |
@@ -178,7 +178,8 @@ FleetStream/
 ├── Makefile                  # make up / logs / demo / stress
 ├── stress_test.py            # 1k–5k livreurs, benchmark p50/p95/p99
 │
-├── producer/                 # 100 livreurs asyncio à Paris
+├── tlc_replay/               # NYC TLC HVFHV replay → positions + offers + events (100% vraies trips Uber)
+├── context_poller/           # Poll Citi Bike GBFS + Open-Meteo + NYC 311 → context-signals-v1
 ├── hot_path/                 # Speed Layer → Redis GEOADD (TTL 30s)
 ├── cold_path/                # Batch Layer → Parquet Snappy hive-partitionné
 │
@@ -265,8 +266,14 @@ df = conn.execute("""
 
 | Variable | Défaut | Description |
 |---|---|---|
-| `NUM_LIVREURS` | `100` | Livreurs simulés |
-| `EMIT_INTERVAL_MS` | `1000` | Intervalle d'émission |
+| `TLC_MONTH` | `2024-01` | Mois de depart du replay historique (format `YYYY-MM`) |
+| `TLC_MONTHS` | `` | Liste CSV explicite des mois a rejouer (prioritaire), ex: `2024-01,2024-02,...,2024-10` |
+| `TLC_MONTH_COUNT` | `0` | Nombre de mois consecutifs a rejouer a partir de `TLC_MONTH` (`10` pour 10 mois, `12` pour 1 an) |
+| `TLC_SPEED_FACTOR` | `1` | 1 = temps réel NYC, 6 = 6× accéléré |
+| `TLC_TRIP_SAMPLE_RATE` | `0.15` | Fraction de trips Uber rejouées (→ nb courses concurrentes) |
+| `TLC_MAX_ACTIVE_TRIPS` | `800` | Plafond dur de courses simultanées |
+| `DRIVER_INGEST_TOKEN` | `dev-insecure-token` | Token du gateway mobile `driver-ingest` |
+| `CONTEXT_TICK_SECONDS` | `30` | Fréquence de publication des signaux de contexte (263 zones) |
 | `GPS_TTL_SECONDS` | `30` | TTL Redis |
 | `BATCH_INTERVAL_SECONDS` | `60` | Fréquence flush Parquet |
 | `MAX_BATCH_RECORDS` | `50000` | Taille max buffer cold path |
@@ -293,3 +300,200 @@ make clean           # Supprime containers + volumes + Parquet
 
 Projet académique **CY Tech — ING3 Big Data**.
 Architecture Lambda/Kappa appliquée au suivi de flotte en temps réel.
+
+---
+
+## Copilot Uber Eats MVP (v1)
+
+This repository now includes a local-first copilot workflow for courier decision support.
+
+### New event contract (Protobuf)
+
+- Schema file: `schemas/copilot_events.proto`
+- Generated code: `schemas/gen/copilot_events_pb2.py`
+- Registry helper: `scripts/register-schemas.ps1` (uses `schemas/register_schemas.py`)
+
+### New streaming topics
+
+- `order-offers-v1`
+- `order-events-v1`
+- `context-signals-v1`
+
+`livreurs-gps` is preserved for live courier positions.
+
+### New services
+
+- `copilot-features`: consumes offers/context and writes realtime feature vectors into Redis.
+- `driver-ingest`: secure HTTP gateway for real mobile GPS ingestion (`CourierPositionV1` -> `livreurs-gps`).
+- `uber-driver-connector`: optional connector to Uber Driver API (`/partners/me`, `/partners/trips`) that publishes normalized events to `order-events-v1`.
+- Existing services (`tlc-replay`, `context-poller`, `hot-consumer`, `cold-consumer`, `api`) now support the copilot event flow.
+
+### New API endpoints
+
+- `POST /copilot/score-offer`
+- `GET /copilot/driver/{id}/next-best-zone`
+- `GET /copilot/driver/{id}/offers`
+- `GET /copilot/replay`
+- `GET /copilot/health`
+- `GET /copilot` (mobile-first PWA)
+
+### Driver ingest API (real devices)
+
+Gateway URL: `http://localhost:8010`
+
+- `GET /healthz`
+- `POST /ingest/v1/position`
+- `POST /ingest/v1/positions`
+
+Authentication:
+
+- `Authorization: Bearer <token>` (or `X-Driver-Token`)
+- local sandbox token default: `dev-insecure-token` (change in production)
+
+### Driver PWA UX (lot 3)
+
+- realtime health banner (ML mode + quality gate + metrics)
+- driver session controls with quick windows (`Last 30m`, `Last 2h`, `Today`)
+- KPI strip (`offers`, `accept rate`, `avg EUR/h`, `replay events`)
+- manual scoring with presets (`Safe`, `Balanced`, `Surge`)
+- one-tap scoring from cached offers
+- offer filtering (`all` / `accept` / `reject`)
+- ranked next-best zones with opportunity meter
+- replay timeline with event-type summary
+
+### Lot 4 evidence output
+
+Running `make perf-lot4` generates:
+
+- JSON report in `data/reports/perf_lot4_*.json`
+- markdown summary in `docs/preuve-technique.md`
+
+The report checks:
+
+- hot path geosearch p99
+- copilot score-offer p95
+- ingestion throughput delta
+- DLQ file count
+
+### New storage layout
+
+- Position history stays in `data/parquet/`.
+- Copilot business events are persisted in `data/parquet_events/`.
+
+### Local ML workflow
+
+Train model artifact locally:
+
+```bash
+make train-copilot
+```
+
+Output:
+
+- `data/models/copilot_model.joblib`
+- `data/models/copilot_model.json`
+
+The metadata file now contains:
+
+- quality metrics (`roc_auc`, `average_precision`, `brier_score`, `ece_10_bins`)
+- label source distribution (`observed_realized`, `observed_rejected`, `accepted_proxy`, fallback)
+- training parameters (`label_threshold_eur_h`, `context_window_minutes`)
+
+At API startup, a quality gate validates the model before enabling ML scoring:
+
+- `COPILOT_MODEL_MIN_ROWS`
+- `COPILOT_MODEL_MIN_AUC`
+- `COPILOT_MODEL_MIN_AVG_PRECISION`
+
+If the gate fails, the API falls back to heuristic scoring automatically.
+
+### Data source modes
+
+#### 1) Simulation mode (default) - NYC TLC HVFHV replay
+
+`tlc-replay` streams historical Uber NYC trips and emits:
+
+- `OrderOfferV1` at `request_datetime`
+- `OrderEventV1(accepted)` right after the offer
+- `CourierPositionV1` at pickup, interpolated between pickup/dropoff centroids, and at dropoff
+- `OrderEventV1(dropped_off)` at `dropoff_datetime`
+
+Replay long history (PowerShell examples):
+
+```powershell
+# 10 months from Jan 2024 (2024-01 .. 2024-10)
+$env:TLC_MONTH="2024-01"; $env:TLC_MONTH_COUNT="10"; docker compose up -d --force-recreate tlc-replay
+
+# 12 months from Jan 2024 (full year)
+$env:TLC_MONTH="2024-01"; $env:TLC_MONTH_COUNT="12"; docker compose up -d --force-recreate tlc-replay
+```
+
+If you want exact custom months instead of a range:
+
+```powershell
+$env:TLC_MONTHS="2024-01,2024-02,2024-03,2024-04"; docker compose up -d --force-recreate tlc-replay
+```
+
+Lat/lon come from the 263 NYC taxi zone centroids (pre-computed once with DuckDB
+spatial from the official TLC shapefile and shipped as `tlc_replay/nyc_zone_centroids.json`).
+To regenerate the file:
+
+```bash
+python scripts/gen_nyc_zone_centroids.py
+```
+
+#### 2) Real mode - mobile GPS ingestion
+
+`driver-ingest` receives real courier GPS from your mobile app / SDK and publishes
+`CourierPositionV1` directly into `livreurs-gps` (then consumed by `hot-consumer`).
+
+Switch commands:
+
+```bash
+make real-mode   # stop tlc-replay, keep real GPS only
+make sim-mode    # restart tlc-replay
+```
+
+Quick ingest check:
+
+```bash
+make demo-ingest
+```
+
+### Context streaming — real public APIs
+
+The `context-poller` service streams `ContextSignalV1` events for each of the 263
+NYC taxi zones every `CONTEXT_TICK_SECONDS`, using only public API data:
+
+- **Citi Bike GBFS** (`gbfs.lyft.com/gbfs/2.3/bkn/…`) → `demand_index`
+- **Open-Meteo** (`api.open-meteo.com`) → `weather_factor`
+- **NYC 311 Socrata** (`data.cityofnewyork.us/resource/erm2-nwe9.json`) → `traffic_factor`
+- **Redis GEO** (`fleet:livreurs`, populated by `hot-consumer` from TLC positions) → `supply_index`
+
+There is no synthetic context anywhere in the platform.
+
+### Developer checks
+
+```bash
+python -m ruff check tlc_replay context_poller hot_path cold_path api copilot_features ml tests schemas/register_schemas.py
+python -m pytest -q
+```
+
+### New helper commands
+
+```bash
+make demo-copilot
+make bench-copilot
+make smoke-e2e
+make perf-lot4
+make proof-lot4
+```
+
+### DuckDB local script updates
+
+`./scripts/duckdb-local.ps1` now supports:
+
+- `events-count`
+- `events-sample`
+
+for `copilot_events` view.

@@ -1,0 +1,5 @@
+﻿aiokafka==0.11.0
+cramjam>=2.8.0
+redis[asyncio]==5.0.8
+python-dotenv==1.0.1
+protobuf==5.27.3

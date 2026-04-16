@@ -1,0 +1,8 @@
+{
+  "name": "FleetStream Driver Copilot",
+  "short_name": "Driver AI",
+  "start_url": "/copilot",
+  "display": "standalone",
+  "background_color": "#f3f6ef",
+  "theme_color": "#0f172a"
+}

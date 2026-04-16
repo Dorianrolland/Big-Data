@@ -19,19 +19,23 @@ import os
 import statistics
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Any, Awaitable, Literal, Optional
 
 import duckdb
 import redis.asyncio as aioredis
+from redis.exceptions import RedisError
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import Gauge
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
+
+from copilot_router import copilot_router, start_copilot_background_tasks, stop_copilot_background_tasks
 
 load_dotenv()
 
@@ -44,6 +48,9 @@ log = logging.getLogger("api")
 # ── Config ──────────────────────────────────────────────────────────────────────
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 DATA_PATH = Path(os.getenv("DATA_PATH", "/data/parquet"))
+REDIS_CONNECT_TIMEOUT_SECONDS = float(os.getenv("REDIS_CONNECT_TIMEOUT_SECONDS", "1.5"))
+REDIS_OP_TIMEOUT_SECONDS = float(os.getenv("REDIS_OP_TIMEOUT_SECONDS", "6.0"))
+DUCKDB_QUERY_TIMEOUT_SECONDS = float(os.getenv("DUCKDB_QUERY_TIMEOUT_SECONDS", "12.0"))
 
 GEO_KEY          = "fleet:geo"
 HASH_PREFIX      = "fleet:livreur:"
@@ -51,6 +58,17 @@ STATS_MSGS_KEY   = "fleet:stats:total_messages"
 STATS_DLQ_KEY    = "fleet:stats:dlq_count"
 DLQ_KEY          = "fleet:dlq"
 DLQ_PATH         = Path(os.getenv("DLQ_PATH", "/data/dlq"))
+TLC_REPLAY_STATUS_KEY = "copilot:replay:tlc:status"
+DELIVERING_STATUS_ALIASES = {
+    "delivering",
+    "pickup_arrived",
+    "pickup_assigned",
+    "pickup_en_route",
+    "on_trip",
+    "busy",
+}
+AVAILABLE_STATUS_ALIASES = {"available", "ready", "waiting_order"}
+IDLE_STATUS_ALIASES = {"idle", "offline", "paused"}
 
 # ── Prometheus custom metrics ───────────────────────────────────────────────────
 gauge_active_livreurs = Gauge(
@@ -78,7 +96,18 @@ instrumentator = Instrumentator(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Connexion Redis
-    app.state.redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+    app.state.redis = aioredis.from_url(
+        REDIS_URL,
+        decode_responses=True,
+        socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS,
+        socket_timeout=REDIS_OP_TIMEOUT_SECONDS,
+        health_check_interval=15,
+        retry_on_timeout=True,
+    )
+    try:
+        await app.state.redis.ping()
+    except Exception as exc:
+        log.warning("Redis indisponible au démarrage (%s): %s", REDIS_URL, exc)
 
     # Connexion DuckDB persistante — source de vérité pour tous les endpoints
     # Cold Path. Chaque requête obtient son propre cursor (thread-safe), ce qui
@@ -88,6 +117,7 @@ async def lifespan(app: FastAPI):
     # pré-chargée pour préparer la future migration vers MinIO/S3.
     app.state.duckdb = duckdb.connect(":memory:")
     try:
+        app.state.duckdb.execute("SET enable_object_cache = true;")
         app.state.duckdb.execute("INSTALL parquet; LOAD parquet;")
         app.state.duckdb.execute("INSTALL httpfs; LOAD httpfs;")
     except Exception as exc:
@@ -127,7 +157,13 @@ async def lifespan(app: FastAPI):
         await asyncio.sleep(30)  # Attendre que les premières données Parquet arrivent
         while True:
             try:
-                glob_path = str(DATA_PATH / "**" / "*.parquet")
+                ref_ts = await _latest_parquet_ts()
+                if ref_ts is None:
+                    log.info("Feedback loop: en attente de ts de reference Parquet")
+                    await asyncio.sleep(300)
+                    continue
+                window_start = ref_ts - timedelta(hours=2)
+                scan_sql = _parquet_scan_sql(window_start, ref_ts, max_hours=24)
                 rows = await _dq(
                     f"""
                     SELECT
@@ -136,11 +172,12 @@ async def lifespan(app: FastAPI):
                         ROUND(AVG(speed_kmh), 1)               AS avg_speed,
                         ROUND(STDDEV(speed_kmh), 1)            AS std_speed,
                         COUNT(*)                               AS nb_points
-                    FROM read_parquet('{glob_path}', hive_partitioning = true)
-                    WHERE ts >= NOW() - INTERVAL 2 HOUR
+                    FROM {scan_sql}
+                    WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
                     GROUP BY lat_cell, lon_cell
                     HAVING COUNT(*) >= 20
-                    """
+                    """,
+                    [_dt_to_iso(window_start), _dt_to_iso(ref_ts)],
                 )
 
                 r: aioredis.Redis = app.state.redis
@@ -156,17 +193,23 @@ async def lifespan(app: FastAPI):
                     pipe.expire(key, 7200)  # TTL 2h
                 await pipe.execute()
                 gauge_feedback_zones.set(len(rows))
-                log.info("Feedback loop: %d zones de vitesse mises à jour dans Redis", len(rows))
+                log.info(
+                    "Feedback loop: %d speed zones updated in Redis (ref=%s)",
+                    len(rows),
+                    _dt_to_iso(ref_ts),
+                )
             except Exception as exc:
                 log.warning("Feedback loop error: %s", exc)
             await asyncio.sleep(300)  # 5 minutes
 
-    task  = asyncio.create_task(_update_fleet_metrics())
+    task = asyncio.create_task(_update_fleet_metrics())
     task2 = asyncio.create_task(_feedback_loop())
+    copilot_tasks = start_copilot_background_tasks(app)
     log.info("FleetStream API v2 démarrée — Redis: %s | Data: %s", REDIS_URL, DATA_PATH)
     yield
     task.cancel()
     task2.cancel()
+    stop_copilot_background_tasks(copilot_tasks)
     try:
         app.state.duckdb.close()
     except Exception:
@@ -193,14 +236,29 @@ instrumentator.instrument(app)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(RedisError)
+async def handle_redis_error(request: Request, exc: RedisError):
+    log.warning("RedisError non gérée sur %s: %s", request.url.path, exc)
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": _redis_unavailable_message(),
+            "path": request.url.path,
+            "backend": "redis",
+        },
+    )
 
 # Sert le dashboard HTML statique depuis le dossier /dashboard
 _DASHBOARD_DIR = Path(__file__).parent / "static"
 if _DASHBOARD_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(_DASHBOARD_DIR)), name="static")
+
+app.include_router(copilot_router)
 
 @app.get("/map", include_in_schema=False)
 async def live_map():
@@ -246,6 +304,7 @@ class HistoryResponse(BaseModel):
     heures: int
     resume: HistoryResume
     trajectory: list[dict]
+    time_reference: dict[str, str] | None = None
 
 
 # ── Utilitaires ─────────────────────────────────────────────────────────────────
@@ -253,7 +312,12 @@ def _parquet_glob() -> str:
     return str(DATA_PATH / "**" / "*.parquet")
 
 
-async def _dq(sql: str, params: list | None = None) -> list[tuple]:
+async def _dq(
+    sql: str,
+    params: list | None = None,
+    *,
+    timeout_sec: float | None = None,
+) -> list[tuple]:
     """
     Exécute une requête SQL sur la connexion DuckDB partagée dans un thread.
 
@@ -269,7 +333,24 @@ async def _dq(sql: str, params: list | None = None) -> list[tuple]:
     def _run() -> list[tuple]:
         cur = app.state.duckdb.cursor()
         return cur.execute(sql, params or []).fetchall()
-    return await asyncio.to_thread(_run)
+    effective_timeout = (
+        DUCKDB_QUERY_TIMEOUT_SECONDS if timeout_sec is None else timeout_sec
+    )
+    if effective_timeout <= 0:
+        return await asyncio.to_thread(_run)
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_run),
+            timeout=effective_timeout,
+        )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"DuckDB timeout ({effective_timeout:.1f}s). "
+                "Réduis la fenêtre d'analyse ou relance quand les données sont moins chargées."
+            ),
+        ) from exc
 
 
 def _percentile(data: list[float], pct: int) -> float:
@@ -278,6 +359,250 @@ def _percentile(data: list[float], pct: int) -> float:
     data_sorted = sorted(data)
     idx = max(0, int(len(data_sorted) * pct / 100) - 1)
     return round(data_sorted[idx], 3)
+
+
+def _coerce_datetime_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _parse_iso_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = f"{raw[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return _coerce_datetime_utc(parsed)
+
+
+def _dt_to_iso(value: datetime) -> str:
+    return _coerce_datetime_utc(value).isoformat()
+
+
+def _sql_quote_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _hour_partition_globs(
+    window_start: datetime,
+    window_end: datetime,
+    *,
+    max_hours: int = 72,
+) -> list[str]:
+    """
+    Retourne les globs Parquet des partitions horaires couvertes par la fenêtre.
+
+    Exemple:
+      /data/parquet/year=2024/month=01/day=01/hour=06/*.parquet
+    """
+    start_utc = _coerce_datetime_utc(window_start)
+    end_utc = _coerce_datetime_utc(window_end)
+    if end_utc < start_utc:
+        start_utc, end_utc = end_utc, start_utc
+
+    start_hour = start_utc.replace(minute=0, second=0, microsecond=0)
+    end_hour = end_utc.replace(minute=0, second=0, microsecond=0)
+    span_hours = int((end_hour - start_hour).total_seconds() // 3600) + 1
+    if span_hours > max_hours:
+        return []
+
+    globs: list[str] = []
+    seen: set[str] = set()
+    cur = start_hour
+    while cur <= end_hour:
+        partition_dir = (
+            DATA_PATH
+            / f"year={cur.year:04d}"
+            / f"month={cur:%m}"
+            / f"day={cur:%d}"
+            / f"hour={cur:%H}"
+        )
+        if partition_dir.exists():
+            glob = str(partition_dir / "*.parquet")
+            if glob not in seen:
+                globs.append(glob)
+                seen.add(glob)
+        cur += timedelta(hours=1)
+    return globs
+
+
+def _recent_hour_partition_globs(limit: int = 8) -> list[str]:
+    if not DATA_PATH.exists():
+        return []
+
+    hour_dirs = sorted(
+        (
+            p for p in DATA_PATH.glob("year=*/month=*/day=*/hour=*")
+            if p.is_dir()
+        ),
+        key=lambda p: p.as_posix(),
+        reverse=True,
+    )
+    out: list[str] = []
+    for part in hour_dirs:
+        if next(part.glob("*.parquet"), None) is None:
+            continue
+        out.append(str(part / "*.parquet"))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _parquet_scan_sql_from_globs(globs: list[str] | None = None) -> str:
+    if globs:
+        quoted = ", ".join(_sql_quote_literal(g) for g in globs)
+        return f"read_parquet([{quoted}], hive_partitioning = true)"
+    return f"read_parquet('{_parquet_glob()}', hive_partitioning = true)"
+
+
+def _parquet_scan_sql(
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
+    *,
+    max_hours: int = 72,
+) -> str:
+    if window_start is not None and window_end is not None:
+        globs = _hour_partition_globs(window_start, window_end, max_hours=max_hours)
+        if globs:
+            return _parquet_scan_sql_from_globs(globs)
+    return _parquet_scan_sql_from_globs()
+
+
+def _canonical_status(raw_status: str | None) -> str:
+    status = (raw_status or "").strip().lower()
+    if status in DELIVERING_STATUS_ALIASES:
+        return "delivering"
+    if status in AVAILABLE_STATUS_ALIASES:
+        return "available"
+    if status in IDLE_STATUS_ALIASES:
+        return "idle"
+    return status or "unknown"
+
+
+def _redis_unavailable_message() -> str:
+    return (
+        "Redis est temporairement indisponible. Vérifie `redis`/`redpanda` avec "
+        "`docker compose ps`, puis relance la requête."
+    )
+
+
+def _redis_http_exception(exc: Exception) -> HTTPException:
+    log.warning("Redis indisponible: %s", exc)
+    return HTTPException(status_code=503, detail=_redis_unavailable_message())
+
+
+async def _run_redis(
+    awaitable: Awaitable[Any],
+    *,
+    op_name: str,
+    default: Any = None,
+    strict: bool = True,
+) -> Any:
+    try:
+        return await awaitable
+    except (RedisError, OSError) as exc:
+        log.warning("Redis operation failed (%s): %s", op_name, exc)
+        if strict:
+            raise _redis_http_exception(exc) from exc
+        return default
+
+
+async def _latest_parquet_ts() -> datetime | None:
+    recent_globs = _recent_hour_partition_globs(limit=8)
+    fast_scan_sql = _parquet_scan_sql_from_globs(recent_globs)
+    try:
+        rows = await _dq(
+            f"""
+            SELECT MAX(ts) AS max_ts
+            FROM {fast_scan_sql}
+            """
+        )
+    except Exception:
+        rows = []
+
+    raw = rows[0][0] if rows else None
+
+    # Fast scan only covers the ~8 most recent hour partitions. If it finds
+    # nothing AND we actually narrowed the scan (i.e. recent_globs wasn't
+    # empty), fall back to a full scan across every partition.
+    if raw is None and recent_globs:
+        try:
+            rows = await _dq(
+                f"""
+                SELECT MAX(ts) AS max_ts
+                FROM {_parquet_scan_sql_from_globs()}
+                """
+            )
+        except Exception:
+            return None
+        raw = rows[0][0] if rows else None
+
+    if isinstance(raw, datetime):
+        return _coerce_datetime_utc(raw)
+    if isinstance(raw, str):
+        return _parse_iso_timestamp(raw)
+    return None
+
+
+async def _resolve_reference_ts(reference_ts: str | None) -> tuple[datetime, dict[str, str]]:
+    if reference_ts:
+        explicit = _parse_iso_timestamp(reference_ts)
+        if explicit is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"reference_ts invalide: '{reference_ts}' (format ISO-8601 attendu)",
+            )
+        return explicit, {
+            "mode": "explicit",
+            "requested_reference_ts": reference_ts,
+            "source": "query_param",
+        }
+
+    redis_client: aioredis.Redis = app.state.redis
+    replay_status = await _run_redis(
+        redis_client.hgetall(TLC_REPLAY_STATUS_KEY),
+        op_name="hgetall tlc replay status",
+        default={},
+        strict=False,
+    ) or {}
+
+    replay_virtual_ts = _parse_iso_timestamp(replay_status.get("virtual_time"))
+    if replay_virtual_ts is not None:
+        payload = {"mode": "tlc_virtual_time", "source": "redis"}
+        state = replay_status.get("state")
+        if state:
+            payload["replay_state"] = state
+        return replay_virtual_ts, payload
+
+    latest = await _latest_parquet_ts()
+    if latest is not None:
+        return latest, {"mode": "parquet_max_ts", "source": "duckdb"}
+
+    now_utc = datetime.now(timezone.utc)
+    return now_utc, {"mode": "system_now", "source": "system_clock"}
+
+
+def _build_time_reference(
+    base: dict[str, str],
+    reference_ts: datetime,
+    window_start: datetime | None = None,
+    extra: dict[str, str] | None = None,
+) -> dict[str, str]:
+    payload = dict(base)
+    payload["reference_ts"] = _dt_to_iso(reference_ts)
+    payload["window_end"] = _dt_to_iso(reference_ts)
+    if window_start is not None:
+        payload["window_start"] = _dt_to_iso(window_start)
+    if extra:
+        payload.update(extra)
+    return payload
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -291,20 +616,23 @@ def _percentile(data: list[float], pct: int) -> float:
     tags=["Hot Path"],
 )
 async def livreurs_proches(
-    lat:    float = Query(..., description="Latitude",  example=48.8566),
-    lon:    float = Query(..., description="Longitude", example=2.3522),
+    lat:    float = Query(..., description="Latitude",  example=40.7580),
+    lon:    float = Query(..., description="Longitude", example=-73.9855),
     rayon:  float = Query(1.5, description="Rayon en km", ge=0.1, le=50.0),
     statut: Optional[Literal["available", "delivering", "idle"]] = Query(None),
-    limit:  int   = Query(50, ge=1, le=200),
+    limit:  int   = Query(50, ge=1, le=1000),
 ):
     r: aioredis.Redis = app.state.redis
 
-    raw = await r.geosearch(
+    raw = await _run_redis(
+        r.geosearch(
         GEO_KEY,
         longitude=lon, latitude=lat,
         radius=rayon, unit="km",
         withcoord=True, withdist=True,
         sort="ASC", count=limit,
+        ),
+        op_name="geosearch livreurs-proches",
     )
     if not raw:
         return NearbyResponse(count=0, rayon_km=rayon, livreurs=[])
@@ -312,14 +640,18 @@ async def livreurs_proches(
     pipe = r.pipeline(transaction=False)
     for item in raw:
         pipe.hgetall(f"{HASH_PREFIX}{item[0]}")
-    hashes = await pipe.execute()
+    hashes = await _run_redis(
+        pipe.execute(),
+        op_name="pipeline hgetall livreurs-proches",
+    )
 
     livreurs: list[LivreurPosition] = []
     for item, h in zip(raw, hashes):
         name, dist, (glon, glat) = item
         if not h:
             continue
-        if statut and h.get("status") != statut:
+        normalized_status = _canonical_status(h.get("status"))
+        if statut and normalized_status != statut:
             continue
         livreurs.append(LivreurPosition(
             livreur_id=name,
@@ -327,7 +659,7 @@ async def livreurs_proches(
             lon=float(h.get("lon", glon)),
             speed_kmh=float(h.get("speed_kmh", 0)),
             heading_deg=float(h.get("heading_deg", 0)),
-            status=h.get("status", "unknown"),
+            status=normalized_status,
             accuracy_m=float(h.get("accuracy_m", 0)),
             battery_pct=float(h.get("battery_pct", 0)),
             ts=h.get("ts", ""),
@@ -338,6 +670,167 @@ async def livreurs_proches(
 
 
 @app.get(
+    "/livreurs/focus/status",
+    summary="Métadonnées du scénario single-driver (léger, pour header UI)",
+    tags=["Hot Path"],
+)
+async def livreur_focus_status():
+    """Léger status du runner single-driver (polled rarement par l'UI).
+
+    Retourne le contenu brut de la hash Redis
+    `copilot:replay:tlc:single:status` plus quelques dérivés utiles pour
+    un header (age, is_healthy, providers). Ne touche pas au Cold Path.
+    """
+    r: aioredis.Redis = app.state.redis
+    raw = await _run_redis(
+        r.hgetall("copilot:replay:tlc:single:status"),
+        op_name="hgetall focus status",
+        default={},
+        strict=False,
+    ) or {}
+    now_utc = datetime.now(timezone.utc)
+    updated_at_iso = raw.get("updated_at") or ""
+    age_seconds: float | None = None
+    parsed = _parse_iso_timestamp(updated_at_iso)
+    if parsed is not None:
+        age_seconds = max(0.0, (now_utc - parsed).total_seconds())
+
+    def _to_int(key: str) -> int:
+        try:
+            return int(raw.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    providers = [p for p in (raw.get("routing_providers") or "").split(",") if p]
+    is_healthy = (age_seconds is not None and age_seconds < 60.0) and bool(providers)
+
+    return {
+        "driver_id": raw.get("driver_id") or "",
+        "state": raw.get("state") or "unknown",
+        "virtual_time": raw.get("virtual_time") or "",
+        "updated_at": updated_at_iso,
+        "age_seconds": age_seconds,
+        "is_healthy": is_healthy,
+        "stale_reason": raw.get("stale_reason") or "",
+        "routing_providers": providers,
+        "positions": _to_int("positions"),
+        "trips": _to_int("trips"),
+        "repositions": _to_int("repositions"),
+        "lunch_breaks": _to_int("lunch_breaks"),
+        "routing_errors": _to_int("routing_errors"),
+        "generated_at": _dt_to_iso(now_utc),
+    }
+
+
+@app.get(
+    "/livreurs/focus",
+    summary="Vue focus sur un chauffeur unique (position + stale + trail court)",
+    tags=["Hot Path"],
+)
+async def livreur_focus(
+    driver_id: str = Query(..., description="Identifiant du chauffeur à suivre"),
+    trail_points: int = Query(60, ge=0, le=500, description="Longueur du trail court (Cold Path)"),
+    stale_after_s: float = Query(15.0, ge=1.0, le=600.0),
+):
+    """Endpoint dédié au mode focus de la carte live.
+
+    Retourne la position Hot Path du chauffeur, un indicateur `stale` si
+    son dernier point est plus vieux que `stale_after_s`, et un trail
+    court reconstruit depuis le Cold Path Parquet pour animer le sillage
+    derrière le marqueur sans le faire disparaître au moindre retard.
+    """
+    r: aioredis.Redis = app.state.redis
+
+    hot = await _run_redis(
+        r.hgetall(f"{HASH_PREFIX}{driver_id}"),
+        op_name=f"hgetall focus {driver_id}",
+        default={},
+        strict=False,
+    )
+
+    now_utc = datetime.now(timezone.utc)
+    position: dict | None = None
+    stale = True
+    age_seconds: float | None = None
+    if hot:
+        try:
+            lat = float(hot.get("lat", 0.0))
+            lon = float(hot.get("lon", 0.0))
+        except (TypeError, ValueError):
+            lat = 0.0
+            lon = 0.0
+        ts_iso = hot.get("ts") or ""
+        ts_parsed = _parse_iso_timestamp(ts_iso)
+        if ts_parsed is not None:
+            age_seconds = max(0.0, (now_utc - ts_parsed).total_seconds())
+            stale = age_seconds > stale_after_s
+        else:
+            stale = True
+        position = {
+            "driver_id": driver_id,
+            "lat": lat,
+            "lon": lon,
+            "speed_kmh": float(hot.get("speed_kmh", 0.0) or 0.0),
+            "heading_deg": float(hot.get("heading_deg", 0.0) or 0.0),
+            "status": _canonical_status(hot.get("status")),
+            "accuracy_m": float(hot.get("accuracy_m", 0.0) or 0.0),
+            "battery_pct": float(hot.get("battery_pct", 0.0) or 0.0),
+            "ts": ts_iso,
+        }
+
+    trail: list[dict] = []
+    if trail_points > 0:
+        window_end = now_utc
+        window_start = window_end - timedelta(hours=2)
+        scan_sql = _parquet_scan_sql(window_start, window_end, max_hours=4)
+        try:
+            rows = await _dq(
+                f"""
+                SELECT ts, lat, lon, speed_kmh, status
+                FROM {scan_sql}
+                WHERE livreur_id = ?
+                  AND ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
+                ORDER BY ts DESC
+                LIMIT ?
+                """,
+                [driver_id, _dt_to_iso(window_start), _dt_to_iso(window_end), int(trail_points)],
+            )
+        except Exception as exc:
+            log.warning("focus trail failed for %s: %s", driver_id, exc)
+            rows = []
+        for ts_val, lat_v, lon_v, speed_v, status_v in reversed(rows):
+            if lat_v is None or lon_v is None:
+                continue
+            trail.append(
+                {
+                    "ts": ts_val.isoformat() if isinstance(ts_val, datetime) else str(ts_val),
+                    "lat": float(lat_v),
+                    "lon": float(lon_v),
+                    "speed_kmh": float(speed_v or 0.0),
+                    "status": _canonical_status(status_v),
+                }
+            )
+
+    replay_status = await _run_redis(
+        r.hgetall("copilot:replay:tlc:single:status"),
+        op_name="hgetall single status",
+        default={},
+        strict=False,
+    ) or {}
+
+    return {
+        "driver_id": driver_id,
+        "position": position,
+        "stale": stale,
+        "age_seconds": age_seconds,
+        "stale_after_s": stale_after_s,
+        "trail": trail,
+        "replay_status": replay_status,
+        "generated_at": _dt_to_iso(now_utc),
+    }
+
+
+@app.get(
     "/livreurs/{livreur_id}",
     response_model=LivreurPosition,
     summary="Position temps réel d'un livreur",
@@ -345,7 +838,10 @@ async def livreurs_proches(
 )
 async def get_livreur(livreur_id: str):
     r: aioredis.Redis = app.state.redis
-    h = await r.hgetall(f"{HASH_PREFIX}{livreur_id}")
+    h = await _run_redis(
+        r.hgetall(f"{HASH_PREFIX}{livreur_id}"),
+        op_name=f"hgetall livreur {livreur_id}",
+    )
     if not h:
         raise HTTPException(
             status_code=404,
@@ -357,7 +853,7 @@ async def get_livreur(livreur_id: str):
         lon=float(h.get("lon", 0)),
         speed_kmh=float(h.get("speed_kmh", 0)),
         heading_deg=float(h.get("heading_deg", 0)),
-        status=h.get("status", "unknown"),
+        status=_canonical_status(h.get("status")),
         accuracy_m=float(h.get("accuracy_m", 0)),
         battery_pct=float(h.get("battery_pct", 0)),
         ts=h.get("ts", ""),
@@ -372,21 +868,60 @@ async def get_livreur(livreur_id: str):
 async def stats():
     r: aioredis.Redis = app.state.redis
 
-    total_geo  = await r.zcard(GEO_KEY)
-    total_msgs = int(await r.get(STATS_MSGS_KEY) or 0)
+    redis_available = bool(
+        await _run_redis(
+            r.ping(),
+            op_name="ping stats",
+            default=False,
+            strict=False,
+        )
+    )
+    total_geo = 0
+    total_msgs = 0
+    if redis_available:
+        total_geo = int(
+            await _run_redis(
+                r.zcard(GEO_KEY),
+                op_name="zcard stats",
+                default=0,
+                strict=False,
+            ) or 0
+        )
+        total_msgs = int(
+            await _run_redis(
+                r.get(STATS_MSGS_KEY),
+                op_name="get stats messages",
+                default=0,
+                strict=False,
+            ) or 0
+        )
 
     # Source de vérité : sorted set GEO (purgé par _purge_ghosts_loop côté hot path).
     # On évite KEYS HASH_PREFIX:* qui est O(N) bloquant sur Redis et inclut les hashes
     # éphémères pas encore expirés alors que le livreur a déjà disparu de la flotte.
-    livreur_ids = await r.zrange(GEO_KEY, 0, -1)
+    livreur_ids = (
+        await _run_redis(
+            r.zrange(GEO_KEY, 0, -1),
+            op_name="zrange stats",
+            default=[],
+            strict=False,
+        ) or []
+    )
     status_counts: dict[str, int] = {"available": 0, "delivering": 0, "idle": 0}
     if livreur_ids:
         pipe = r.pipeline(transaction=False)
         for lid in livreur_ids:
             pipe.hget(f"{HASH_PREFIX}{lid}", "status")
-        for s in await pipe.execute():
-            if s in status_counts:
-                status_counts[s] += 1
+        statuses = await _run_redis(
+            pipe.execute(),
+            op_name="pipeline statuses stats",
+            default=[],
+            strict=False,
+        ) or []
+        for s in statuses:
+            canonical = _canonical_status(s)
+            if canonical in status_counts:
+                status_counts[canonical] += 1
 
     parquet_files = list(DATA_PATH.glob("**/*.parquet")) if DATA_PATH.exists() else []
 
@@ -397,6 +932,7 @@ async def stats():
             "statuts":            status_counts,
             "backend":            "Redis Stack (GEOSEARCH)",
             "ttl_secondes":       30,
+            "redis_available":    redis_available,
         },
         "cold_path": {
             "fichiers_parquet":   len(parquet_files),
@@ -435,8 +971,22 @@ async def dlq_stats():
     r: aioredis.Redis = app.state.redis
 
     # ── Hot Path : compteur Redis + taille de la liste DLQ ───────────────────
-    hot_count = int(await r.get(STATS_DLQ_KEY) or 0)
-    hot_window_size = await r.llen(DLQ_KEY)
+    hot_count = int(
+        await _run_redis(
+            r.get(STATS_DLQ_KEY),
+            op_name="get dlq stats counter",
+            default=0,
+            strict=False,
+        ) or 0
+    )
+    hot_window_size = int(
+        await _run_redis(
+            r.llen(DLQ_KEY),
+            op_name="llen dlq",
+            default=0,
+            strict=False,
+        ) or 0
+    )
 
     # ── Cold Path : agrégation des fichiers DLQ JSONL ────────────────────────
     cold_count = 0
@@ -486,7 +1036,12 @@ async def dlq_peek(
     payload brut + la raison Pydantic (champ manquant, valeur hors borne...).
     """
     r: aioredis.Redis = app.state.redis
-    raw_items = await r.lrange(DLQ_KEY, 0, limit - 1)
+    raw_items = await _run_redis(
+        r.lrange(DLQ_KEY, 0, limit - 1),
+        op_name="lrange dlq peek",
+        default=[],
+        strict=False,
+    ) or []
     items: list[dict] = []
     for s in raw_items:
         try:
@@ -514,6 +1069,10 @@ async def dlq_peek(
 async def history(
     livreur_id: str,
     heures: int = Query(1, description="Fenêtre temporelle en heures", ge=1, le=24),
+    reference_ts: str | None = Query(
+        None,
+        description="Horodatage ISO-8601 de reference (UTC). Defaut: horloge replay TLC.",
+    ),
 ):
     """
     Boucle Lambda : lit le Data Lake Parquet via DuckDB pour reconstruire
@@ -521,19 +1080,21 @@ async def history(
 
     Inclut : distance parcourue (Haversine), vitesse moyenne/max, statut dominant.
     """
-    glob = _parquet_glob()
+    ref_ts, ref_meta = await _resolve_reference_ts(reference_ts)
+    window_start = ref_ts - timedelta(hours=heures)
+    window_start_iso = _dt_to_iso(window_start)
+    window_end_iso = _dt_to_iso(ref_ts)
+    scan_sql = _parquet_scan_sql(window_start, ref_ts)
     try:
-        # glob vient de DATA_PATH (config serveur, pas entrée user) → interpolation safe
-        # livreur_id et heures restent paramétrés (protection injection)
         rows = await _dq(
             f"""
             SELECT lat, lon, speed_kmh, heading_deg, status, ts
-            FROM   read_parquet('{glob}', hive_partitioning = true)
+            FROM   {scan_sql}
             WHERE  livreur_id = ?
-              AND  ts >= NOW() - INTERVAL (CAST(? AS INTEGER)) HOUR
+              AND  ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
             ORDER BY ts
             """,
-            [livreur_id, heures],
+            [livreur_id, window_start_iso, window_end_iso],
         )
 
         if not rows:
@@ -549,9 +1110,9 @@ async def history(
                 SELECT lat, lon,
                        LAG(lat) OVER (ORDER BY ts) AS prev_lat,
                        LAG(lon) OVER (ORDER BY ts) AS prev_lon
-                FROM   read_parquet('{glob}', hive_partitioning = true)
+                FROM   {scan_sql}
                 WHERE  livreur_id = ?
-                  AND  ts >= NOW() - INTERVAL (CAST(? AS INTEGER)) HOUR
+                  AND  ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
             )
             SELECT COALESCE(SUM(
                 6371.0 * 2 * ASIN(SQRT(
@@ -562,7 +1123,7 @@ async def history(
             ), 0) AS total_km
             FROM ordered WHERE prev_lat IS NOT NULL
             """,
-            [livreur_id, heures],
+            [livreur_id, window_start_iso, window_end_iso],
         )
         dist_row = dist_rows[0] if dist_rows else (0.0,)
 
@@ -599,6 +1160,7 @@ async def history(
         heures=heures,
         resume=resume,
         trajectory=trajectory,
+        time_reference=_build_time_reference(ref_meta, ref_ts, window_start),
     )
 
 
@@ -611,8 +1173,14 @@ async def heatmap(
     heures:     int   = Query(1, ge=1, le=24),
     resolution: float = Query(0.01, ge=0.001, le=0.1,
                               description="Taille de cellule en degrés (~1km)"),
+    reference_ts: str | None = Query(
+        None,
+        description="Horodatage ISO-8601 de reference (UTC). Defaut: horloge replay TLC.",
+    ),
 ):
-    glob = _parquet_glob()
+    ref_ts, ref_meta = await _resolve_reference_ts(reference_ts)
+    window_start = ref_ts - timedelta(hours=heures)
+    scan_sql = _parquet_scan_sql(window_start, ref_ts)
     try:
         rows = await _dq(
             f"""
@@ -621,13 +1189,13 @@ async def heatmap(
                 ROUND(lon / ?, 0) * ?  AS lon_cell,
                 COUNT(*)               AS nb_passages,
                 AVG(speed_kmh)         AS avg_speed
-            FROM   read_parquet('{glob}', hive_partitioning = true)
-            WHERE  ts >= NOW() - INTERVAL (CAST(? AS INTEGER)) HOUR
+            FROM   {scan_sql}
+            WHERE  ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
             GROUP  BY lat_cell, lon_cell
             ORDER  BY nb_passages DESC
             LIMIT  500
             """,
-            [resolution, resolution, resolution, resolution, heures],
+            [resolution, resolution, resolution, resolution, _dt_to_iso(window_start), _dt_to_iso(ref_ts)],
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Erreur DuckDB : {exc}")
@@ -640,6 +1208,7 @@ async def heatmap(
             {"lat": r[0], "lon": r[1], "nb_passages": r[2], "avg_speed_kmh": round(r[3] or 0, 1)}
             for r in rows
         ],
+        "time_reference": _build_time_reference(ref_meta, ref_ts, window_start),
     }
 
 
@@ -663,23 +1232,38 @@ async def performance_check(
 
     # Warm-up (5 requêtes ignorées)
     for _ in range(5):
-        await r.geosearch(GEO_KEY, longitude=2.3522, latitude=48.8566,
-                          radius=15, unit="km", count=10)
+        await _run_redis(
+            r.geosearch(
+                GEO_KEY,
+                longitude=-73.9855,
+                latitude=40.7580,
+                radius=20,
+                unit="km",
+                count=10,
+            ),
+            op_name="geosearch performance warmup",
+        )
 
     latencies_ms: list[float] = []
     for _ in range(samples):
         t0 = time.perf_counter()
-        await r.geosearch(
-            GEO_KEY,
-            longitude=2.3522, latitude=48.8566,
-            radius=15, unit="km",
-            withcoord=False, withdist=False,
-            count=100,
+        await _run_redis(
+            r.geosearch(
+                GEO_KEY,
+                longitude=-73.9855, latitude=40.7580,
+                radius=20, unit="km",
+                withcoord=False, withdist=False,
+                count=100,
+            ),
+            op_name="geosearch performance sample",
         )
         latencies_ms.append((time.perf_counter() - t0) * 1000)
 
     # Redis INFO
-    info = await r.info("all")
+    info = await _run_redis(
+        r.info("all"),
+        op_name="info performance",
+    )
 
     sla_ok = _percentile(latencies_ms, 99) < 10.0
 
@@ -718,6 +1302,10 @@ async def performance_check(
 )
 async def fleet_insights(
     heures: int = Query(1, description="Fenêtre d'analyse historique", ge=1, le=24),
+    reference_ts: str | None = Query(
+        None,
+        description="Horodatage ISO-8601 de reference (UTC). Defaut: horloge replay TLC.",
+    ),
 ):
     """
     Vue métier complète de la flotte : taux d'utilisation, alertes opérationnelles,
@@ -726,14 +1314,41 @@ async def fleet_insights(
     Cas d'usage : dashboard opérateur, alertes dispatch, reporting journalier.
     """
     r: aioredis.Redis = app.state.redis
-    glob = _parquet_glob()
+    ref_ts, ref_meta = await _resolve_reference_ts(reference_ts)
+    window_start = ref_ts - timedelta(hours=heures)
+    scan_sql = _parquet_scan_sql(window_start, ref_ts)
 
     # ── Hot Path : état instantané ───────────────────────────────────────────
-    total_actifs = await r.zcard(GEO_KEY)
+    redis_available = bool(
+        await _run_redis(
+            r.ping(),
+            op_name="ping fleet-insights",
+            default=False,
+            strict=False,
+        )
+    )
+    total_actifs = 0
     # Liste source : sorted set GEO purgé en continu par le hot consumer.
     # ZRANGE est O(log N + M) et garanti non-bloquant — KEYS HASH_PREFIX:*
     # serait O(N) sur tout le keyspace Redis, à proscrire en prod.
-    livreur_ids = await r.zrange(GEO_KEY, 0, -1)
+    livreur_ids: list[str] = []
+    if redis_available:
+        total_actifs = int(
+            await _run_redis(
+                r.zcard(GEO_KEY),
+                op_name="zcard fleet-insights",
+                default=0,
+                strict=False,
+            ) or 0
+        )
+        livreur_ids = (
+            await _run_redis(
+                r.zrange(GEO_KEY, 0, -1),
+                op_name="zrange fleet-insights",
+                default=[],
+                strict=False,
+            ) or []
+        )
     status_counts: dict[str, int] = {"available": 0, "delivering": 0, "idle": 0}
     idle_suspects: list[dict] = []
     low_battery: list[dict] = []
@@ -742,17 +1357,23 @@ async def fleet_insights(
         pipe = r.pipeline(transaction=False)
         for lid in livreur_ids:
             pipe.hmget(f"{HASH_PREFIX}{lid}", "status", "speed_kmh", "ts", "lat", "lon", "battery_pct")
-        results = await pipe.execute()
+        results = await _run_redis(
+            pipe.execute(),
+            op_name="pipeline hmget fleet-insights",
+            default=[],
+            strict=False,
+        ) or []
         for lid, vals in zip(livreur_ids, results):
             status, speed, ts, lat, lon, battery = vals
-            if status in status_counts:
-                status_counts[status] += 1
+            canonical_status = _canonical_status(status)
+            if canonical_status in status_counts:
+                status_counts[canonical_status] += 1
             try:
                 # Livreur "delivering" mais vitesse quasi nulle → suspect
-                if status == "delivering" and float(speed or 0) < 1.5:
+                if canonical_status == "delivering" and float(speed or 0) < 1.5:
                     idle_suspects.append({
                         "livreur_id": lid,
-                        "status": status,
+                        "status": canonical_status,
                         "speed_kmh": round(float(speed or 0), 1),
                         "ts": ts,
                     })
@@ -762,7 +1383,7 @@ async def fleet_insights(
                     low_battery.append({
                         "livreur_id": lid,
                         "battery_pct": round(batt, 1),
-                        "status": status,
+                        "status": canonical_status,
                     })
             except (ValueError, TypeError):
                 pass
@@ -778,7 +1399,14 @@ async def fleet_insights(
     )
 
     # ── Cold Path : productivité historique ──────────────────────────────────
-    cold_stats = {}
+    cold_stats = {
+        "livreurs_actifs_periode": 0,
+        "vitesse_moyenne_kmh": 0.0,
+        "taux_livraison_pct": 0.0,
+        "alertes_vitesse_exces": 0,
+        "stops_suspects_total": 0,
+    }
+    cold_path_available = False
     try:
         rows = await _dq(
             f"""
@@ -790,13 +1418,14 @@ async def fleet_insights(
                 COUNT(*) FILTER (WHERE speed_kmh > 50)                  AS alertes_vitesse,
                 COUNT(*) FILTER (WHERE speed_kmh < 1 AND status = 'delivering')
                                                                         AS stops_suspects
-            FROM read_parquet('{glob}', hive_partitioning = true)
-            WHERE ts >= NOW() - INTERVAL (CAST(? AS INTEGER)) HOUR
+            FROM {scan_sql}
+            WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
             """,
-            [heures],
+            [_dt_to_iso(window_start), _dt_to_iso(ref_ts)],
         )
         row = rows[0] if rows else None
         if row:
+            cold_path_available = True
             cold_stats = {
                 "livreurs_actifs_periode": row[0],
                 "vitesse_moyenne_kmh":     row[1],
@@ -833,6 +1462,7 @@ async def fleet_insights(
             "taux_utilisation_pct": utilisation_pct,
             "taux_disponibilite_pct": disponibilite_pct,
             "taux_inactivite_pct": inactivite_pct,
+            "redis_available":     redis_available,
         },
         "alertes": {
             "livreurs_immobiles_en_livraison": len(idle_suspects),
@@ -841,10 +1471,12 @@ async def fleet_insights(
             "detail_batterie": sorted(low_battery, key=lambda x: x["battery_pct"])[:5],
         },
         "productivite_historique": cold_stats,
+        "cold_path_available": cold_path_available,
         "recommandations": _build_recommendations(
             utilisation_pct, inactivite_pct, len(idle_suspects),
             cold_stats.get("alertes_vitesse_exces", 0), len(low_battery),
         ),
+        "time_reference": _build_time_reference(ref_meta, ref_ts, window_start),
     }
 
 
@@ -893,6 +1525,10 @@ def _build_recommendations(
 async def driver_score(
     livreur_id: str,
     heures: int = Query(1, description="Fenêtre d'analyse en heures", ge=1, le=24),
+    reference_ts: str | None = Query(
+        None,
+        description="Horodatage ISO-8601 de reference (UTC). Defaut: horloge replay TLC.",
+    ),
 ):
     """
     Score de performance individuel calculé sur le Cold Path (DuckDB/Parquet).
@@ -902,7 +1538,9 @@ async def driver_score(
 
     Cas d'usage : primes de performance, tarification assurance, onboarding RH.
     """
-    glob = _parquet_glob()
+    ref_ts, ref_meta = await _resolve_reference_ts(reference_ts)
+    window_start = ref_ts - timedelta(hours=heures)
+    scan_sql = _parquet_scan_sql(window_start, ref_ts)
     try:
         rows = await _dq(
             f"""
@@ -911,9 +1549,9 @@ async def driver_score(
                     speed_kmh, status, ts, lat, lon,
                     LAG(lat) OVER (ORDER BY ts) AS prev_lat,
                     LAG(lon) OVER (ORDER BY ts) AS prev_lon
-                FROM read_parquet('{glob}', hive_partitioning = true)
+                FROM {scan_sql}
                 WHERE livreur_id = ?
-                  AND ts >= NOW() - INTERVAL (CAST(? AS INTEGER)) HOUR
+                  AND ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
             ),
             stats AS (
                 SELECT
@@ -939,7 +1577,7 @@ async def driver_score(
             )
             SELECT * FROM stats
             """,
-            [livreur_id, heures],
+            [livreur_id, _dt_to_iso(window_start), _dt_to_iso(ref_ts)],
         )
         row = rows[0] if rows else None
     except Exception as exc:
@@ -1016,6 +1654,7 @@ async def driver_score(
             "Performance insuffisante — entretien RH conseillé."   if grade == "D" else
             "Performance critique — intervention requise."
         ),
+        "time_reference": _build_time_reference(ref_meta, ref_ts, window_start),
     }
 
 
@@ -1030,6 +1669,10 @@ async def zone_coverage(
     resolution: float = Query(0.02, ge=0.005, le=0.1,
                               description="Taille de cellule en degrés (~2km)"),
     heures:     int   = Query(1, ge=1, le=24),
+    reference_ts: str | None = Query(
+        None,
+        description="Horodatage ISO-8601 de reference (UTC). Defaut: horloge replay TLC.",
+    ),
 ):
     """
     Compare la distribution actuelle des livreurs (Hot Path Redis) avec la densité
@@ -1038,15 +1681,22 @@ async def zone_coverage(
     Cas d'usage : dispatch intelligent, rééquilibrage de flotte, alertes zones découvertes.
     """
     r: aioredis.Redis = app.state.redis
-    glob = _parquet_glob()
+    ref_ts, ref_meta = await _resolve_reference_ts(reference_ts)
+    window_start = ref_ts - timedelta(hours=heures)
+    scan_sql = _parquet_scan_sql(window_start, ref_ts)
 
     # ── Hot Path : positions actuelles → agrégation par cellule ─────────────
-    raw = await r.geosearch(
-        GEO_KEY,
-        longitude=2.3522, latitude=48.8566,
-        radius=15, unit="km",
-        withcoord=True, count=500,
-    )
+    raw = await _run_redis(
+        r.geosearch(
+            GEO_KEY,
+            longitude=-73.9855, latitude=40.7580,
+            radius=20, unit="km",
+            withcoord=True, count=500,
+        ),
+        op_name="geosearch zone-coverage",
+        default=[],
+        strict=False,
+    ) or []
     supply: dict[tuple, int] = {}
     for _, (lon, lat) in raw:
         cell = (
@@ -1064,11 +1714,11 @@ async def zone_coverage(
                 ROUND(ROUND(lat / ?, 0) * ?, 4)  AS lat_cell,
                 ROUND(ROUND(lon / ?, 0) * ?, 4)  AS lon_cell,
                 COUNT(*)                          AS passages
-            FROM read_parquet('{glob}', hive_partitioning = true)
-            WHERE ts >= NOW() - INTERVAL (CAST(? AS INTEGER)) HOUR
+            FROM {scan_sql}
+            WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
             GROUP BY lat_cell, lon_cell
             """,
-            [resolution, resolution, resolution, resolution, heures],
+            [resolution, resolution, resolution, resolution, _dt_to_iso(window_start), _dt_to_iso(ref_ts)],
         )
         for lat_c, lon_c, passages in rows:
             demand[(lat_c, lon_c)] = passages
@@ -1125,6 +1775,7 @@ async def zone_coverage(
             "zones_saturees":     sur_couvertes[:5],
         },
         "toutes_zones": zones,
+        "time_reference": _build_time_reference(ref_meta, ref_ts, window_start),
     }
 
 
@@ -1139,6 +1790,10 @@ async def detect_anomalies(
     fenetre_minutes: int = Query(10, description="Fenêtre d'analyse en minutes", ge=5, le=60),
     seuil_vitesse:   float = Query(50.0, description="Seuil excès de vitesse (km/h)", ge=20.0, le=120.0),
     seuil_immobile:  float = Query(2.0, description="Vitesse max pour considérer un livreur immobile (km/h)", ge=0.5, le=10.0),
+    reference_ts: str | None = Query(
+        None,
+        description="Horodatage ISO-8601 de reference (UTC). Defaut: horloge replay TLC.",
+    ),
 ):
     """
     Analyse statistique du comportement de chaque livreur sur les N dernières minutes.
@@ -1150,7 +1805,10 @@ async def detect_anomalies(
 
     Cas d'usage : sécurité routière, détection pannes/accidents, conformité assurance.
     """
-    glob = _parquet_glob()
+    ref_ts, ref_meta = await _resolve_reference_ts(reference_ts)
+    baseline_start = ref_ts - timedelta(minutes=fenetre_minutes * 2)
+    analysis_start = ref_ts - timedelta(minutes=fenetre_minutes)
+    scan_sql = _parquet_scan_sql(baseline_start, ref_ts, max_hours=24)
     try:
         # Récupère les stats par livreur sur la fenêtre demandée
         rows = await _dq(
@@ -1164,8 +1822,8 @@ async def detect_anomalies(
                     -- Moyenne et écart-type personnel sur une fenêtre plus large (baseline)
                     AVG(speed_kmh) OVER (PARTITION BY livreur_id)    AS baseline_moy,
                     STDDEV(speed_kmh) OVER (PARTITION BY livreur_id) AS baseline_std
-                FROM read_parquet('{glob}', hive_partitioning = true)
-                WHERE ts >= NOW() - INTERVAL (CAST(? AS INTEGER) * 2) MINUTE
+                FROM {scan_sql}
+                WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
             ),
             recent AS (
                 SELECT
@@ -1183,7 +1841,7 @@ async def detect_anomalies(
                     END AS z_score,
                     MAX(ts) AS derniere_position
                 FROM base
-                WHERE ts >= NOW() - INTERVAL (CAST(? AS INTEGER)) MINUTE
+                WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
                 GROUP BY livreur_id
                 HAVING COUNT(*) >= 3
             )
@@ -1193,15 +1851,22 @@ async def detect_anomalies(
                OR z_score > 2.5
             ORDER BY z_score DESC, nb_exces_vitesse DESC
             """,
-            [fenetre_minutes, seuil_vitesse, seuil_immobile, fenetre_minutes],
+            [
+                _dt_to_iso(baseline_start),
+                _dt_to_iso(ref_ts),
+                seuil_vitesse,
+                seuil_immobile,
+                _dt_to_iso(analysis_start),
+                _dt_to_iso(ref_ts),
+            ],
         )
         scanned_rows = await _dq(
             f"""
             SELECT COUNT(DISTINCT livreur_id)
-            FROM read_parquet('{glob}', hive_partitioning = true)
-            WHERE ts >= NOW() - INTERVAL (CAST(? AS INTEGER)) MINUTE
+            FROM {scan_sql}
+            WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
             """,
-            [fenetre_minutes],
+            [_dt_to_iso(analysis_start), _dt_to_iso(ref_ts)],
         )
         total_scanned = scanned_rows[0][0] if scanned_rows else 0
     except Exception as exc:
@@ -1271,6 +1936,12 @@ async def detect_anomalies(
             "z-score sur baseline individuelle (vitesse moyenne personnelle) + "
             "seuils absolus vitesse/immobilisation"
         ),
+        "time_reference": _build_time_reference(
+            ref_meta,
+            ref_ts,
+            analysis_start,
+            {"baseline_window_start": _dt_to_iso(baseline_start)},
+        ),
     }
 
 
@@ -1285,6 +1956,10 @@ async def detect_gps_fraud(
     fenetre_minutes: int = Query(15, description="Fenêtre d'analyse en minutes", ge=5, le=60),
     seuil_teleport_km: float = Query(2.0, description="Distance min pour considérer une téléportation (km)", ge=0.5, le=20.0),
     vitesse_max_physique_kmh: float = Query(90.0, description="Vitesse max physiquement possible (km/h)", ge=30.0, le=200.0),
+    reference_ts: str | None = Query(
+        None,
+        description="Horodatage ISO-8601 de reference (UTC). Defaut: horloge replay TLC.",
+    ),
 ):
     """
     Détecte les anomalies GPS indicatives de fraude ou de dysfonctionnement matériel :
@@ -1299,7 +1974,9 @@ async def detect_gps_fraud(
     Cas d'usage : détection de triche livreur (fausse position), GPS spoofing,
     dysfonctionnement capteur, compliance assurance.
     """
-    glob = _parquet_glob()
+    ref_ts, ref_meta = await _resolve_reference_ts(reference_ts)
+    window_start = ref_ts - timedelta(minutes=fenetre_minutes)
+    scan_sql = _parquet_scan_sql(window_start, ref_ts, max_hours=24)
     try:
         rows = await _dq(
             f"""
@@ -1310,8 +1987,8 @@ async def detect_gps_fraud(
                     LAG(lat) OVER w  AS prev_lat,
                     LAG(lon) OVER w  AS prev_lon,
                     LAG(ts)  OVER w  AS prev_ts
-                FROM read_parquet('{glob}', hive_partitioning = true)
-                WHERE ts >= NOW() - INTERVAL (CAST(? AS INTEGER)) MINUTE
+                FROM {scan_sql}
+                WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
                 WINDOW w AS (PARTITION BY livreur_id ORDER BY ts)
             ),
             jumps AS (
@@ -1350,7 +2027,12 @@ async def detect_gps_fraud(
             ORDER BY vitesse_implicite_kmh DESC
             LIMIT 50
             """,
-            [fenetre_minutes, seuil_teleport_km, vitesse_max_physique_kmh],
+            [
+                _dt_to_iso(window_start),
+                _dt_to_iso(ref_ts),
+                seuil_teleport_km,
+                vitesse_max_physique_kmh,
+            ],
         )
 
         # Positions figées : même lat/lon sur >5 mesures consécutives
@@ -1363,8 +2045,8 @@ async def detect_gps_fraud(
                     ROUND(lat, 5) AS rlat,
                     ROUND(lon, 5) AS rlon,
                     ROW_NUMBER() OVER (PARTITION BY livreur_id ORDER BY ts) AS rn
-                FROM read_parquet('{glob}', hive_partitioning = true)
-                WHERE ts >= NOW() - INTERVAL (CAST(? AS INTEGER)) MINUTE
+                FROM {scan_sql}
+                WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
             ),
             groups AS (
                 SELECT *,
@@ -1384,16 +2066,16 @@ async def detect_gps_fraud(
             ORDER BY nb_repetitions DESC
             LIMIT 20
             """,
-            [fenetre_minutes],
+            [_dt_to_iso(window_start), _dt_to_iso(ref_ts)],
         )
 
         scanned_rows = await _dq(
             f"""
             SELECT COUNT(DISTINCT livreur_id)
-            FROM read_parquet('{glob}', hive_partitioning = true)
-            WHERE ts >= NOW() - INTERVAL (CAST(? AS INTEGER)) MINUTE
+            FROM {scan_sql}
+            WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
             """,
-            [fenetre_minutes],
+            [_dt_to_iso(window_start), _dt_to_iso(ref_ts)],
         )
         total_scanned = scanned_rows[0][0] if scanned_rows else 0
     except Exception as exc:
@@ -1453,6 +2135,7 @@ async def detect_gps_fraud(
             "Si vitesse implicite (distance/temps) > seuil physique → téléportation. "
             "Positions figées : mêmes coordonnées (arrondi 5 décimales) sur ≥5 mesures."
         ),
+        "time_reference": _build_time_reference(ref_meta, ref_ts, window_start),
     }
 
 
@@ -1467,6 +2150,10 @@ async def detect_gps_fraud(
 )
 async def predict_demand(
     horizon_minutes: int = Query(30, description="Horizon de prédiction en minutes", ge=15, le=120),
+    reference_ts: str | None = Query(
+        None,
+        description="Horodatage ISO-8601 de reference (UTC). Defaut: horloge replay TLC.",
+    ),
 ):
     """
     Identifie les zones où la demande est en hausse en comparant l'activité
@@ -1478,7 +2165,10 @@ async def predict_demand(
     Cas d'usage : envoyer des livreurs disponibles dans une zone AVANT que les
     commandes n'arrivent — c'est le principe du dispatch prédictif d'Uber/Deliveroo.
     """
-    glob = _parquet_glob()
+    ref_ts, ref_meta = await _resolve_reference_ts(reference_ts)
+    recent_start = ref_ts - timedelta(minutes=15)
+    baseline_start = ref_ts - timedelta(hours=1)
+    scan_sql = _parquet_scan_sql(baseline_start, ref_ts, max_hours=24)
     try:
         rows = await _dq(
             f"""
@@ -1488,8 +2178,8 @@ async def predict_demand(
                     ROUND(ROUND(lon / 0.02, 0) * 0.02, 4) AS lon_cell,
                     COUNT(*)                               AS recent_count,
                     ROUND(AVG(speed_kmh), 1)               AS recent_speed
-                FROM read_parquet('{glob}', hive_partitioning = true)
-                WHERE ts >= NOW() - INTERVAL 15 MINUTE
+                FROM {scan_sql}
+                WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
                 GROUP BY lat_cell, lon_cell
             ),
             baseline AS (
@@ -1497,9 +2187,9 @@ async def predict_demand(
                     ROUND(ROUND(lat / 0.02, 0) * 0.02, 4) AS lat_cell,
                     ROUND(ROUND(lon / 0.02, 0) * 0.02, 4) AS lon_cell,
                     COUNT(*) / 3.0                         AS baseline_count
-                FROM read_parquet('{glob}', hive_partitioning = true)
-                WHERE ts >= NOW() - INTERVAL 1 HOUR
-                  AND ts <  NOW() - INTERVAL 15 MINUTE
+                FROM {scan_sql}
+                WHERE ts >= CAST(? AS TIMESTAMPTZ)
+                  AND ts <  CAST(? AS TIMESTAMPTZ)
                 GROUP BY lat_cell, lon_cell
             )
             SELECT
@@ -1518,6 +2208,12 @@ async def predict_demand(
             ORDER BY tendance_pct DESC
             LIMIT 30
             """,
+            [
+                _dt_to_iso(recent_start),
+                _dt_to_iso(ref_ts),
+                _dt_to_iso(baseline_start),
+                _dt_to_iso(recent_start),
+            ],
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Erreur DuckDB : {exc}")
@@ -1558,6 +2254,12 @@ async def predict_demand(
         "dispatch_prioritaire": hot[:5],
         "zones_a_decouvrir":    cold[:3],
         "toutes_zones":         zones,
+        "time_reference": _build_time_reference(
+            ref_meta,
+            ref_ts,
+            recent_start,
+            {"baseline_window_start": _dt_to_iso(baseline_start)},
+        ),
     }
 
 
@@ -1577,6 +2279,10 @@ async def surge_price(
     lon:    float = Query(..., description="Longitude du point de demande", ge=-180, le=180),
     rayon:  float = Query(2.0, description="Rayon de la zone (km)", ge=0.5, le=10.0),
     base_price_eur: float = Query(5.0, description="Prix de base de la course en euros", ge=1.0, le=100.0),
+    reference_ts: str | None = Query(
+        None,
+        description="Horodatage ISO-8601 de reference (UTC). Defaut: horloge replay TLC.",
+    ),
 ):
     """
     Calcule un multiplicateur de prix dynamique (surge) à la Uber/Deliveroo.
@@ -1607,15 +2313,20 @@ async def surge_price(
     aux livreurs en zone tendue, alerte congestion pour le dispatch.
     """
     r: aioredis.Redis = app.state.redis
-    glob = _parquet_glob()
+    ref_ts, ref_meta = await _resolve_reference_ts(reference_ts)
 
     # ── 1. HOT PATH : photographie instantanée de l'offre dans le rayon ──────
-    raw_drivers = await r.geosearch(
-        GEO_KEY,
-        longitude=lon, latitude=lat,
-        radius=rayon, unit="km",
-        withcoord=False, count=500,
-    )
+    raw_drivers = await _run_redis(
+        r.geosearch(
+            GEO_KEY,
+            longitude=lon, latitude=lat,
+            radius=rayon, unit="km",
+            withcoord=False, count=500,
+        ),
+        op_name="geosearch surge-price",
+        default=[],
+        strict=False,
+    ) or []
     nb_total_zone = len(raw_drivers)
 
     nb_available = 0
@@ -1625,12 +2336,19 @@ async def surge_price(
         pipe = r.pipeline(transaction=False)
         for lid in raw_drivers:
             pipe.hget(f"{HASH_PREFIX}{lid}", "status")
-        for status in await pipe.execute():
-            if status == "available":
+        statuses = await _run_redis(
+            pipe.execute(),
+            op_name="pipeline status surge-price",
+            default=[],
+            strict=False,
+        ) or []
+        for status in statuses:
+            canonical_status = _canonical_status(status)
+            if canonical_status == "available":
                 nb_available += 1
-            elif status == "delivering":
+            elif canonical_status == "delivering":
                 nb_delivering += 1
-            elif status == "idle":
+            elif canonical_status == "idle":
                 nb_idle += 1
 
     # Pression offre : 0.0 (beaucoup de livreurs dispos) → 1.0 (aucun dispo)
@@ -1654,6 +2372,9 @@ async def surge_price(
     # Conversion approximative km → degrés (1° lat ≈ 111.32 km, lon dépend du cos)
     dlat = rayon / 111.32
     dlon = rayon / (111.32 * max(math.cos(math.radians(lat)), 0.01))
+    recent_start = ref_ts - timedelta(minutes=15)
+    baseline_start = ref_ts - timedelta(hours=1)
+    scan_sql = _parquet_scan_sql(baseline_start, ref_ts, max_hours=24)
 
     demand_pressure = 0.0
     recent_count = 0
@@ -1663,26 +2384,38 @@ async def surge_price(
             f"""
             WITH zone_filter AS (
                 SELECT speed_kmh, status, ts
-                FROM read_parquet('{glob}', hive_partitioning = true)
-                WHERE ts >= NOW() - INTERVAL 1 HOUR
+                FROM {scan_sql}
+                WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
                   AND lat BETWEEN ? AND ?
                   AND lon BETWEEN ? AND ?
             ),
             recent AS (
                 SELECT COUNT(*) AS n
                 FROM zone_filter
-                WHERE ts >= NOW() - INTERVAL 15 MINUTE
+                WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
             ),
             baseline AS (
                 -- Baseline : moyenne 15-min sur l'heure écoulée (normalisée)
                 SELECT COUNT(*) / 4.0 AS n
                 FROM zone_filter
-                WHERE ts <  NOW() - INTERVAL 15 MINUTE
+                WHERE ts >= CAST(? AS TIMESTAMPTZ)
+                  AND ts <  CAST(? AS TIMESTAMPTZ)
             )
             SELECT recent.n, baseline.n
             FROM recent, baseline
             """,
-            [lat - dlat, lat + dlat, lon - dlon, lon + dlon],
+            [
+                _dt_to_iso(baseline_start),
+                _dt_to_iso(ref_ts),
+                lat - dlat,
+                lat + dlat,
+                lon - dlon,
+                lon + dlon,
+                _dt_to_iso(recent_start),
+                _dt_to_iso(ref_ts),
+                _dt_to_iso(baseline_start),
+                _dt_to_iso(recent_start),
+            ],
         )
         if rows and rows[0]:
             recent_count = int(rows[0][0] or 0)
@@ -1781,6 +2514,12 @@ async def surge_price(
             "Multiplicateur plafonné à 3.0× — décomposition complète exposée "
             "pour transparence DGCCRF (loi française sur les prix dynamiques)."
         ),
+        "time_reference": _build_time_reference(
+            ref_meta,
+            ref_ts,
+            recent_start,
+            {"baseline_window_start": _dt_to_iso(baseline_start)},
+        ),
     }
 
 
@@ -1795,6 +2534,22 @@ async def feedback_loop_status():
     quelques exemples de clés, et la dernière mise à jour.
     """
     r: aioredis.Redis = app.state.redis
+    redis_available = bool(
+        await _run_redis(
+            r.ping(),
+            op_name="ping feedback-loop-status",
+            default=False,
+            strict=False,
+        )
+    )
+    if not redis_available:
+        return {
+            "actif": False,
+            "message": "Redis indisponible: feedback loop temporairement inaccessible.",
+            "nb_zones": 0,
+            "exemples": [],
+        }
+
     # SCAN cursor-based, non-bloquant — KEYS bloquerait Redis sur tout le keyspace.
     # COUNT=200 = compromis entre nombre de round-trips et taille des batches.
     keys: list[str] = []
@@ -1812,7 +2567,12 @@ async def feedback_loop_status():
     pipe = r.pipeline(transaction=False)
     for k in keys[:5]:
         pipe.hgetall(k)
-    samples = await pipe.execute()
+    samples = await _run_redis(
+        pipe.execute(),
+        op_name="pipeline feedback-loop-status samples",
+        default=[],
+        strict=False,
+    ) or []
 
     exemples = []
     for k, h in zip(keys[:5], samples):

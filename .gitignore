@@ -10,6 +10,13 @@ build/
 
 # Data (Parquet lake — peut être très volumineux)
 data/parquet/
+data/parquet_events/
+data/models/
+data/reports/
+data/tlc/
+data/osrm/
+data/*.duckdb
+data/*.duckdb.wal
 
 # Environnement
 .env
@@ -35,3 +42,6 @@ Thumbs.db
 # Logs
 *.log
 logs/
+*.parquet 
+.pytest_cache/
+data/

@@ -8,3 +8,7 @@ prometheus-fastapi-instrumentator==6.1.0
 prometheus-client==0.20.0
 pytz==2024.1
 aiofiles==23.2.1
+protobuf==5.27.3
+scikit-learn==1.5.1
+joblib==1.4.2
+httpx==0.27.0

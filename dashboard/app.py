@@ -669,7 +669,7 @@ const STATUS_COLORS = {{
 const deckgl = new deck.DeckGL({{
   container: 'map',
   mapStyle: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
-  initialViewState: {{ latitude:48.8566, longitude:2.3522, zoom:12, pitch:25 }},
+  initialViewState: {{ latitude:40.7580, longitude:-73.9855, zoom:11, pitch:25 }},
   controller: true,
   layers: [],
   getTooltip: null,
@@ -693,7 +693,7 @@ const deckgl = new deck.DeckGL({{
 
 async function refresh() {{
   try {{
-    const r = await fetch(API + '/livreurs-proches?lat=48.8566&lon=2.3522&rayon=15&limit=200');
+    const r = await fetch(API + '/livreurs-proches?lat=40.7580&lon=-73.9855&rayon=20&limit=500');
     const data = await r.json();
     const livreurs = (data.livreurs || []).map(lv => ({{
       position: [lv.lon, lv.lat],
@@ -756,7 +756,7 @@ st.markdown("""
 <div class="map-card">
     <div class="map-card-header">
         <span>🗺️</span>
-        <span>Flotte en temps réel — Paris · Auto-refresh 3s</span>
+        <span>Flotte en temps réel — New York City · Auto-refresh 3s</span>
     </div>
 """, unsafe_allow_html=True)
 components.html(_FLEET_MAP_HTML, height=460, scrolling=False)
@@ -823,6 +823,50 @@ with col_demand:
 
 ph_fraud  = st.empty()
 ph_zones  = st.empty()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  SECTION 2b — COPILOT DRIVER COCKPIT
+# ════════════════════════════════════════════════════════════════════════════
+st.markdown("""
+<div class="fs-sh" style="margin-top:32px">
+    <div class="overline">Driver Revenue Copilot · ML + Open Data</div>
+    <div class="heading">Cockpit Chauffeur</div>
+    <div class="sub">
+        Score d'acceptation des offres, zones de repositionnement,
+        signaux Citi Bike (GBFS) et bornes de recharge (OpenChargeMap).
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+# ── Copilot — Score an offer ─────────────────────────────────────────────────
+st.markdown("""
+<div class="spotlight-container">
+    <div class="spotlight-header"><span>🎯</span> Copilot — Scorer une offre</div>
+""", unsafe_allow_html=True)
+col_cp_id, col_cp_btn = st.columns([4, 1])
+with col_cp_id:
+    cp_driver_id = st.text_input(
+        "CP Driver", value="L042", placeholder="ex: L007, L042...",
+        key="cp_driver_id", label_visibility="collapsed",
+    )
+with col_cp_btn:
+    cp_score_btn = st.button("🎯 Offres", key="cp_score_btn", use_container_width=True)
+st.markdown("</div>", unsafe_allow_html=True)
+
+if cp_score_btn:
+    st.session_state.last_cp_offers = fetch(f"/copilot/driver/{cp_driver_id}/offers", {"limit": 10})
+    st.session_state.last_cp_zones = fetch(f"/copilot/driver/{cp_driver_id}/next-best-zone", {"top_k": 5})
+    st.session_state.last_cp_health = fetch("/copilot/health")
+
+ph_copilot = st.empty()
+
+# ── Copilot GBFS/IRVE context ─────────────────────────────────────────────────
+col_gbfs, col_irve = st.columns(2)
+with col_gbfs:
+    ph_gbfs = st.empty()
+with col_irve:
+    ph_irve = st.empty()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1256,7 +1300,7 @@ while True:
                    f'🚨 {alertes.get("livreurs_immobiles_en_livraison",0)} livreur(s) suspect(s)</div>'
                    f'{suspects_html}</div>' if alertes.get("livreurs_immobiles_en_livraison", 0) > 0 else "")
                 + reco_html
-                + f'</div>',
+                + '</div>',
                 unsafe_allow_html=True,
             )
 
@@ -1493,6 +1537,157 @@ while True:
                 f'</div></div>',
                 unsafe_allow_html=True,
             )
+
+    # ── Copilot driver offers + zones ────────────────────────────────────
+    cp_offers = st.session_state.get("last_cp_offers")
+    cp_zones = st.session_state.get("last_cp_zones")
+    cp_health = st.session_state.get("last_cp_health")
+
+    with ph_copilot.container():
+        if cp_offers and cp_offers.get("offers"):
+            offers = cp_offers["offers"]
+            offers_html = ""
+            for o in offers[:8]:
+                score = float(o.get("accept_score", 0))
+                decision = o.get("decision", "?")
+                eph = float(o.get("eur_per_hour_net", 0))
+                color = "#10B981" if decision == "accept" else "#EF4444"
+                bar_w = max(5, int(score * 100))
+                reasons = ", ".join(o.get("explanation", []))
+                offers_html += (
+                    f'<div style="display:flex;align-items:center;gap:12px;padding:8px 0;'
+                    f'border-bottom:1px solid #F1F5F9">'
+                    f'<div style="min-width:70px;font-size:11px;font-weight:700;color:{color}">'
+                    f'{decision.upper()}</div>'
+                    f'<div style="flex:1">'
+                    f'<div style="background:#F1F5F9;border-radius:6px;height:8px;overflow:hidden">'
+                    f'<div style="width:{bar_w}%;height:100%;background:{color};'
+                    f'border-radius:6px;transition:width 0.3s"></div></div></div>'
+                    f'<div style="min-width:50px;text-align:right;font-size:13px;font-weight:800">'
+                    f'{score:.0%}</div>'
+                    f'<div style="min-width:80px;text-align:right;font-size:12px;color:#64748B">'
+                    f'{eph:.1f} EUR/h</div>'
+                    f'</div>'
+                )
+            model_used = offers[0].get("model_used", "heuristic") if offers else "?"
+
+            zones_html = ""
+            if cp_zones and cp_zones.get("recommendations"):
+                for z in cp_zones["recommendations"][:5]:
+                    opp = float(z.get("opportunity_score", 0))
+                    zones_html += (
+                        f'<div style="display:flex;justify-content:space-between;padding:6px 0;'
+                        f'border-bottom:1px solid #F1F5F9;font-size:12px">'
+                        f'<span style="font-weight:600">{z.get("zone_id","?")}</span>'
+                        f'<span>demande {z.get("demand_index",0):.1f} / offre {z.get("supply_index",0):.1f}</span>'
+                        f'<span style="font-weight:800;color:#6366F1">{opp:.2f}</span>'
+                        f'</div>'
+                    )
+
+            connectors_html = ""
+            if cp_health:
+                for name, key in [("Weather", "weather_context"), ("Citi Bike", "gbfs_context"),
+                                  ("OCM EV", "irve_context"), ("TLC Replay", "tlc_replay")]:
+                    ctx = cp_health.get(key, {})
+                    status = ctx.get("status", "off")
+                    dot_color = "#10B981" if status == "ok" else "#F59E0B" if "degraded" in status else "#94A3B8"
+                    connectors_html += (
+                        f'<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 8px;'
+                        f'background:#F8FAFC;border-radius:6px;font-size:10px;font-weight:600">'
+                        f'<span style="width:6px;height:6px;border-radius:50%;background:{dot_color}"></span>'
+                        f'{name}</span> '
+                    )
+
+            no_zones = '<div style="font-size:12px;color:#94A3B8">Aucune donnee</div>'
+            zones_display = zones_html if zones_html else no_zones
+
+            st.markdown(
+                f'<div class="bi-card">'
+                f'<div class="bi-card-header">'
+                f'<span style="font-size:18px">🎯</span>'
+                f'<span class="bi-card-title">Copilot — {cp_offers.get("driver_id","?")}</span>'
+                f'<span style="margin-left:auto;font-size:10px;color:#94A3B8">model: {model_used}</span>'
+                f'</div>'
+                f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">'
+                f'<div>'
+                f'<div style="font-size:11px;font-weight:700;color:#0F172A;margin-bottom:8px">'
+                f'Dernieres offres ({len(offers)})</div>'
+                f'{offers_html}'
+                f'</div>'
+                f'<div>'
+                f'<div style="font-size:11px;font-weight:700;color:#0F172A;margin-bottom:8px">'
+                f'Zones recommandees (repositionnement)</div>'
+                f'{zones_display}'
+                f'</div></div>'
+                f'<div style="margin-top:14px;display:flex;gap:6px;flex-wrap:wrap">'
+                f'{connectors_html}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    # ── GBFS / IRVE context cards ────────────────────────────────────────
+    gbfs_data = fetch("/copilot/gbfs/zones", {"top_k": 8})
+    with ph_gbfs.container():
+        if gbfs_data and gbfs_data.get("zones"):
+            zones_g = gbfs_data["zones"][:8]
+            rows_html = ""
+            for z in zones_g:
+                boost = float(z.get("demand_boost", 0))
+                boost_color = "#EF4444" if boost > 0.3 else "#F59E0B" if boost > 0.15 else "#10B981"
+                rows_html += (
+                    f'<div style="display:flex;justify-content:space-between;padding:5px 0;'
+                    f'border-bottom:1px solid #F1F5F9;font-size:11px">'
+                    f'<span>{z.get("zone_id","?")}</span>'
+                    f'<span>{z.get("bikes_available",0)} velos</span>'
+                    f'<span style="color:{boost_color};font-weight:700">+{boost:.0%}</span>'
+                    f'</div>'
+                )
+            st.markdown(
+                f'<div class="bi-card">'
+                f'<div class="bi-card-header">'
+                f'<span style="font-size:16px">🚲</span>'
+                f'<span class="bi-card-title">Citi Bike — Signal demande</span>'
+                f'<span style="margin-left:auto;font-size:10px;color:#94A3B8">'
+                f'{gbfs_data.get("count",0)} zones</span>'
+                f'</div>'
+                f'{rows_html}'
+                f'<div style="font-size:9px;color:#94A3B8;margin-top:8px">'
+                f'Stations vides = forte demande transport = boost taxi</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    irve_health = fetch("/copilot/health")
+    with ph_irve.container():
+        irve_ctx = (irve_health or {}).get("irve_context", {})
+        tlc_ctx = (irve_health or {}).get("tlc_replay", {})
+        gbfs_ctx = (irve_health or {}).get("gbfs_context", {})
+
+        def status_dot(ctx):
+            s = ctx.get("status", "off")
+            c = "#10B981" if s == "ok" else "#F59E0B" if "degraded" in s else "#94A3B8"
+            return f'<span style="width:8px;height:8px;border-radius:50%;background:{c};display:inline-block"></span>'
+
+        st.markdown(
+            f'<div class="bi-card">'
+            f'<div class="bi-card-header">'
+            f'<span style="font-size:16px">🔌</span>'
+            f'<span class="bi-card-title">Connecteurs Open Data</span>'
+            f'</div>'
+            f'<div style="display:flex;flex-direction:column;gap:10px">'
+            f'<div style="display:flex;align-items:center;gap:8px;font-size:12px">'
+            f'{status_dot(irve_ctx)} <strong>IRVE</strong> — '
+            f'{irve_ctx.get("stations_loaded","0")} EV charging stations loaded</div>'
+            f'<div style="display:flex;align-items:center;gap:8px;font-size:12px">'
+            f'{status_dot(gbfs_ctx)} <strong>Citi Bike GBFS</strong> — '
+            f'{gbfs_ctx.get("stations_polled","0")} stations, '
+            f'{gbfs_ctx.get("zones_updated","0")} zones</div>'
+            f'<div style="display:flex;align-items:center;gap:8px;font-size:12px">'
+            f'{status_dot(tlc_ctx)} <strong>NYC TLC Replay</strong> — '
+            f'month {tlc_ctx.get("month","?")} · {tlc_ctx.get("emitted","0")} events · {tlc_ctx.get("progress_pct","0")}%</div>'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
 
     # ── Footer timestamp ──────────────────────────────────────────────────
     with ph_ts.container():

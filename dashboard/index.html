@@ -319,7 +319,7 @@ const defaultStatus = { color: '#484f58', bg: 'rgba(72,79,88,.25)', badge: 'badg
 
 /* ── Carte ──────────────────────────────────────────────────────────────── */
 const map = L.map('map', {
-  center: [48.8566, 2.3522], zoom: 12,
+  center: [40.7580, -73.9855], zoom: 12,
   zoomControl: true,
   attributionControl: true,
 });
@@ -416,7 +416,7 @@ function setBar(sid, bid, ms) {
    ══════════════════════════════════════════════════════════════════════════ */
 async function pollGPS() {
   try {
-    const r = await fetch(`${API}/livreurs-proches?lat=48.8566&lon=2.3522&rayon=15&limit=200`);
+    const r = await fetch(`${API}/livreurs-proches?lat=40.7580&lon=-73.9855&rayon=20&limit=200`);
     if (!r.ok) return;
     const data = await r.json();
     const livreurs = data.livreurs || [];
