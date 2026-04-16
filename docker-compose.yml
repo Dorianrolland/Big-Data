@@ -51,6 +51,7 @@ services:
       timeout: 10s
       retries: 5
       start_period: 30s
+    restart: unless-stopped
 
   redpanda-console:
     image: docker.redpanda.com/redpandadata/console:v2.4.6
@@ -64,6 +65,7 @@ services:
       KAFKA_SCHEMAREGISTRY_URLS: http://redpanda:8081
     ports:
       - "8080:8080"
+    restart: unless-stopped
 
   redpanda-init:
     image: redpandadata/redpanda:v23.3.18
@@ -111,24 +113,6 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
-
-  producer:
-    build:
-      context: ./producer
-      dockerfile: Dockerfile
-    container_name: fleetstream-producer
-    depends_on:
-      redpanda:
-        condition: service_healthy
-      redpanda-init:
-        condition: service_completed_successfully
-      schema-init:
-        condition: service_completed_successfully
-    environment:
-      <<: *kafka-env
-      NUM_LIVREURS: "${NUM_LIVREURS:-300}"
-      EMIT_INTERVAL_MS: "${EMIT_INTERVAL_MS:-1000}"
-      OFFER_PROBABILITY: "${OFFER_PROBABILITY:-0.14}"
     restart: unless-stopped
 
   hot-consumer:
@@ -211,13 +195,81 @@ services:
       <<: *common-env
       TLC_DATA_DIR: /data/tlc
       TLC_MONTH: "${TLC_MONTH:-2024-01}"
+      TLC_MONTHS: "${TLC_MONTHS:-}"
+      TLC_MONTH_COUNT: "${TLC_MONTH_COUNT:-0}"
       TLC_BASE_URL: "${TLC_BASE_URL:-https://d37ci6vzurychx.cloudfront.net/trip-data}"
       TLC_LICENSE_FILTER: "${TLC_LICENSE_FILTER:-HV0003}"
-      TLC_SPEED_FACTOR: "${TLC_SPEED_FACTOR:-60}"
-      TLC_BATCH_SIZE: "${TLC_BATCH_SIZE:-500}"
+      TLC_SPEED_FACTOR: "${TLC_SPEED_FACTOR:-1}"
+      TLC_TICK_INTERVAL_SEC: "${TLC_TICK_INTERVAL_SEC:-5}"
+      TLC_TRIP_SAMPLE_RATE: "${TLC_TRIP_SAMPLE_RATE:-0.15}"
+      TLC_MAX_ACTIVE_TRIPS: "${TLC_MAX_ACTIVE_TRIPS:-800}"
       TLC_LOOP_ON_FINISH: "${TLC_LOOP_ON_FINISH:-true}"
+      TLC_SCENARIO: "${TLC_SCENARIO:-fleet}"
+      TLC_SINGLE_DRIVER_ID: "${TLC_SINGLE_DRIVER_ID:-drv_demo_001}"
+      TLC_TRAIN_MONTH_COUNT: "${TLC_TRAIN_MONTH_COUNT:-0}"
+      TLC_LIVE_MONTH_COUNT: "${TLC_LIVE_MONTH_COUNT:-0}"
+      TLC_RESET_RUNTIME_ON_START: "${TLC_RESET_RUNTIME_ON_START:-false}"
+      TLC_NIGHT_ACCEL_START: "${TLC_NIGHT_ACCEL_START:-02:00}"
+      TLC_NIGHT_ACCEL_END: "${TLC_NIGHT_ACCEL_END:-08:00}"
+      TLC_NIGHT_ACCEL_FACTOR: "${TLC_NIGHT_ACCEL_FACTOR:-8}"
+      TLC_LUNCH_BREAK_ENABLED: "${TLC_LUNCH_BREAK_ENABLED:-true}"
+      TLC_LUNCH_BREAK_WINDOW: "${TLC_LUNCH_BREAK_WINDOW:-12:00-14:00}"
+      TLC_LUNCH_BREAK_MIN: "${TLC_LUNCH_BREAK_MIN:-20}"
+      TLC_LUNCH_BREAK_MAX: "${TLC_LUNCH_BREAK_MAX:-45}"
+      ROUTING_PROVIDERS: "${ROUTING_PROVIDERS:-osrm,osrm_public}"
+      ROUTING_PUBLIC_PROVIDER: "${ROUTING_PUBLIC_PROVIDER:-openrouteservice}"
+      ROUTING_PUBLIC_API_KEY: "${ROUTING_PUBLIC_API_KEY:-}"
+      ROUTING_PUBLIC_BASE_URL: "${ROUTING_PUBLIC_BASE_URL:-https://api.openrouteservice.org}"
+      ROUTING_OSRM_URL: "${ROUTING_OSRM_URL:-http://osrm:5000}"
+      ROUTING_OSRM_PUBLIC_URL: "${ROUTING_OSRM_PUBLIC_URL:-https://router.project-osrm.org}"
     volumes:
       - ./data:/data
+    restart: unless-stopped
+
+  driver-ingest:
+    build:
+      context: ./driver_ingest
+      dockerfile: Dockerfile
+    container_name: fleetstream-driver-ingest
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
+      schema-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *common-env
+      DRIVER_INGEST_TOKEN: "${DRIVER_INGEST_TOKEN:-dev-insecure-token}"
+      DRIVER_INGEST_RATE_LIMIT_PER_MIN: "${DRIVER_INGEST_RATE_LIMIT_PER_MIN:-1800}"
+      DRIVER_INGEST_MAX_BATCH_SIZE: "${DRIVER_INGEST_MAX_BATCH_SIZE:-200}"
+      DRIVER_INGEST_COMPRESSION: "${DRIVER_INGEST_COMPRESSION:-gzip}"
+    ports:
+      - "8010:8000"
+    restart: unless-stopped
+
+  context-poller:
+    build:
+      context: ./context_poller
+      dockerfile: Dockerfile
+    container_name: fleetstream-context-poller
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
+      schema-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *common-env
+      CONTEXT_TICK_SECONDS: "${CONTEXT_TICK_SECONDS:-30}"
+      GBFS_POLL_SECONDS: "${GBFS_POLL_SECONDS:-60}"
+      WEATHER_POLL_SECONDS: "${WEATHER_POLL_SECONDS:-600}"
+      NYC311_POLL_SECONDS: "${NYC311_POLL_SECONDS:-300}"
     restart: unless-stopped
 
   api:
@@ -229,6 +281,8 @@ services:
       redis:
         condition: service_healthy
       copilot-features:
+        condition: service_started
+      tlc-replay:
         condition: service_started
     environment:
       <<: *common-env

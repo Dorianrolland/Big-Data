@@ -309,6 +309,33 @@
 const API      = '';
 const POLL_GPS = 2000;
 const POLL_PERF = 20000;
+const HTTP_TIMEOUT_MS = 4500;
+const BOOT_SPINNER_FAILSAFE_MS = 7000;
+
+/* ── Focus mode ────────────────────────────────────────────────────────────
+   Active when the URL has ?focus=<driver_id>. In this mode the map tracks
+   a single chauffeur via /livreurs/focus, draws a short trail and
+   interpolates between polls so the marker slides smoothly. The marker
+   never disappears on a brief stale window — a "stale" pill is shown
+   instead. */
+const _urlParams = new URLSearchParams(window.location.search);
+const FOCUS_DRIVER = (_urlParams.get('focus') || '').trim();
+const FOCUS_ENABLED = FOCUS_DRIVER.length > 0;
+const FOCUS_TRAIL_POINTS = Number(_urlParams.get('trail') || '60');
+const FOCUS_POLL_MS = Number(_urlParams.get('focusPoll') || '1500');
+const FOCUS_STATUS_POLL_MS = Number(_urlParams.get('focusStatusPoll') || '10000');
+const FOCUS_INTERP_MS = 60;
+
+setTimeout(() => {
+  const spinner = document.getElementById('spinner');
+  if (spinner && spinner.style.display !== 'none') {
+    spinner.style.display = 'none';
+    const label = document.getElementById('last-update');
+    if (label && (!label.textContent || label.textContent.toLowerCase().includes('connexion'))) {
+      label.textContent = 'API en attente...';
+    }
+  }
+}, BOOT_SPINNER_FAILSAFE_MS);
 
 const STATUS = {
   delivering: { color: '#f0883e', bg: 'rgba(240,136,62,.18)', badge: 'badge-delivering' },
@@ -334,6 +361,36 @@ L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
 const halos   = new Map();  // id → halo CircleMarker (rayon large, opacité faible)
 const markers = new Map();  // id → CircleMarker principal
 let firstLoad = true;
+let gpsPollInFlight = false;
+let statsPollInFlight = false;
+let perfPollInFlight = false;
+
+function hideSpinner() {
+  const spinner = document.getElementById('spinner');
+  if (spinner) spinner.style.display = 'none';
+}
+
+function setConnectionLabel(text) {
+  const el = document.getElementById('last-update');
+  if (el) el.textContent = text;
+}
+
+async function fetchJson(path, timeoutMs = HTTP_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const r = await fetch(`${API}${path}`, {
+      signal: controller.signal,
+      cache: 'no-store',
+    });
+    if (!r.ok) {
+      throw new Error(`HTTP ${r.status}`);
+    }
+    return await r.json();
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
 
 /* ── Création d'un livreur (halo + marqueur) ────────────────────────────── */
 function mkMarker(lv) {
@@ -415,14 +472,14 @@ function setBar(sid, bid, ms) {
    POLLING GPS — setLatLng en place, zero recreate
    ══════════════════════════════════════════════════════════════════════════ */
 async function pollGPS() {
+  if (gpsPollInFlight) return;
+  gpsPollInFlight = true;
   try {
-    const r = await fetch(`${API}/livreurs-proches?lat=40.7580&lon=-73.9855&rayon=20&limit=200`);
-    if (!r.ok) return;
-    const data = await r.json();
+    const data = await fetchJson('/livreurs-proches?lat=40.7580&lon=-73.9855&rayon=20&limit=200');
     const livreurs = data.livreurs || [];
 
     if (firstLoad) {
-      document.getElementById('spinner').style.display = 'none';
+      hideSpinner();
       firstLoad = false;
     }
 
@@ -464,39 +521,297 @@ async function pollGPS() {
     document.getElementById('k-total').textContent = livreurs.length;
     document.getElementById('k-del').textContent   = nDel;
     document.getElementById('k-avail').textContent = nAvail;
-    document.getElementById('last-update').textContent =
-      '⟳ ' + new Date().toLocaleTimeString('fr-FR');
+    setConnectionLabel('⟳ ' + new Date().toLocaleTimeString('fr-FR'));
     updateList(livreurs);
-  } catch (e) { console.warn('GPS poll:', e); }
+  } catch (e) {
+    if (firstLoad) {
+      hideSpinner();
+      firstLoad = false;
+    }
+    setConnectionLabel('API indisponible (reconnexion...)');
+    console.warn('GPS poll:', e);
+  } finally {
+    gpsPollInFlight = false;
+  }
 }
 
 async function pollStats() {
+  if (statsPollInFlight) return;
+  statsPollInFlight = true;
   try {
-    const d = await (await fetch(`${API}/stats`)).json();
+    const d = await fetchJson('/stats');
     const cp = d.cold_path || {};
     document.getElementById('k-msgs').textContent =
       (d.hot_path?.messages_traites || 0).toLocaleString('fr-FR');
     document.getElementById('c-files').textContent = cp.fichiers_parquet ?? '—';
     document.getElementById('c-size').textContent  = (cp.taille_totale_mb ?? '—') + ' MB';
-  } catch {}
+  } catch (e) {
+    document.getElementById('k-msgs').textContent = '—';
+    console.warn('Stats poll:', e);
+  } finally {
+    statsPollInFlight = false;
+  }
 }
 
 async function pollPerf() {
+  if (perfPollInFlight) return;
+  perfPollInFlight = true;
   try {
-    const d = await (await fetch(`${API}/health/performance?samples=50`)).json();
+    const d = await fetchJson('/health/performance?samples=50', 8000);
     const b = d.geosearch_benchmark || {};
     document.getElementById('k-p99').textContent = b.p99_ms != null ? b.p99_ms + ' ms' : '—';
     setBar('s-p50','b-p50', b.p50_ms);
     setBar('s-p95','b-p95', b.p95_ms);
     setBar('s-p99','b-p99', b.p99_ms);
-  } catch {}
+  } catch (e) {
+    document.getElementById('k-p99').textContent = '—';
+    setBar('s-p50','b-p50', 0);
+    setBar('s-p95','b-p95', 0);
+    setBar('s-p99','b-p99', 0);
+    console.warn('Perf poll:', e);
+  } finally {
+    perfPollInFlight = false;
+  }
 }
 
 /* ── Start ──────────────────────────────────────────────────────────────── */
-pollGPS(); pollStats(); pollPerf();
-setInterval(pollGPS,   POLL_GPS);
-setInterval(pollStats, 5000);
-setInterval(pollPerf,  POLL_PERF);
+window.addEventListener('error', () => {
+  if (firstLoad) {
+    hideSpinner();
+    firstLoad = false;
+  }
+  setConnectionLabel('Erreur frontend (reconnexion...)');
+});
+window.addEventListener('unhandledrejection', () => {
+  if (firstLoad) {
+    hideSpinner();
+    firstLoad = false;
+  }
+});
+
+/* ══════════════════════════════════════════════════════════════════════════
+   FOCUS MODE — suit un chauffeur unique avec trail + interpolation
+   ══════════════════════════════════════════════════════════════════════════ */
+const focusState = {
+  marker: null,
+  halo: null,
+  trail: null,         // legacy single polyline — unused since trail coloring
+  trailGroup: null,    // L.layerGroup holding one polyline per status run
+  lastLat: null,
+  lastLon: null,
+  targetLat: null,
+  targetLon: null,
+  lastUpdateWall: 0,
+  targetUpdateWall: 0,
+  inflight: false,
+  lastAge: null,
+  statusPillEl: null,
+  stale: false,
+  statusMeta: null,
+};
+
+function ensureFocusPill() {
+  if (focusState.statusPillEl) return focusState.statusPillEl;
+  const bar = document.getElementById('topbar');
+  if (!bar) return null;
+  const pill = document.createElement('span');
+  pill.className = 'pill pill-arch';
+  pill.id = 'focus-pill';
+  pill.textContent = 'FOCUS: ' + FOCUS_DRIVER;
+  pill.style.marginLeft = '6px';
+  bar.insertBefore(pill, document.getElementById('kpis'));
+  focusState.statusPillEl = pill;
+  return pill;
+}
+
+function setFocusPillState(stale, ageS) {
+  const pill = ensureFocusPill();
+  if (!pill) return;
+  const meta = focusState.statusMeta;
+  const suffix = meta && meta.trips != null
+    ? ' · trips:' + meta.trips + (meta.routing_errors > 0 ? ' · err:' + meta.routing_errors : '')
+    : '';
+  if (stale) {
+    pill.className = 'pill';
+    pill.style.background = 'rgba(248,81,73,.15)';
+    pill.style.color = '#f85149';
+    pill.style.border = '1px solid rgba(248,81,73,.4)';
+    pill.textContent = 'FOCUS: ' + FOCUS_DRIVER + ' — STALE ' + (ageS != null ? Math.round(ageS) + 's' : '') + suffix;
+  } else {
+    pill.className = 'pill pill-live';
+    pill.textContent = 'FOCUS: ' + FOCUS_DRIVER + suffix;
+    pill.style.background = '';
+    pill.style.color = '';
+    pill.style.border = '';
+  }
+  if (meta) {
+    const parts = [
+      'driver: ' + (meta.driver_id || FOCUS_DRIVER),
+      'state: ' + (meta.state || '?'),
+      'virtual_time: ' + (meta.virtual_time || '?'),
+      'providers: ' + (meta.routing_providers && meta.routing_providers.length
+        ? meta.routing_providers.join(',') : '(none)'),
+      'trips: ' + (meta.trips || 0),
+      'repositions: ' + (meta.repositions || 0),
+      'lunch_breaks: ' + (meta.lunch_breaks || 0),
+      'routing_errors: ' + (meta.routing_errors || 0),
+      'positions emitted: ' + (meta.positions || 0),
+    ];
+    if (meta.stale_reason) parts.push('stale_reason: ' + meta.stale_reason);
+    pill.title = parts.join('\n');
+  }
+}
+
+async function pollFocusStatus() {
+  try {
+    const d = await fetchJson('/livreurs/focus/status');
+    focusState.statusMeta = d || null;
+    // refresh the pill text so counters update without waiting for next pollFocus
+    setFocusPillState(focusState.stale, focusState.lastAge);
+  } catch (e) {
+    // non-fatal: status is informative, position stream is the live path
+    console.warn('Focus status poll:', e);
+  }
+}
+
+function ensureFocusMarker(lat, lon, status) {
+  const s = STATUS[status] || defaultStatus;
+  if (!focusState.marker) {
+    focusState.halo = L.circleMarker([lat, lon], {
+      radius: 22, fillColor: s.color, fillOpacity: .18,
+      color: 'transparent', weight: 0, interactive: false,
+    }).addTo(map);
+    focusState.marker = L.circleMarker([lat, lon], {
+      radius: 9, fillColor: s.color, fillOpacity: 1,
+      color: '#ffffff', weight: 2,
+    }).addTo(map);
+  } else {
+    focusState.marker.setStyle({ fillColor: s.color });
+    focusState.halo.setStyle({ fillColor: s.color });
+  }
+}
+
+// Color the trail by driver status so you can see at a glance when the
+// chauffeur was repositioning vs. actually delivering a course.
+function colorForTrailStatus(status) {
+  switch ((status || '').toLowerCase()) {
+    case 'delivering':      return '#4ade80'; // green — revenue leg
+    case 'repositioning':   return '#38bdf8'; // blue — empty leg
+    case 'pickup_arrived':  return '#fbbf24'; // amber — at pickup
+    case 'idle':
+    case 'available':       return '#94a3b8'; // gray — waiting
+    default:                return '#a371f7'; // purple fallback
+  }
+}
+
+function renderTrail(points) {
+  if (!points || points.length < 2) {
+    if (focusState.trailGroup) focusState.trailGroup.clearLayers();
+    return;
+  }
+  if (!focusState.trailGroup) {
+    focusState.trailGroup = L.layerGroup().addTo(map);
+  } else {
+    focusState.trailGroup.clearLayers();
+  }
+  // Break the point sequence into runs of consecutive identical statuses
+  // and draw one polyline per run. Each run overlaps by one point with
+  // the next so segments visually connect without gaps.
+  let runStart = 0;
+  for (let i = 1; i <= points.length; i++) {
+    const atEnd = i === points.length;
+    if (atEnd || points[i].status !== points[runStart].status) {
+      if (i - runStart >= 2) {
+        const slice = points.slice(runStart, i).map(p => [p.lat, p.lon]);
+        L.polyline(slice, {
+          color: colorForTrailStatus(points[runStart].status),
+          weight: 3, opacity: .8, smoothFactor: 1.2,
+        }).addTo(focusState.trailGroup);
+      }
+      runStart = i - 1; // overlap one point with previous run
+    }
+  }
+}
+
+async function pollFocus() {
+  if (focusState.inflight) return;
+  focusState.inflight = true;
+  try {
+    const d = await fetchJson(
+      '/livreurs/focus?driver_id=' + encodeURIComponent(FOCUS_DRIVER) +
+      '&trail_points=' + FOCUS_TRAIL_POINTS + '&stale_after_s=15'
+    );
+    if (firstLoad) { hideSpinner(); firstLoad = false; }
+
+    const pos = d && d.position;
+    focusState.stale = !!(d && d.stale);
+    focusState.lastAge = d && d.age_seconds != null ? d.age_seconds : null;
+    setFocusPillState(focusState.stale, focusState.lastAge);
+
+    if (pos && Number.isFinite(pos.lat) && Number.isFinite(pos.lon)) {
+      ensureFocusMarker(pos.lat, pos.lon, pos.status);
+      const now = performance.now();
+      if (focusState.lastLat == null) {
+        focusState.lastLat = pos.lat;
+        focusState.lastLon = pos.lon;
+        focusState.marker.setLatLng([pos.lat, pos.lon]);
+        focusState.halo.setLatLng([pos.lat, pos.lon]);
+      } else {
+        // set new target; renderTick() will interpolate towards it
+        focusState.lastLat = focusState.targetLat != null ? focusState.targetLat : focusState.lastLat;
+        focusState.lastLon = focusState.targetLon != null ? focusState.targetLon : focusState.lastLon;
+      }
+      focusState.targetLat = pos.lat;
+      focusState.targetLon = pos.lon;
+      focusState.lastUpdateWall = now;
+      focusState.targetUpdateWall = now + FOCUS_POLL_MS;
+      if (focusState.firstFit !== true) {
+        map.setView([pos.lat, pos.lon], 14, { animate: false });
+        focusState.firstFit = true;
+      }
+    }
+    if (d && Array.isArray(d.trail)) {
+      renderTrail(d.trail);
+    }
+    setConnectionLabel('⟳ focus ' + new Date().toLocaleTimeString('fr-FR'));
+  } catch (e) {
+    if (firstLoad) { hideSpinner(); firstLoad = false; }
+    setConnectionLabel('focus: API retry…');
+    console.warn('Focus poll:', e);
+  } finally {
+    focusState.inflight = false;
+  }
+}
+
+function focusRenderTick() {
+  if (focusState.marker && focusState.targetLat != null) {
+    const now = performance.now();
+    const span = Math.max(100, focusState.targetUpdateWall - focusState.lastUpdateWall);
+    const t = Math.max(0, Math.min(1, (now - focusState.lastUpdateWall) / span));
+    const lat = focusState.lastLat + (focusState.targetLat - focusState.lastLat) * t;
+    const lon = focusState.lastLon + (focusState.targetLon - focusState.lastLon) * t;
+    focusState.marker.setLatLng([lat, lon]);
+    focusState.halo.setLatLng([lat, lon]);
+  }
+  requestAnimationFrame(focusRenderTick);
+}
+
+if (FOCUS_ENABLED) {
+  ensureFocusPill();
+  pollFocus();
+  pollFocusStatus();
+  setInterval(pollFocus, FOCUS_POLL_MS);
+  setInterval(pollFocusStatus, FOCUS_STATUS_POLL_MS);
+  requestAnimationFrame(focusRenderTick);
+  pollStats(); pollPerf();
+  setInterval(pollStats, 5000);
+  setInterval(pollPerf, POLL_PERF);
+} else {
+  pollGPS(); pollStats(); pollPerf();
+  setInterval(pollGPS,   POLL_GPS);
+  setInterval(pollStats, 5000);
+  setInterval(pollPerf,  POLL_PERF);
+}
 </script>
 </body>
 </html>

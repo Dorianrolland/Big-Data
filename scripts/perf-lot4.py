@@ -97,7 +97,7 @@ def replay_count(base_url: str, minutes: int = 15) -> int:
         "limit": "5000",
     }
     query = urllib.parse.urlencode(params)
-    payload = api_json(f"{base_url.rstrip('/')}/copilot/replay?{query}")
+    payload = api_json(f"{base_url.rstrip('/')}/copilot/replay?{query}", timeout=120.0)
     return int(payload.get("count", 0))
 
 

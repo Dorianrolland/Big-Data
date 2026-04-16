@@ -161,7 +161,7 @@ La carte utilise Leaflet.js avec une technique anti-clignotement :
 
 | Métrique | Valeur |
 |---|---|
-| Throughput producer | 100 msg/s (configurable) |
+| Throughput TLC replay | ~250-800 courses concurrentes (sample rate configurable) |
 | Latence GEOSEARCH p50 | ~0.8 ms |
 | Latence GEOSEARCH p99 | ~2.3 ms ✅ (SLA < 10ms) |
 | Taille Parquet (1h) | ~8-12 MB (Snappy) |
@@ -178,7 +178,8 @@ FleetStream/
 ├── Makefile                  # make up / logs / demo / stress
 ├── stress_test.py            # 1k–5k livreurs, benchmark p50/p95/p99
 │
-├── producer/                 # 100 livreurs asyncio à NYC
+├── tlc_replay/               # NYC TLC HVFHV replay → positions + offers + events (100% vraies trips Uber)
+├── context_poller/           # Poll Citi Bike GBFS + Open-Meteo + NYC 311 → context-signals-v1
 ├── hot_path/                 # Speed Layer → Redis GEOADD (TTL 30s)
 ├── cold_path/                # Batch Layer → Parquet Snappy hive-partitionné
 │
@@ -265,8 +266,14 @@ df = conn.execute("""
 
 | Variable | Défaut | Description |
 |---|---|---|
-| `NUM_LIVREURS` | `100` | Livreurs simulés |
-| `EMIT_INTERVAL_MS` | `1000` | Intervalle d'émission |
+| `TLC_MONTH` | `2024-01` | Mois de depart du replay historique (format `YYYY-MM`) |
+| `TLC_MONTHS` | `` | Liste CSV explicite des mois a rejouer (prioritaire), ex: `2024-01,2024-02,...,2024-10` |
+| `TLC_MONTH_COUNT` | `0` | Nombre de mois consecutifs a rejouer a partir de `TLC_MONTH` (`10` pour 10 mois, `12` pour 1 an) |
+| `TLC_SPEED_FACTOR` | `1` | 1 = temps réel NYC, 6 = 6× accéléré |
+| `TLC_TRIP_SAMPLE_RATE` | `0.15` | Fraction de trips Uber rejouées (→ nb courses concurrentes) |
+| `TLC_MAX_ACTIVE_TRIPS` | `800` | Plafond dur de courses simultanées |
+| `DRIVER_INGEST_TOKEN` | `dev-insecure-token` | Token du gateway mobile `driver-ingest` |
+| `CONTEXT_TICK_SECONDS` | `30` | Fréquence de publication des signaux de contexte (263 zones) |
 | `GPS_TTL_SECONDS` | `30` | TTL Redis |
 | `BATCH_INTERVAL_SECONDS` | `60` | Fréquence flush Parquet |
 | `MAX_BATCH_RECORDS` | `50000` | Taille max buffer cold path |
@@ -317,8 +324,9 @@ This repository now includes a local-first copilot workflow for courier decision
 ### New services
 
 - `copilot-features`: consumes offers/context and writes realtime feature vectors into Redis.
+- `driver-ingest`: secure HTTP gateway for real mobile GPS ingestion (`CourierPositionV1` -> `livreurs-gps`).
 - `uber-driver-connector`: optional connector to Uber Driver API (`/partners/me`, `/partners/trips`) that publishes normalized events to `order-events-v1`.
-- Existing services (`producer`, `hot-consumer`, `cold-consumer`, `api`) now support the copilot event flow.
+- Existing services (`tlc-replay`, `context-poller`, `hot-consumer`, `cold-consumer`, `api`) now support the copilot event flow.
 
 ### New API endpoints
 
@@ -329,7 +337,18 @@ This repository now includes a local-first copilot workflow for courier decision
 - `GET /copilot/health`
 - `GET /copilot` (mobile-first PWA)
 
-`GET /copilot/health` now includes `uber_connector` status from Redis.
+### Driver ingest API (real devices)
+
+Gateway URL: `http://localhost:8010`
+
+- `GET /healthz`
+- `POST /ingest/v1/position`
+- `POST /ingest/v1/positions`
+
+Authentication:
+
+- `Authorization: Bearer <token>` (or `X-Driver-Token`)
+- local sandbox token default: `dev-insecure-token` (change in production)
 
 ### Driver PWA UX (lot 3)
 
@@ -388,25 +407,75 @@ At API startup, a quality gate validates the model before enabling ML scoring:
 
 If the gate fails, the API falls back to heuristic scoring automatically.
 
-### Uber Driver API integration (optional)
+### Data source modes
 
-The connector is **on by default** and runs in degraded mode without token.
+#### 1) Simulation mode (default) - NYC TLC HVFHV replay
 
-Enable with env vars:
+`tlc-replay` streams historical Uber NYC trips and emits:
 
-- `UBER_CONNECTOR_ENABLED=true`
-- `UBER_ENV=sandbox` (or `production`)
-- `UBER_ACCESS_TOKEN=<oauth bearer>`
+- `OrderOfferV1` at `request_datetime`
+- `OrderEventV1(accepted)` right after the offer
+- `CourierPositionV1` at pickup, interpolated between pickup/dropoff centroids, and at dropoff
+- `OrderEventV1(dropped_off)` at `dropoff_datetime`
 
-Output:
+Replay long history (PowerShell examples):
 
-- normalized `order.event.v1` records into `order-events-v1`
-- connector status visible in `/copilot/health -> uber_connector`
+```powershell
+# 10 months from Jan 2024 (2024-01 .. 2024-10)
+$env:TLC_MONTH="2024-01"; $env:TLC_MONTH_COUNT="10"; docker compose up -d --force-recreate tlc-replay
+
+# 12 months from Jan 2024 (full year)
+$env:TLC_MONTH="2024-01"; $env:TLC_MONTH_COUNT="12"; docker compose up -d --force-recreate tlc-replay
+```
+
+If you want exact custom months instead of a range:
+
+```powershell
+$env:TLC_MONTHS="2024-01,2024-02,2024-03,2024-04"; docker compose up -d --force-recreate tlc-replay
+```
+
+Lat/lon come from the 263 NYC taxi zone centroids (pre-computed once with DuckDB
+spatial from the official TLC shapefile and shipped as `tlc_replay/nyc_zone_centroids.json`).
+To regenerate the file:
+
+```bash
+python scripts/gen_nyc_zone_centroids.py
+```
+
+#### 2) Real mode - mobile GPS ingestion
+
+`driver-ingest` receives real courier GPS from your mobile app / SDK and publishes
+`CourierPositionV1` directly into `livreurs-gps` (then consumed by `hot-consumer`).
+
+Switch commands:
+
+```bash
+make real-mode   # stop tlc-replay, keep real GPS only
+make sim-mode    # restart tlc-replay
+```
+
+Quick ingest check:
+
+```bash
+make demo-ingest
+```
+
+### Context streaming — real public APIs
+
+The `context-poller` service streams `ContextSignalV1` events for each of the 263
+NYC taxi zones every `CONTEXT_TICK_SECONDS`, using only public API data:
+
+- **Citi Bike GBFS** (`gbfs.lyft.com/gbfs/2.3/bkn/…`) → `demand_index`
+- **Open-Meteo** (`api.open-meteo.com`) → `weather_factor`
+- **NYC 311 Socrata** (`data.cityofnewyork.us/resource/erm2-nwe9.json`) → `traffic_factor`
+- **Redis GEO** (`fleet:livreurs`, populated by `hot-consumer` from TLC positions) → `supply_index`
+
+There is no synthetic context anywhere in the platform.
 
 ### Developer checks
 
 ```bash
-python -m ruff check producer hot_path cold_path uber_connector api copilot_features ml tests schemas/register_schemas.py
+python -m ruff check tlc_replay context_poller hot_path cold_path api copilot_features ml tests schemas/register_schemas.py
 python -m pytest -q
 ```
 

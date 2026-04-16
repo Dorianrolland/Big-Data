@@ -115,6 +115,12 @@ async def enrich_offer(redis_client: aioredis.Redis, offer: OrderOfferV1) -> dic
         "courier_id": offer.courier_id,
         "zone_id": offer.zone_id,
         "ts": offer.ts,
+        "courier_lat": round(float(courier_lat), 6),
+        "courier_lon": round(float(courier_lon), 6),
+        "pickup_lat": round(float(offer.pickup_lat), 6),
+        "pickup_lon": round(float(offer.pickup_lon), 6),
+        "dropoff_lat": round(float(offer.dropoff_lat), 6),
+        "dropoff_lon": round(float(offer.dropoff_lon), 6),
         "estimated_fare_eur": round(float(offer.estimated_fare_eur), 3),
         "estimated_distance_km": round(float(offer.estimated_distance_km), 3),
         "estimated_duration_min": round(float(offer.estimated_duration_min), 3),
@@ -151,17 +157,46 @@ async def store_offer(redis_client: aioredis.Redis, feature_map: dict) -> None:
 
 async def upsert_context(redis_client: aioredis.Redis, signal_msg: ContextSignalV1) -> None:
     key = f"{ZONE_CONTEXT_PREFIX}{signal_msg.zone_id}"
+    prev_demand_raw, prev_trend_ema_raw, prev_updated_raw = await redis_client.hmget(
+        key, ["demand_index", "demand_trend_ema", "updated_at"]
+    )
+    demand_index = round(float(signal_msg.demand_index), 3)
+
+    try:
+        prev_demand = float(prev_demand_raw) if prev_demand_raw is not None else demand_index
+    except (TypeError, ValueError):
+        prev_demand = demand_index
+    try:
+        prev_trend_ema = float(prev_trend_ema_raw) if prev_trend_ema_raw is not None else 0.0
+    except (TypeError, ValueError):
+        prev_trend_ema = 0.0
+
+    demand_trend = demand_index - prev_demand
+    demand_trend_ema = (0.65 * demand_trend) + (0.35 * prev_trend_ema)
+    forecast_demand_15m = max(0.3, demand_index + (demand_trend_ema * 1.4))
+
+    now_s = time.time()
+    try:
+        prev_updated = float(prev_updated_raw) if prev_updated_raw is not None else None
+    except (TypeError, ValueError):
+        prev_updated = None
+    context_tick_s = round(max(0.0, now_s - prev_updated), 3) if prev_updated else None
+
     await redis_client.hset(
         key,
         mapping={
             "ts": signal_msg.ts,
             "zone_id": signal_msg.zone_id,
-            "demand_index": round(float(signal_msg.demand_index), 3),
+            "demand_index": demand_index,
             "supply_index": round(float(signal_msg.supply_index), 3),
             "weather_factor": round(float(signal_msg.weather_factor), 3),
             "traffic_factor": round(float(signal_msg.traffic_factor), 3),
+            "demand_trend": round(float(demand_trend), 3),
+            "demand_trend_ema": round(float(demand_trend_ema), 3),
+            "forecast_demand_index_15m": round(float(forecast_demand_15m), 3),
+            "context_tick_s": context_tick_s if context_tick_s is not None else "",
             "source": signal_msg.source,
-            "updated_at": str(time.time()),
+            "updated_at": str(now_s),
         },
     )
     await redis_client.expire(key, OFFER_TTL_SECONDS)

@@ -6,6 +6,9 @@
   <title>FleetStream Copilot</title>
   <meta name="theme-color" content="#0f172a" />
   <link rel="manifest" href="/static/copilot/manifest.webmanifest" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
   <style>
     :root {
       --bg: #f3f6ef;
@@ -294,6 +297,8 @@
 
     .badge.accept { color: var(--good); border-color: rgba(21, 128, 61, 0.25); }
     .badge.reject { color: var(--bad); border-color: rgba(180, 35, 24, 0.25); }
+    .badge.consider { color: var(--warn); border-color: rgba(180, 83, 9, 0.25); }
+    .badge.skip { color: var(--bad); border-color: rgba(180, 35, 24, 0.25); }
 
     .chips {
       display: flex;
@@ -353,6 +358,142 @@
       background: linear-gradient(90deg, #f59e0b 0%, #0ea5a4 100%);
     }
 
+    .map-wrap {
+      display: grid;
+      gap: 8px;
+    }
+
+    .map-board {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background:
+        radial-gradient(circle at 16% 18%, rgba(14, 165, 164, 0.12), transparent 36%),
+        radial-gradient(circle at 84% 78%, rgba(245, 158, 11, 0.12), transparent 34%),
+        #fff;
+      min-height: 180px;
+      padding: 8px;
+    }
+
+    .map-board.map-ready {
+      padding: 0;
+      overflow: hidden;
+      min-height: 280px;
+      background: #e8eef3;
+    }
+
+    .map-board svg {
+      width: 100%;
+      height: 240px;
+      display: block;
+      border-radius: 10px;
+      background: rgba(148, 163, 184, 0.08);
+      border: 1px solid rgba(15, 23, 42, 0.12);
+    }
+
+    .dispatch-leaflet {
+      width: 100%;
+      height: 280px;
+      border-radius: 11px;
+      overflow: hidden;
+      border: 1px solid rgba(15, 23, 42, 0.12);
+      background: rgba(148, 163, 184, 0.12);
+    }
+
+    .dispatch-leaflet .leaflet-container {
+      width: 100%;
+      height: 100%;
+    }
+
+    .zone-pin {
+      width: 14px;
+      height: 14px;
+      border-radius: 999px;
+      border: 2px solid #ffffff;
+      box-shadow: 0 2px 6px rgba(15, 23, 42, 0.35);
+    }
+
+    .zone-pin.best {
+      background: #d97706;
+    }
+
+    .zone-pin.alt {
+      background: #0ea5a4;
+    }
+
+    .origin-pin {
+      width: 14px;
+      height: 14px;
+      border-radius: 999px;
+      background: #2563eb;
+      border: 2px solid #ffffff;
+      box-shadow: 0 2px 6px rgba(15, 23, 42, 0.35);
+    }
+
+    .map-legend {
+      display: grid;
+      gap: 6px;
+      max-height: 220px;
+      overflow: auto;
+      padding-right: 2px;
+    }
+
+    .map-row {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+      padding: 8px;
+      display: grid;
+      gap: 5px;
+    }
+
+    .map-row-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      font-size: 0.79rem;
+    }
+
+    .map-row-meta {
+      font-size: 0.76rem;
+      color: var(--ink-soft);
+    }
+
+    .mission-stats {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+
+    .mission-stat {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 8px;
+      display: grid;
+      gap: 3px;
+      min-height: 56px;
+    }
+
+    .mission-stat .k {
+      font-size: 0.67rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--ink-soft);
+    }
+
+    .mission-stat .v {
+      font-size: 0.95rem;
+      font-weight: 800;
+      color: var(--ink);
+    }
+
+    .mission-note {
+      font-size: 0.76rem;
+      color: var(--ink-soft);
+    }
+
     .timeline {
       display: grid;
       gap: 8px;
@@ -382,6 +523,7 @@
     @media (max-width: 920px) {
       .layout { grid-template-columns: 1fr; }
       .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .mission-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
 
     @media (max-width: 680px) {
@@ -392,6 +534,7 @@
       }
 
       .kpi-grid { grid-template-columns: 1fr; }
+      .mission-stats { grid-template-columns: 1fr; }
 
       .title {
         font-size: 1.08rem;
@@ -434,12 +577,76 @@
             <button id="refreshBtn">Refresh Driver Data</button>
             <button class="alt" id="replayBtn">Replay Session</button>
           </div>
+          <div class="grid three">
+            <label>Around Radius (km)<input id="aroundRadius" type="number" step="0.1" value="4.0" /></label>
+            <label>Around Limit<input id="aroundLimit" type="number" step="1" value="10" /></label>
+            <label>Min Accept Score<input id="aroundMinScore" type="number" step="0.05" value="0.25" /></label>
+          </div>
+          <div class="grid three">
+            <label>Max Reposition ETA (min)<input id="dispatchMaxEta" type="number" step="1" value="20" /></label>
+            <label>Forecast Horizon (min)<input id="dispatchForecastHorizon" type="number" step="5" value="30" /></label>
+            <label>Dispatch Zone Limit<input id="dispatchZoneTopK" type="number" step="1" value="5" /></label>
+          </div>
+          <div class="grid two">
+            <label title="0 = opportunité pure, 0.3 = modéré, 0.6 = agressif">Zone Distance Weight<input id="zoneDistanceWeight" type="number" step="0.05" min="0" max="1" value="0.3" /></label>
+            <label title="Filtre dur: zones au-delà ignorées">Zone Max Distance (km)<input id="zoneMaxDistanceKm" type="number" step="0.5" min="0.5" max="50" value="12" /></label>
+          </div>
+          <div class="grid two">
+            <label title="Bonus 'homeward' — laissé vide pour désactiver">Home Lat<input id="zoneHomeLat" type="number" step="0.000001" placeholder="40.7580" /></label>
+            <label title="Bonus 'homeward' — laissé vide pour désactiver">Home Lon<input id="zoneHomeLon" type="number" step="0.000001" placeholder="-73.9855" /></label>
+          </div>
+          <div class="grid two">
+            <label>Dispatch Strategy
+              <select id="dispatchStrategy">
+                <option value="conservative">Conservative</option>
+                <option value="balanced" selected>Balanced</option>
+                <option value="aggressive">Aggressive</option>
+              </select>
+            </label>
+          </div>
+          <div class="quick-row">
+            <label class="auto-refresh"><input id="aroundUseOsrm" type="checkbox" /> route-aware (OSRM)</label>
+            <button class="ghost" id="refreshAroundBtn">Refresh Best Around</button>
+            <button class="ghost" id="refreshFuelBtn">Sync Fuel API</button>
+          </div>
           <div class="kpi-grid">
             <div class="kpi"><div class="k">Offers</div><div class="v" id="kpiOffers">-</div></div>
             <div class="kpi"><div class="k">Accept Rate</div><div class="v" id="kpiAcceptRate">-</div></div>
             <div class="kpi"><div class="k">Avg EUR/h</div><div class="v" id="kpiAvgNet">-</div></div>
             <div class="kpi"><div class="k">Replay Events</div><div class="v" id="kpiReplay">-</div></div>
           </div>
+        </section>
+
+        <section class="card glass">
+          <h2>Mission Mode</h2>
+          <div class="quick-row">
+            <button class="ghost" id="missionStartBestBtn">Start Best Mission</button>
+            <button class="ghost" id="missionStopBtn">Stop Mission</button>
+          </div>
+          <div class="info-line" id="missionStatus">Mission inactive.</div>
+          <div class="mission-stats">
+            <div class="mission-stat"><div class="k">Target</div><div class="v" id="missionTarget">-</div></div>
+            <div class="mission-stat"><div class="k">Elapsed</div><div class="v" id="missionElapsed">-</div></div>
+            <div class="mission-stat"><div class="k">Remaining</div><div class="v" id="missionRemaining">-</div></div>
+            <div class="mission-stat"><div class="k">ETA</div><div class="v" id="missionEta">-</div></div>
+          </div>
+          <div class="zone-meter"><div id="missionProgressFill" style="width:0%"></div></div>
+          <div class="mission-note" id="missionMeta">Start from "Best zone" or from a zone row in Dispatch map.</div>
+        </section>
+
+        <section class="card glass">
+          <h2>Mission Journal</h2>
+          <div class="quick-row">
+            <button class="ghost" id="missionJournalRefreshBtn">Refresh Journal</button>
+          </div>
+          <div class="info-line" id="missionJournalSummary">No mission report yet.</div>
+          <div class="mission-stats">
+            <div class="mission-stat"><div class="k">Success Rate</div><div class="v" id="journalSuccessRate">-</div></div>
+            <div class="mission-stat"><div class="k">Realized Delta</div><div class="v" id="journalRealizedDelta">-</div></div>
+            <div class="mission-stat"><div class="k">Predicted Delta</div><div class="v" id="journalPredictedDelta">-</div></div>
+            <div class="mission-stat"><div class="k">Avg Mission Time</div><div class="v" id="journalAvgElapsed">-</div></div>
+          </div>
+          <div class="list" id="missionJournalList"></div>
         </section>
 
         <section class="card glass">
@@ -470,6 +677,21 @@
       </div>
 
       <div class="col">
+        <section class="card glass">
+          <h2>Instant Dispatch</h2>
+          <div class="info-line" id="dispatchSummary">No dispatch recommendation yet.</div>
+          <div class="list" id="dispatchPlan"></div>
+          <div class="map-wrap">
+            <div class="map-board" id="dispatchMap">Map pending...</div>
+            <div class="map-legend" id="dispatchLegend"></div>
+          </div>
+        </section>
+
+        <section class="card glass">
+          <h2>Best Offers Around You</h2>
+          <div class="list" id="bestOffers"></div>
+        </section>
+
         <section class="card glass">
           <h2>Latest Offers</h2>
           <div class="grid two">
@@ -507,7 +729,8 @@
     <div class="footer">MVP local - no paid dependencies - lot 3 UX</div>
   </main>
 
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
   <script src="/static/copilot/app.js"></script>
 </body>
 </html>
-

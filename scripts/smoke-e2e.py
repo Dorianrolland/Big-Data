@@ -175,7 +175,11 @@ def ensure_docker_available() -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Smoke E2E local FleetStream Copilot")
     parser.add_argument("--url", default="http://localhost:8001", help="base URL API")
-    parser.add_argument("--driver", default="L001", help="driver id used for offers/replay")
+    parser.add_argument(
+        "--driver",
+        default=None,
+        help="driver id used for offers/replay (default: auto-discover from /livreurs-proches)",
+    )
     parser.add_argument("--up", action="store_true", help="run docker compose up -d before checks")
     parser.add_argument("--build", action="store_true", help="with --up, also rebuild images")
     parser.add_argument("--down", action="store_true", help="run docker compose down after checks")
@@ -206,13 +210,23 @@ def main() -> int:
             timeout_s=args.timeout,
         )
 
+        driver_id = args.driver
+        if driver_id is None:
+            nearby = wait_for_json(
+                f"{base_url}/livreurs-proches?lat=40.7580&lon=-73.9855&rayon=10",
+                lambda x: len(x.get("livreurs", [])) > 0,
+                timeout_s=args.timeout,
+            )
+            driver_id = nearby["livreurs"][0]["livreur_id"]
+            print(f"auto-discovered driver_id={driver_id}")
+
         offers_payload = wait_for_json(
-            f"{base_url}/copilot/driver/{args.driver}/offers?limit=20",
+            f"{base_url}/copilot/driver/{driver_id}/offers?limit=20",
             lambda x: int(x.get("count", 0)) > 0,
             timeout_s=args.timeout,
         )
 
-        zone_payload = request_json(f"{base_url}/copilot/driver/{args.driver}/next-best-zone?top_k=5")
+        zone_payload = request_json(f"{base_url}/copilot/driver/{driver_id}/next-best-zone?top_k=5")
 
         # Wait until cold path has at least one parquet file in events lake.
         deadline = time.time() + args.timeout
@@ -221,15 +235,26 @@ def main() -> int:
             time.sleep(2)
             event_parquet_files = count_parquet_files(EVENTS_DIR)
 
-        to_ts = datetime.now(timezone.utc)
-        from_ts = to_ts - timedelta(minutes=20)
+        # Anchor replay window on virtual replay clock (offer ts), not real wall clock.
+        sample_offer = offers_payload.get("offers", [{}])[0]
+        offer_ts_str = sample_offer.get("ts")
+        if offer_ts_str:
+            offer_ts = datetime.fromisoformat(offer_ts_str)
+            if offer_ts.tzinfo is None:
+                offer_ts = offer_ts.replace(tzinfo=timezone.utc)
+            replay_to_ts = offer_ts + timedelta(minutes=10)
+            replay_from_ts = offer_ts - timedelta(minutes=10)
+        else:
+            replay_to_ts = datetime.now(timezone.utc)
+            replay_from_ts = replay_to_ts - timedelta(minutes=20)
+
         replay_url = (
             f"{base_url}/copilot/replay?"
-            f"from={urllib.parse.quote(from_ts.isoformat())}&"
-            f"to={urllib.parse.quote(to_ts.isoformat())}&"
-            f"driver_id={urllib.parse.quote(args.driver)}&limit=100"
+            f"from={urllib.parse.quote(replay_from_ts.isoformat())}&"
+            f"to={urllib.parse.quote(replay_to_ts.isoformat())}&"
+            f"limit=100"
         )
-        replay_payload = request_json(replay_url)
+        replay_payload = request_json(replay_url, timeout=90.0)
 
         hot_perf = request_json(f"{base_url}/health/performance?samples=200")
         score_perf = benchmark_score_offer(
@@ -262,7 +287,7 @@ def main() -> int:
             "finished_at": finished_at.isoformat(),
             "duration_s": round((finished_at - started_at).total_seconds(), 2),
             "base_url": base_url,
-            "driver_id": args.driver,
+            "driver_id": driver_id,
             "checks": checks,
             "passed": passed,
             "kpi": {
