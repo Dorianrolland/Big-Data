@@ -161,7 +161,7 @@ class SingleDriverScenario:
         # (the driver gracefully holds at last point and emits a stale
         # reason), but we DO want a loud log line at startup so ops can tell
         # the difference between "routing broken" and "nothing happening".
-        self._startup_health: dict[str, str] = {}
+        self._startup_health = {}
         try:
             self._startup_health = await self.routing.healthcheck()
         except Exception as exc:
@@ -175,9 +175,12 @@ class SingleDriverScenario:
             ",".join(self.routing.active_providers) or "(none)",
             self._startup_health or "(skipped)",
         )
-        if self._startup_health and all(
-            v.startswith("unhealthy") for v in self._startup_health.values()
-        ):
+        if not self.routing.active_providers:
+            log.warning(
+                "single-driver: no routing provider configured - "
+                "driver will be held at its last point",
+            )
+        if self._startup_all_unhealthy:
             log.warning(
                 "single-driver: every routing provider failed the startup probe — "
                 "driver will be held at its last point until a provider recovers",
@@ -195,6 +198,15 @@ class SingleDriverScenario:
 
     def _is_lunch(self, vt: datetime) -> bool:
         return LUNCH_BREAK_ENABLED and _in_time_window(vt, self.lunch_start, self.lunch_end)
+
+    def _is_routing_degraded(self) -> bool:
+        if not self.routing.active_providers:
+            return True
+        if self._startup_all_unhealthy:
+            return True
+        if self.routing.last_error:
+            return True
+        return False
 
     async def _emit_position(self, vt: datetime, status: str, speed_kmh: float) -> None:
         assert self.state is not None
@@ -265,6 +277,9 @@ class SingleDriverScenario:
             "lunch_breaks": str(self.stats_lunch),
             "routing_errors": str(self.stats_routing_errors),
             "routing_providers": ",".join(self.routing.active_providers),
+            "routing_health_json": json.dumps(self._startup_health, separators=(",", ":"), sort_keys=True),
+            "routing_degraded": "1" if self._is_routing_degraded() else "0",
+            "routing_last_error": self.routing.last_error or "",
             "state": (self.state.status if self.state else "unknown"),
             "stale_reason": (self.state.stale_reason if self.state and self.state.stale_reason else ""),
         }

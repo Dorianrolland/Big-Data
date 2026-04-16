@@ -702,7 +702,18 @@ async def livreur_focus_status():
             return 0
 
     providers = [p for p in (raw.get("routing_providers") or "").split(",") if p]
-    is_healthy = (age_seconds is not None and age_seconds < 60.0) and bool(providers)
+    routing_health_raw = raw.get("routing_health_json") or "{}"
+    try:
+        routing_health = json.loads(routing_health_raw)
+        if not isinstance(routing_health, dict):
+            routing_health = {}
+    except Exception:
+        routing_health = {}
+
+    routing_degraded_raw = str(raw.get("routing_degraded", "0") or "0").strip().lower()
+    routing_degraded = routing_degraded_raw in {"1", "true", "yes", "on"}
+    routing_last_error = raw.get("routing_last_error") or ""
+    is_healthy = (age_seconds is not None and age_seconds < 60.0) and bool(providers) and (not routing_degraded)
 
     return {
         "driver_id": raw.get("driver_id") or "",
@@ -713,6 +724,9 @@ async def livreur_focus_status():
         "is_healthy": is_healthy,
         "stale_reason": raw.get("stale_reason") or "",
         "routing_providers": providers,
+        "routing_health": routing_health,
+        "routing_degraded": routing_degraded,
+        "routing_last_error": routing_last_error,
         "positions": _to_int("positions"),
         "trips": _to_int("trips"),
         "repositions": _to_int("repositions"),

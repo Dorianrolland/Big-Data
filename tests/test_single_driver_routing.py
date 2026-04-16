@@ -108,6 +108,21 @@ def test_routing_chain_public_then_osrm():
     _arun(_run())
 
 
+def test_routing_chain_osrm_then_public_osrm():
+    async def _run():
+        client = RoutingClient(RoutingConfig(providers=("osrm", "osrm_public")))
+        client._providers = [_FakeProvider("osrm", "fail"), _FakeProvider("osrm_public", "ok")]
+        await client.start()
+        try:
+            route = await client.route_segment((40.7, -74.0), (40.72, -73.98))
+            assert route.source == "osrm_public"
+            assert len(route.geometry) >= 2
+        finally:
+            await client.close()
+
+    _arun(_run())
+
+
 def test_routing_chain_all_fail_raises():
     async def _run():
         client = RoutingClient(RoutingConfig(providers=("osrm",)))
