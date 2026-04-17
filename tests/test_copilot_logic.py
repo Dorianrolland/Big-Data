@@ -2,10 +2,16 @@ from api.copilot_logic import (
     FEATURE_COLUMNS,
     build_feature_map,
     cost_breakdown,
+    explanation_details,
     heuristic_score,
+    hybrid_accept_decision,
+    hybrid_accept_threshold,
     model_score,
+    normalize_score_weights,
     recommendation_score,
+    score_components,
     validate_model_payload,
+    weighted_offer_score,
 )
 
 
@@ -14,12 +20,34 @@ class _DummyModel:
         return [[0.3, 0.7] for _ in rows]
 
 
+class _NanModel:
+    def predict_proba(self, rows):
+        return [[0.5, float("nan")] for _ in rows]
+
+
 def test_build_feature_map_defaults():
     features = build_feature_map({"estimated_fare_eur": "12.5"})
     assert features["estimated_fare_eur"] == 12.5
     assert features["estimated_duration_min"] >= 1.0
     assert features["supply_index"] >= 0.2
     assert features["pressure_ratio"] > 0
+
+
+def test_build_feature_map_sanitizes_non_finite_inputs():
+    features = build_feature_map(
+        {
+            "estimated_fare_eur": "nan",
+            "estimated_distance_km": "inf",
+            "estimated_duration_min": "-inf",
+            "demand_index": "nan",
+            "supply_index": 0.0,
+        }
+    )
+    assert features["estimated_fare_eur"] == 0.0
+    assert features["estimated_distance_km"] == 0.0
+    assert features["estimated_duration_min"] == 1.0
+    assert features["demand_index"] == 1.0
+    assert features["supply_index"] == 0.2
 
 
 def test_heuristic_score_range():
@@ -123,9 +151,196 @@ def test_recommendation_score_flags_far_pickup():
     assert "pickup_far" in signals
 
 
+def test_normalize_score_weights_rescales_and_guards():
+    norm = normalize_score_weights(
+        {
+            "net_hourly": 4.0,
+            "net_trip": 0.0,
+            "fuel_efficiency": -1.0,
+            "time_efficiency": 1.0,
+            "context": 1.0,
+        }
+    )
+    assert round(sum(norm.values()), 6) == 1.0
+    assert norm["fuel_efficiency"] == 0.0
+    assert norm["net_hourly"] > norm["time_efficiency"]
+
+
+def test_normalize_score_weights_falls_back_to_defaults_on_zero_total():
+    norm = normalize_score_weights(
+        {
+            "net_hourly": 0.0,
+            "net_trip": -5.0,
+            "fuel_efficiency": 0.0,
+            "time_efficiency": -1.0,
+            "context": 0.0,
+        }
+    )
+    assert round(sum(norm.values()), 6) == 1.0
+    assert round(norm["net_hourly"], 2) == 0.46
+    assert round(norm["net_trip"], 2) == 0.18
+    assert round(norm["context"], 2) == 0.08
+
+
+def test_score_components_are_clamped():
+    features = build_feature_map(
+        {
+            "estimated_fare_eur": 4.0,
+            "estimated_distance_km": 8.0,
+            "distance_to_pickup_km": 4.0,
+            "estimated_duration_min": 42.0,
+            "eta_to_pickup_min": 10.0,
+            "demand_index": 0.6,
+            "supply_index": 1.8,
+            "traffic_factor": 1.35,
+            "target_hourly_net_eur": 24.0,
+        }
+    )
+    comps = score_components(features)
+    assert set(comps) == {"net_hourly", "net_trip", "fuel_efficiency", "time_efficiency", "context"}
+    assert all(0.0 <= v <= 1.0 for v in comps.values())
+
+
+def test_weighted_offer_score_short_vs_long_edge_case():
+    short_features = build_feature_map(
+        {
+            "estimated_fare_eur": 10.0,
+            "estimated_distance_km": 1.2,
+            "estimated_duration_min": 9.0,
+            "target_hourly_net_eur": 18.0,
+        }
+    )
+    long_features = build_feature_map(
+        {
+            "estimated_fare_eur": 18.0,
+            "estimated_distance_km": 8.0,
+            "estimated_duration_min": 40.0,
+            "target_hourly_net_eur": 18.0,
+        }
+    )
+    short_score, _, _ = weighted_offer_score(short_features)
+    long_score, _, _ = weighted_offer_score(long_features)
+    assert short_features["estimated_net_eur_h"] > long_features["estimated_net_eur_h"]
+    assert short_score > long_score
+
+
+def test_hybrid_accept_threshold_penalizes_below_target_and_fuel():
+    risky = build_feature_map(
+        {
+            "estimated_fare_eur": 7.0,
+            "estimated_distance_km": 7.0,
+            "estimated_duration_min": 30.0,
+            "fuel_price_eur_l": 2.1,
+            "vehicle_consumption_l_100km": 11.0,
+            "target_hourly_net_eur": 24.0,
+        }
+    )
+    clean = build_feature_map(
+        {
+            "estimated_fare_eur": 15.0,
+            "estimated_distance_km": 2.0,
+            "estimated_duration_min": 14.0,
+            "target_hourly_net_eur": 18.0,
+        }
+    )
+    assert hybrid_accept_threshold(risky) > hybrid_accept_threshold(clean)
+
+
+def test_hybrid_accept_threshold_is_clamped_to_bounds():
+    high_threshold_features = build_feature_map(
+        {
+            "estimated_fare_eur": 4.0,
+            "estimated_distance_km": 8.0,
+            "estimated_duration_min": 35.0,
+            "fuel_price_eur_l": 2.4,
+            "vehicle_consumption_l_100km": 15.0,
+            "target_hourly_net_eur": 35.0,
+        }
+    )
+    low_threshold_features = build_feature_map(
+        {
+            "estimated_fare_eur": 40.0,
+            "estimated_distance_km": 1.0,
+            "estimated_duration_min": 8.0,
+            "target_hourly_net_eur": 1.0,
+        }
+    )
+
+    high = hybrid_accept_threshold(
+        high_threshold_features,
+        base_threshold=0.8,
+        below_target_penalty_max=0.5,
+        high_fuel_penalty=0.5,
+        above_target_bonus=0.0,
+    )
+    low = hybrid_accept_threshold(
+        low_threshold_features,
+        base_threshold=0.4,
+        below_target_penalty_max=0.0,
+        high_fuel_penalty=0.0,
+        above_target_bonus=0.5,
+    )
+    assert high == 0.9
+    assert low == 0.35
+
+
+def test_hybrid_accept_decision_exact_threshold_edge():
+    features = build_feature_map(
+        {
+            "estimated_fare_eur": 13.5,
+            "estimated_distance_km": 3.0,
+            "estimated_duration_min": 17.0,
+            "target_hourly_net_eur": 18.0,
+        }
+    )
+    threshold = hybrid_accept_threshold(features)
+    decision, used_threshold = hybrid_accept_decision(features=features, accept_score=threshold)
+    assert decision == "accept"
+    assert used_threshold == threshold
+
+
+def test_explanation_details_shape_and_values():
+    features = build_feature_map(
+        {
+            "estimated_fare_eur": 16.0,
+            "estimated_distance_km": 3.3,
+            "estimated_duration_min": 16.0,
+            "traffic_factor": 1.1,
+            "target_hourly_net_eur": 18.0,
+        }
+    )
+    details = explanation_details(
+        features=features,
+        accept_score=0.62,
+        decision_threshold=0.54,
+        route_source="estimated",
+        route_duration_min=18.5,
+    )
+    assert len(details) >= 8
+    assert any(d["code"] == "net_hourly" for d in details)
+    assert any(d["source"] == "routing" for d in details)
+
+
+def test_explanation_details_omits_threshold_when_not_provided():
+    features = build_feature_map({"estimated_fare_eur": 11.0, "estimated_distance_km": 2.0})
+    details = explanation_details(features=features, accept_score=0.5)
+    assert not any(d["code"] == "decision_threshold" for d in details)
+
+
 def test_model_score_fallback_without_model():
     features = build_feature_map({})
     prob, source = model_score(None, features)
+    assert prob is None
+    assert source == "heuristic"
+
+
+def test_model_score_nan_probability_falls_back_to_heuristic():
+    features = build_feature_map({"estimated_fare_eur": 12.0})
+    payload = {
+        "model": _NanModel(),
+        "feature_columns": FEATURE_COLUMNS,
+    }
+    prob, source = model_score(payload, features)
     assert prob is None
     assert source == "heuristic"
 
