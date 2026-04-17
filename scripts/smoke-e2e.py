@@ -70,13 +70,19 @@ def request_json(url: str, method: str = "GET", payload: dict[str, Any] | None =
         return json.loads(body) if body else {}
 
 
-def wait_for_json(url: str, predicate, timeout_s: int, step_s: float = 2.0) -> dict:
+def wait_for_json(
+    url: str,
+    predicate,
+    timeout_s: int,
+    step_s: float = 2.0,
+    request_timeout_s: float = 10.0,
+) -> dict:
     deadline = time.time() + timeout_s
     last_error: str | None = None
 
     while time.time() < deadline:
         try:
-            payload = request_json(url)
+            payload = request_json(url, timeout=request_timeout_s)
             if predicate(payload):
                 return payload
         except Exception as exc:  # noqa: BLE001
@@ -104,6 +110,84 @@ def dlq_stats(path: Path) -> dict[str, Any]:
     }
 
 
+def parse_offer_ts(offer_ts_str: str | None) -> datetime | None:
+    if not offer_ts_str:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(offer_ts_str))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def compute_replay_window(offer_ts_str: str | None) -> tuple[datetime, datetime]:
+    offer_ts = parse_offer_ts(offer_ts_str)
+    if offer_ts is not None:
+        return offer_ts - timedelta(minutes=5), offer_ts + timedelta(minutes=5)
+    replay_to_ts = datetime.now(timezone.utc)
+    replay_from_ts = replay_to_ts - timedelta(minutes=10)
+    return replay_from_ts, replay_to_ts
+
+
+def build_replay_url(
+    *,
+    base_url: str,
+    replay_from_ts: datetime,
+    replay_to_ts: datetime,
+    driver_id: str,
+    limit: int = 50,
+) -> str:
+    params = {
+        "from": replay_from_ts.isoformat(),
+        "to": replay_to_ts.isoformat(),
+        "driver_id": str(driver_id),
+        "limit": str(int(limit)),
+    }
+    return f"{base_url.rstrip('/')}/copilot/replay?{urllib.parse.urlencode(params)}"
+
+
+def summarize_offer_quality(offers_payload: dict[str, Any]) -> dict[str, Any]:
+    def safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    offers = [item for item in (offers_payload.get("offers") or []) if isinstance(item, dict)]
+    if not offers:
+        return {
+            "offers_accept_count": 0,
+            "offers_reject_count": 0,
+            "offers_unknown_decision_count": 0,
+            "offers_accept_rate_pct": 0.0,
+            "offers_avg_accept_score": 0.0,
+            "offers_avg_eur_per_hour": 0.0,
+            "top_offer_accept_score": None,
+            "top_offer_eur_per_hour": None,
+        }
+
+    accept_count = sum(1 for item in offers if str(item.get("decision", "")).lower() == "accept")
+    reject_count = sum(1 for item in offers if str(item.get("decision", "")).lower() == "reject")
+    unknown_count = len(offers) - accept_count - reject_count
+    accept_scores = [safe_float(item.get("accept_score"), 0.0) for item in offers]
+    eur_per_hour = [safe_float(item.get("eur_per_hour_net"), 0.0) for item in offers]
+    top_offer = max(offers, key=lambda item: safe_float(item.get("accept_score"), float("-inf")))
+    count = len(offers)
+
+    return {
+        "offers_accept_count": int(accept_count),
+        "offers_reject_count": int(reject_count),
+        "offers_unknown_decision_count": int(unknown_count),
+        "offers_accept_rate_pct": round((accept_count / count) * 100.0, 2),
+        "offers_avg_accept_score": round(sum(accept_scores) / count, 4),
+        "offers_avg_eur_per_hour": round(sum(eur_per_hour) / count, 3),
+        "top_offer_accept_score": round(safe_float(top_offer.get("accept_score"), 0.0), 4),
+        "top_offer_eur_per_hour": round(safe_float(top_offer.get("eur_per_hour_net"), 0.0), 3),
+    }
+
+
 def benchmark_score_offer(base_url: str, requests_n: int, concurrency: int, timeout: float) -> dict[str, Any]:
     endpoint = f"{base_url.rstrip('/')}/copilot/score-offer"
     payload_bytes = json.dumps(
@@ -120,6 +204,7 @@ def benchmark_score_offer(base_url: str, requests_n: int, concurrency: int, time
 
     latencies_ms: list[float] = []
     errors = 0
+    submitted = max(1, int(requests_n))
 
     def one_call() -> float:
         req = urllib.request.Request(
@@ -134,7 +219,7 @@ def benchmark_score_offer(base_url: str, requests_n: int, concurrency: int, time
         return (time.perf_counter() - t0) * 1000
 
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
-        futures = [pool.submit(one_call) for _ in range(max(1, requests_n))]
+        futures = [pool.submit(one_call) for _ in range(submitted)]
         for fut in as_completed(futures):
             try:
                 latencies_ms.append(fut.result())
@@ -142,9 +227,10 @@ def benchmark_score_offer(base_url: str, requests_n: int, concurrency: int, time
                 errors += 1
 
     return {
-        "requests": requests_n,
+        "requests": submitted,
         "success": len(latencies_ms),
         "errors": errors,
+        "success_rate_pct": round((len(latencies_ms) / submitted) * 100.0, 2),
         "p50_ms": percentile(latencies_ms, 50),
         "p95_ms": percentile(latencies_ms, 95),
         "p99_ms": percentile(latencies_ms, 99),
@@ -242,32 +328,26 @@ def main() -> int:
         # Anchor replay window on virtual replay clock (offer ts), not real wall clock.
         sample_offer = offers_payload.get("offers", [{}])[0]
         offer_ts_str = sample_offer.get("ts")
-        if offer_ts_str:
-            offer_ts = datetime.fromisoformat(offer_ts_str)
-            if offer_ts.tzinfo is None:
-                offer_ts = offer_ts.replace(tzinfo=timezone.utc)
-            replay_to_ts = offer_ts + timedelta(minutes=10)
-            replay_from_ts = offer_ts - timedelta(minutes=10)
-        else:
-            replay_to_ts = datetime.now(timezone.utc)
-            replay_from_ts = replay_to_ts - timedelta(minutes=20)
-
-        replay_url = (
-            f"{base_url}/copilot/replay?"
-            f"from={urllib.parse.quote(replay_from_ts.isoformat())}&"
-            f"to={urllib.parse.quote(replay_to_ts.isoformat())}&"
-            f"limit=100"
+        replay_from_ts, replay_to_ts = compute_replay_window(offer_ts_str)
+        replay_url = build_replay_url(
+            base_url=base_url,
+            replay_from_ts=replay_from_ts,
+            replay_to_ts=replay_to_ts,
+            driver_id=str(driver_id),
+            limit=50,
         )
         replay_payload = wait_for_json(
             replay_url,
             lambda x: isinstance(x, dict),
             timeout_s=max(30, args.timeout),
+            request_timeout_s=30.0,
         )
 
         hot_perf = wait_for_json(
             f"{base_url}/health/performance?samples=200",
             lambda x: isinstance(x, dict),
             timeout_s=args.timeout,
+            request_timeout_s=30.0,
         )
         score_perf = benchmark_score_offer(
             base_url=base_url,
@@ -279,6 +359,7 @@ def main() -> int:
             f"{base_url}/stats",
             lambda x: isinstance(x, dict),
             timeout_s=args.timeout,
+            request_timeout_s=30.0,
         )
         dlq = dlq_stats(DLQ_DIR)
 
@@ -315,6 +396,7 @@ def main() -> int:
                 "model_loaded": bool(copilot_health.get("model_loaded", False)),
                 "model_quality_gate": copilot_health.get("model_quality_gate", {}),
                 "dlq": dlq,
+                **summarize_offer_quality(offers_payload),
             },
             "snapshots": {
                 "api_health": api_health,
