@@ -167,7 +167,7 @@
       font-size: 0.93rem;
     }
 
-    input,
+    input:not([type="checkbox"]),
     select {
       width: 100%;
       border-radius: 10px;
@@ -175,17 +175,27 @@
       background: rgba(255, 255, 255, 0.92);
       color: var(--ink);
       padding: 8px 10px;
+      min-height: 42px;
     }
 
     button {
       border: none;
       border-radius: 11px;
-      padding: 10px 12px;
+      padding: 11px 12px;
+      min-height: 42px;
       font-weight: 700;
       cursor: pointer;
       background: linear-gradient(135deg, #17bebb 0%, #0b7285 100%);
       color: #f8fafc;
       box-shadow: 0 8px 18px rgba(11, 114, 133, 0.24);
+      touch-action: manipulation;
+    }
+
+    button:focus-visible,
+    input:focus-visible,
+    select:focus-visible {
+      outline: 2px solid rgba(15, 118, 110, 0.45);
+      outline-offset: 2px;
     }
 
     button.alt {
@@ -260,6 +270,72 @@
       font-size: 0.8rem;
     }
 
+    .state-message {
+      border-radius: 10px;
+      padding: 9px 10px;
+      font-size: 0.8rem;
+      border: 1px solid var(--line);
+      background: rgba(15, 23, 42, 0.04);
+      color: var(--ink-soft);
+    }
+
+    .state-message.loading {
+      border-color: rgba(11, 114, 133, 0.22);
+      background: rgba(14, 165, 164, 0.08);
+      color: #0f3b4f;
+    }
+
+    .state-message.error {
+      border-color: rgba(180, 35, 24, 0.3);
+      background: rgba(180, 35, 24, 0.08);
+      color: #7f1d1d;
+    }
+
+    .state-message.empty {
+      border-color: rgba(180, 83, 9, 0.24);
+      background: rgba(245, 158, 11, 0.12);
+      color: #78350f;
+    }
+
+    .state-message.success {
+      border-color: rgba(21, 128, 61, 0.28);
+      background: rgba(21, 128, 61, 0.1);
+      color: #14532d;
+    }
+
+    .flow-steps {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .flow-step {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+      padding: 8px;
+      display: grid;
+      gap: 3px;
+    }
+
+    .flow-step .k {
+      font-size: 0.68rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--ink-soft);
+    }
+
+    .flow-step .v {
+      font-size: 0.9rem;
+      font-weight: 800;
+      color: var(--ink);
+    }
+
+    .flow-step.active {
+      border-color: rgba(14, 116, 144, 0.45);
+      box-shadow: 0 0 0 2px rgba(14, 116, 144, 0.12) inset;
+    }
+
     .list {
       display: grid;
       gap: 8px;
@@ -275,6 +351,30 @@
       padding: 10px;
       display: grid;
       gap: 7px;
+      transition: border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease;
+    }
+
+    .offer.selectable {
+      cursor: pointer;
+    }
+
+    .offer.selectable:active {
+      transform: scale(0.995);
+    }
+
+    .offer.selectable:focus-visible {
+      outline: 2px solid rgba(15, 118, 110, 0.45);
+      outline-offset: 2px;
+    }
+
+    .offer.selected {
+      border-color: rgba(15, 118, 110, 0.5);
+      box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.12);
+    }
+
+    .offer:focus-within {
+      border-color: rgba(15, 118, 110, 0.5);
+      box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.12);
     }
 
     .offer-top,
@@ -322,10 +422,39 @@
     }
 
     .offer-actions button {
-      padding: 8px 10px;
-      font-size: 0.78rem;
+      padding: 8px 11px;
+      font-size: 0.8rem;
       box-shadow: none;
       border-radius: 9px;
+    }
+
+    .offer-metrics {
+      display: grid;
+      gap: 6px;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+
+    .offer-metric {
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      padding: 7px 8px;
+      background: rgba(15, 23, 42, 0.03);
+      display: grid;
+      gap: 2px;
+      min-height: 52px;
+    }
+
+    .offer-metric .k {
+      font-size: 0.66rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--ink-soft);
+    }
+
+    .offer-metric .v {
+      font-size: 0.88rem;
+      font-weight: 800;
+      color: var(--ink);
     }
 
     .zone {
@@ -529,7 +658,9 @@
     @media (max-width: 680px) {
       .grid.two,
       .grid.three,
-      .score-board {
+      .score-board,
+      .offer-metrics,
+      .flow-steps {
         grid-template-columns: 1fr;
       }
 
@@ -538,6 +669,10 @@
 
       .title {
         font-size: 1.08rem;
+      }
+
+      .offer-actions button {
+        flex: 1 1 100%;
       }
     }
   </style>
@@ -548,7 +683,7 @@
       <div class="header-top">
         <div class="brand">
           <div class="title">FleetStream Driver Copilot</div>
-          <div class="subtitle">Uber NYC - MVP local - decision revenu en temps reel</div>
+          <div class="subtitle">Uber NYC - MVP local - fast driver decision support</div>
         </div>
         <div class="chip-row">
           <span class="chip" id="healthMode">syncing</span>
@@ -556,6 +691,7 @@
           <label class="auto-refresh"><input id="autoRefresh" type="checkbox" checked /> auto refresh 12s</label>
         </div>
       </div>
+      <div class="state-message loading" id="uxStatusLine" role="status" aria-live="polite" aria-atomic="true">Flow: choose offer - score - action.</div>
       <div class="chip-row" id="healthMetrics"></div>
     </section>
 
@@ -588,12 +724,12 @@
             <label>Dispatch Zone Limit<input id="dispatchZoneTopK" type="number" step="1" value="5" /></label>
           </div>
           <div class="grid two">
-            <label title="0 = opportunité pure, 0.3 = modéré, 0.6 = agressif">Zone Distance Weight<input id="zoneDistanceWeight" type="number" step="0.05" min="0" max="1" value="0.3" /></label>
-            <label title="Filtre dur: zones au-delà ignorées">Zone Max Distance (km)<input id="zoneMaxDistanceKm" type="number" step="0.5" min="0.5" max="50" value="12" /></label>
+            <label title="0 = opportunity only, 0.3 = balanced, 0.6 = distance-sensitive">Zone Distance Weight<input id="zoneDistanceWeight" type="number" step="0.05" min="0" max="1" value="0.3" /></label>
+            <label title="Hard filter: farther zones are ignored">Zone Max Distance (km)<input id="zoneMaxDistanceKm" type="number" step="0.5" min="0.5" max="50" value="12" /></label>
           </div>
           <div class="grid two">
-            <label title="Bonus 'homeward' — laissé vide pour désactiver">Home Lat<input id="zoneHomeLat" type="number" step="0.000001" placeholder="40.7580" /></label>
-            <label title="Bonus 'homeward' — laissé vide pour désactiver">Home Lon<input id="zoneHomeLon" type="number" step="0.000001" placeholder="-73.9855" /></label>
+            <label title="Optional homeward bonus - leave empty to disable">Home Lat<input id="zoneHomeLat" type="number" step="0.000001" placeholder="40.7580" /></label>
+            <label title="Optional homeward bonus - leave empty to disable">Home Lon<input id="zoneHomeLon" type="number" step="0.000001" placeholder="-73.9855" /></label>
           </div>
           <div class="grid two">
             <label>Dispatch Strategy
@@ -688,6 +824,24 @@
         </section>
 
         <section class="card glass">
+          <h2>Decision Flow</h2>
+          <div class="flow-steps">
+            <div class="flow-step active" id="flowStepChoose"><div class="k">Step 1</div><div class="v">Choose</div></div>
+            <div class="flow-step" id="flowStepScore"><div class="k">Step 2</div><div class="v">Score</div></div>
+            <div class="flow-step" id="flowStepAction"><div class="k">Step 3</div><div class="v">Action</div></div>
+          </div>
+          <div class="state-message empty" id="decisionStatus" role="status" aria-live="polite" aria-atomic="true">Choose an offer to start the 3-step flow.</div>
+          <div class="offer" id="decisionOfferCard">
+            <div class="muted">No offer selected yet.</div>
+          </div>
+          <div class="offer-actions">
+            <button id="decisionQuickScoreBtn">Pick + Score Top Offer</button>
+            <button class="ghost" id="decisionScoreBtn">Score Selected</button>
+            <button class="alt" id="decisionActionBtn">Open Action Route</button>
+          </div>
+        </section>
+
+        <section class="card glass">
           <h2>Best Offers Around You</h2>
           <div class="list" id="bestOffers"></div>
         </section>
@@ -734,3 +888,4 @@
   <script src="/static/copilot/app.js"></script>
 </body>
 </html>
+

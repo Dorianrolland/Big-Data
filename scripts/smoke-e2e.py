@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import statistics
 import subprocess
 import sys
@@ -32,6 +33,7 @@ DATA_DIR = PROJECT_ROOT / "data"
 EVENTS_DIR = DATA_DIR / "parquet_events"
 DLQ_DIR = DATA_DIR / "dlq"
 REPORTS_DIR = DATA_DIR / "reports"
+DEFAULT_FALLBACK_DRIVER_IDS = ("drv_demo_001", "L001")
 
 
 def percentile(values: list[float], pct: int) -> float:
@@ -110,6 +112,73 @@ def dlq_stats(path: Path) -> dict[str, Any]:
     }
 
 
+def fallback_driver_ids() -> list[str]:
+    raw = str(os.getenv("COPILOT_SMOKE_DRIVER_FALLBACKS", "")).strip()
+    if raw:
+        candidates = [token.strip() for token in raw.split(",") if token.strip()]
+    else:
+        candidates = list(DEFAULT_FALLBACK_DRIVER_IDS)
+
+    deduped: list[str] = []
+    for item in candidates:
+        if item not in deduped:
+            deduped.append(item)
+    return deduped
+
+
+def driver_has_offers(base_url: str, driver_id: str, timeout_s: float = 10.0) -> bool:
+    url = f"{base_url.rstrip('/')}/copilot/driver/{urllib.parse.quote(str(driver_id))}/offers?limit=1"
+    payload = request_json(url, timeout=timeout_s)
+    if int(payload.get("count", 0)) > 0:
+        return True
+    offers = payload.get("offers")
+    return isinstance(offers, list) and len(offers) > 0
+
+
+def discover_driver_id(base_url: str, timeout_s: int) -> str:
+    nearby_payload: dict[str, Any] = {}
+    nearby_url = f"{base_url.rstrip('/')}/livreurs-proches?lat=40.7580&lon=-73.9855&rayon=10"
+    try:
+        nearby_payload = wait_for_json(
+            nearby_url,
+            lambda x: isinstance(x, dict),
+            timeout_s=max(8, min(int(timeout_s), 45)),
+            request_timeout_s=15.0,
+        )
+    except Exception:
+        nearby_payload = {}
+
+    nearby_ids: list[str] = []
+    for row in nearby_payload.get("livreurs", []) if isinstance(nearby_payload, dict) else []:
+        if not isinstance(row, dict):
+            continue
+        driver_id = str(row.get("livreur_id", "")).strip()
+        if driver_id and driver_id not in nearby_ids:
+            nearby_ids.append(driver_id)
+
+    for driver_id in nearby_ids:
+        try:
+            if driver_has_offers(base_url, driver_id, timeout_s=8.0):
+                return driver_id
+        except Exception:
+            continue
+
+    for fallback_id in fallback_driver_ids():
+        if fallback_id in nearby_ids:
+            continue
+        try:
+            if driver_has_offers(base_url, fallback_id, timeout_s=8.0):
+                return fallback_id
+        except Exception:
+            continue
+
+    if nearby_ids:
+        return nearby_ids[0]
+    raise RuntimeError(
+        "unable to auto-discover driver_id: no nearby drivers with offers and no fallback driver available"
+    )
+
+
 def parse_offer_ts(offer_ts_str: str | None) -> datetime | None:
     if not offer_ts_str:
         return None
@@ -146,6 +215,47 @@ def build_replay_url(
         "limit": str(int(limit)),
     }
     return f"{base_url.rstrip('/')}/copilot/replay?{urllib.parse.urlencode(params)}"
+
+
+def fetch_replay_payload(
+    *,
+    base_url: str,
+    driver_id: str,
+    offer_ts_str: str | None,
+    timeout_s: int,
+    limit: int = 50,
+) -> tuple[dict[str, Any], str, tuple[datetime, datetime], str]:
+    windows: list[tuple[str, tuple[datetime, datetime]]] = [
+        ("offer_ts_window", compute_replay_window(offer_ts_str)),
+        ("recent_window", compute_replay_window(None)),
+    ]
+    attempted_errors: list[str] = []
+    seen_urls: set[str] = set()
+
+    for strategy, (replay_from_ts, replay_to_ts) in windows:
+        replay_url = build_replay_url(
+            base_url=base_url,
+            replay_from_ts=replay_from_ts,
+            replay_to_ts=replay_to_ts,
+            driver_id=str(driver_id),
+            limit=limit,
+        )
+        if replay_url in seen_urls:
+            continue
+        seen_urls.add(replay_url)
+        try:
+            payload = wait_for_json(
+                replay_url,
+                lambda x: isinstance(x, dict),
+                timeout_s=max(30, timeout_s),
+                request_timeout_s=30.0,
+            )
+            return payload, replay_url, (replay_from_ts, replay_to_ts), strategy
+        except Exception as exc:  # noqa: BLE001
+            attempted_errors.append(f"{strategy}: {exc}")
+
+    details = " | ".join(attempted_errors) if attempted_errors else "no replay attempts"
+    raise RuntimeError(f"replay query failed after fallback windows: {details}")
 
 
 def summarize_offer_quality(offers_payload: dict[str, Any]) -> dict[str, Any]:
@@ -298,12 +408,7 @@ def main() -> int:
 
         driver_id = args.driver
         if driver_id is None:
-            nearby = wait_for_json(
-                f"{base_url}/livreurs-proches?lat=40.7580&lon=-73.9855&rayon=10",
-                lambda x: len(x.get("livreurs", [])) > 0,
-                timeout_s=args.timeout,
-            )
-            driver_id = nearby["livreurs"][0]["livreur_id"]
+            driver_id = discover_driver_id(base_url=base_url, timeout_s=args.timeout)
             print(f"auto-discovered driver_id={driver_id}")
 
         offers_payload = wait_for_json(
@@ -328,20 +433,14 @@ def main() -> int:
         # Anchor replay window on virtual replay clock (offer ts), not real wall clock.
         sample_offer = offers_payload.get("offers", [{}])[0]
         offer_ts_str = sample_offer.get("ts")
-        replay_from_ts, replay_to_ts = compute_replay_window(offer_ts_str)
-        replay_url = build_replay_url(
+        replay_payload, replay_url, replay_window, replay_strategy = fetch_replay_payload(
             base_url=base_url,
-            replay_from_ts=replay_from_ts,
-            replay_to_ts=replay_to_ts,
             driver_id=str(driver_id),
+            offer_ts_str=offer_ts_str,
+            timeout_s=args.timeout,
             limit=50,
         )
-        replay_payload = wait_for_json(
-            replay_url,
-            lambda x: isinstance(x, dict),
-            timeout_s=max(30, args.timeout),
-            request_timeout_s=30.0,
-        )
+        replay_from_ts, replay_to_ts = replay_window
 
         hot_perf = wait_for_json(
             f"{base_url}/health/performance?samples=200",
@@ -392,6 +491,10 @@ def main() -> int:
                 "score_offer": score_perf,
                 "offers_count": offers_payload.get("count", 0),
                 "replay_count": replay_payload.get("count", 0),
+                "replay_window_strategy": replay_strategy,
+                "replay_window_from": replay_from_ts.isoformat(),
+                "replay_window_to": replay_to_ts.isoformat(),
+                "replay_url": replay_url,
                 "events_parquet_files": event_parquet_files,
                 "model_loaded": bool(copilot_health.get("model_loaded", False)),
                 "model_quality_gate": copilot_health.get("model_quality_gate", {}),
