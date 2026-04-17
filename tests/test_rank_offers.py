@@ -1,16 +1,15 @@
 """Unit tests for the pure ranking helper behind POST /copilot/rank-offers.
 
-The helper is factored out of the FastAPI handler specifically so that we
-can test the sort order, floor filter, recommendation tags, and delta
-metrics without spinning up Redis / OSRM / the FastAPI app. Everything
-here is local, millisecond-fast, and deterministic.
+The helper is factored out of the FastAPI handler so we can validate sort
+order, threshold tags, top-pick quality gates, and delta metrics with no
+Redis/OSRM dependency.
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
-# copilot_router.py uses sibling-level imports (`from copilot_logic import …`)
+# copilot_router.py uses sibling-level imports (`from copilot_logic import ...`)
 # because it's run with api/ as CWD inside the container. For test runs we
 # put api/ on sys.path BEFORE importing it so those sibling imports resolve.
 _API_DIR = Path(__file__).resolve().parent.parent / "api"
@@ -27,6 +26,7 @@ def _mk(offer_id: str, eur_h: float, net_eur: float, accept: float = 0.5, *, tar
         "courier_id": "L1",
         "accept_score": accept,
         "decision": "accept" if accept >= 0.5 else "reject",
+        "decision_threshold": 0.5,
         "eur_per_hour_net": eur_h,
         "estimated_net_eur": net_eur,
         "target_hourly_net_eur": target_h,
@@ -36,6 +36,16 @@ def _mk(offer_id: str, eur_h: float, net_eur: float, accept: float = 0.5, *, tar
         "route_duration_min": 10.0,
         "model_used": "heuristic",
         "explanation": [],
+        "explanation_details": [
+            {
+                "code": "net_hourly",
+                "label": "Net hourly yield",
+                "impact": "neutral",
+                "value": float(eur_h),
+                "unit": "eur_per_hour",
+                "source": "cost",
+            }
+        ],
     }
 
 
@@ -57,36 +67,45 @@ def test_rank_by_eur_per_hour_puts_best_first():
 
 
 def test_rank_by_net_eur_overrides_eur_per_hour():
-    # Offer with lower €/h but higher absolute net is preferred under net_eur
     scored = [
-        _mk("short", 40.0, 3.0),   # 40 €/h but only 3 € in pocket
-        _mk("long",  22.0, 18.0),  # 22 €/h but 18 € on the table
+        _mk("short", 40.0, 3.0),
+        _mk("long", 22.0, 18.0),
     ]
     items, _, _, _ = _rank_offer_items(scored, "estimated_net_eur", None)
     assert items[0].offer_id == "long"
-    assert items[0].top_pick is True
+    # Ranked first by absolute net, but no top-pick badge because it fails the
+    # EUR/h edge quality gate against the second candidate.
+    assert items[0].top_pick is False
 
 
 def test_rank_respects_floor_and_tags_reject():
     scored = [
-        _mk("good",    25.0, 9.0),
-        _mk("meh",     14.0, 4.0),
+        _mk("good", 25.0, 9.0),
+        _mk("meh", 14.0, 4.0),
         _mk("garbage", 6.0, 1.0),
     ]
     items, _, _, _ = _rank_offer_items(scored, "eur_per_hour_net", reject_below_eur_h=12.0)
     assert items[0].offer_id == "good"
     assert items[0].recommendation == "top_pick"
-    assert items[1].recommendation == "viable"          # 14 €/h >= 12
-    assert items[2].recommendation == "reject"          # 6 €/h < 12
-    # Floor must also be able to reject the nominal top pick
+    assert items[1].recommendation == "viable"
+    assert items[2].recommendation == "reject"
+
     items2, _, _, _ = _rank_offer_items(scored, "eur_per_hour_net", reject_below_eur_h=30.0)
-    # Everything below the floor: even rank=1 is flagged reject and not top_pick
     assert all(it.recommendation == "reject" for it in items2)
     assert items2[0].top_pick is False
 
 
+def test_rank_uses_default_reject_floor_when_not_provided():
+    scored = [
+        _mk("ok", 12.0, 5.0),
+        _mk("low", 8.5, 2.0),
+    ]
+    items, _, _, _ = _rank_offer_items(scored, "eur_per_hour_net", None)
+    assert items[0].recommendation in {"top_pick", "viable"}
+    assert items[1].recommendation == "reject"
+
+
 def test_below_target_tag_when_hourly_misses_personal_goal():
-    # Driver wants 25 €/h minimum; the second offer falls below that.
     scored = [
         _mk("A", 28.0, 10.0, target_h=25.0),
         _mk("B", 20.0, 12.0, target_h=25.0),
@@ -96,6 +115,52 @@ def test_below_target_tag_when_hourly_misses_personal_goal():
     assert items[1].recommendation == "below_target"
 
 
+def test_below_target_slack_edge_stays_viable():
+    scored = [
+        _mk("A", 24.0, 8.5, target_h=20.0),
+        _mk("B", 19.25, 7.0, target_h=20.0),
+    ]
+    items, _, _, _ = _rank_offer_items(
+        scored,
+        "eur_per_hour_net",
+        None,
+        below_target_slack_eur_h=0.75,
+    )
+    assert items[1].recommendation == "viable"
+
+
+def test_top_pick_requires_min_quality_and_edge():
+    scored = [
+        _mk("A", 20.0, 7.0),
+        _mk("B", 19.5, 8.0),
+    ]
+    items, _, _, _ = _rank_offer_items(
+        scored,
+        "eur_per_hour_net",
+        None,
+        top_pick_min_eur_h=14.0,
+        top_pick_min_edge_eur_h=1.0,
+    )
+    assert items[0].recommendation == "viable"
+    assert items[0].top_pick is False
+
+
+def test_top_pick_rejected_if_hourly_below_min_quality():
+    scored = [
+        _mk("A", 13.0, 7.0),
+        _mk("B", 11.0, 7.5),
+    ]
+    items, _, _, _ = _rank_offer_items(
+        scored,
+        "eur_per_hour_net",
+        None,
+        top_pick_min_eur_h=14.0,
+        top_pick_min_edge_eur_h=0.5,
+    )
+    assert items[0].recommendation == "viable"
+    assert items[0].top_pick is False
+
+
 def test_delta_vs_top_and_median_are_correct():
     scored = [
         _mk("A", 10.0, 3.0),
@@ -103,7 +168,6 @@ def test_delta_vs_top_and_median_are_correct():
         _mk("C", 30.0, 9.0),
     ]
     items, _, _, median = _rank_offer_items(scored, "eur_per_hour_net", None)
-    # Ranked order: C(30), B(20), A(10) → median = 20
     assert median == 20.0
     assert items[0].delta_vs_top_eur_h == 0.0
     assert items[0].delta_vs_median_eur_h == 10.0
@@ -114,16 +178,51 @@ def test_delta_vs_top_and_median_are_correct():
 
 
 def test_tie_break_prefers_higher_absolute_net():
-    # Two offers equal on €/h → tie-break on estimated_net_eur
     scored = [
         _mk("small", 25.0, 4.0),
-        _mk("big",   25.0, 12.0),
+        _mk("big", 25.0, 12.0),
     ]
     items, _, _, _ = _rank_offer_items(scored, "eur_per_hour_net", None)
     assert items[0].offer_id == "big"
 
 
-def test_single_offer_still_gets_top_pick():
+def test_tie_break_prefers_higher_accept_score_when_hourly_and_net_tie():
+    scored = [
+        _mk("low_accept", 25.0, 10.0, accept=0.45),
+        _mk("high_accept", 25.0, 10.0, accept=0.82),
+    ]
+    items, _, _, _ = _rank_offer_items(scored, "eur_per_hour_net", None)
+    assert items[0].offer_id == "high_accept"
+
+
+def test_tie_break_is_deterministic_on_full_tie():
+    scored = [
+        _mk("B_offer", 25.0, 10.0, accept=0.8),
+        _mk("A_offer", 25.0, 10.0, accept=0.8),
+    ]
+    items, _, _, _ = _rank_offer_items(scored, "eur_per_hour_net", None)
+    assert [it.offer_id for it in items] == ["A_offer", "B_offer"]
+
+
+def test_rank_by_invalid_value_falls_back_to_hourly():
+    scored = [
+        _mk("low", 12.0, 8.0, accept=0.9),
+        _mk("high", 28.0, 4.0, accept=0.1),
+    ]
+    items, _, _, _ = _rank_offer_items(scored, "unexpected_metric", None)
+    assert items[0].offer_id == "high"
+
+
+def test_non_finite_reject_floor_falls_back_to_default():
+    scored = [
+        _mk("ok", 12.0, 5.0),
+        _mk("low", 8.5, 2.0),
+    ]
+    items, _, _, _ = _rank_offer_items(scored, "eur_per_hour_net", reject_below_eur_h=float("nan"))
+    assert items[1].recommendation == "reject"
+
+
+def test_single_offer_keeps_top_pick_when_above_min_quality():
     scored = [_mk("only", 18.0, 6.0)]
     items, best, worst, median = _rank_offer_items(scored, "eur_per_hour_net", None)
     assert len(items) == 1
@@ -131,3 +230,17 @@ def test_single_offer_still_gets_top_pick():
     assert items[0].rank == 1
     assert best == worst == median == 18.0
     assert items[0].delta_vs_top_eur_h == 0.0
+
+
+def test_explanation_details_are_propagated():
+    scored = [_mk("only", 22.0, 8.0)]
+    items, _, _, _ = _rank_offer_items(scored, "eur_per_hour_net", None)
+    assert items[0].explanation_details
+    assert items[0].explanation_details[0].code == "net_hourly"
+
+
+def test_decision_threshold_is_propagated():
+    scored = [_mk("only", 22.0, 8.0)]
+    scored[0]["decision_threshold"] = 0.57
+    items, _, _, _ = _rank_offer_items(scored, "eur_per_hour_net", None)
+    assert items[0].decision_threshold == 0.57

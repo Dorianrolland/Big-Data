@@ -24,9 +24,12 @@ from copilot_logic import (
     cost_breakdown,
     dispatch_decision,
     dispatch_strategy_profile,
+    explanation_details,
     forecast_zone_metrics,
     heuristic_score,
+    hybrid_accept_decision,
     model_score,
+    normalize_score_weights,
     reposition_cost_model,
     recommendation_score,
     validate_model_payload,
@@ -35,6 +38,17 @@ from copilot_logic import (
 logger = logging.getLogger("copilot-router")
 
 load_dotenv()
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        out = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(out):
+        return float(default)
+    return float(out)
+
 
 EVENTS_PATH = Path(os.getenv("EVENTS_PATH", "/data/parquet_events"))
 MODEL_PATH = Path(os.getenv("MODEL_PATH", "/data/models/copilot_model.joblib"))
@@ -75,6 +89,23 @@ FUEL_REFRESH_INTERVAL_S = int(os.getenv("COPILOT_FUEL_REFRESH_SECONDS", "1800"))
 FUEL_USD_TO_EUR_RATE = float(os.getenv("COPILOT_USD_TO_EUR_RATE", "0.92"))
 FUEL_GRADE = os.getenv("COPILOT_FUEL_GRADE", "regular").strip().lower()
 GALLON_TO_LITER = 3.785411784
+SCORE_WEIGHTS = normalize_score_weights(
+    {
+        "net_hourly": _env_float("COPILOT_SCORE_W_NET_HOURLY", 0.46),
+        "net_trip": _env_float("COPILOT_SCORE_W_NET_TRIP", 0.18),
+        "fuel_efficiency": _env_float("COPILOT_SCORE_W_FUEL", 0.16),
+        "time_efficiency": _env_float("COPILOT_SCORE_W_TIME", 0.12),
+        "context": _env_float("COPILOT_SCORE_W_CONTEXT", 0.08),
+    }
+)
+ACCEPT_BASE_THRESHOLD = _env_float("COPILOT_ACCEPT_BASE_THRESHOLD", 0.50)
+ACCEPT_BELOW_TARGET_PENALTY_MAX = max(0.0, _env_float("COPILOT_ACCEPT_BELOW_TARGET_PENALTY_MAX", 0.12))
+ACCEPT_HIGH_FUEL_PENALTY = max(0.0, _env_float("COPILOT_ACCEPT_HIGH_FUEL_PENALTY", 0.06))
+ACCEPT_ABOVE_TARGET_BONUS = max(0.0, _env_float("COPILOT_ACCEPT_ABOVE_TARGET_BONUS", 0.04))
+RANK_REJECT_EUR_H_DEFAULT = max(0.0, _env_float("COPILOT_RANK_REJECT_EUR_H_DEFAULT", 9.0))
+RANK_TOP_PICK_MIN_EUR_H = max(0.0, _env_float("COPILOT_RANK_TOP_PICK_MIN_EUR_H", 14.0))
+RANK_TOP_PICK_MIN_EDGE_EUR_H = max(0.0, _env_float("COPILOT_RANK_TOP_PICK_MIN_EDGE_EUR_H", 1.0))
+RANK_BELOW_TARGET_SLACK_EUR_H = max(0.0, _env_float("COPILOT_RANK_BELOW_TARGET_SLACK_EUR_H", 0.75))
 
 GBFS_STATION_INFO_URL = "https://gbfs.citibikenyc.com/gbfs/en/station_information.json"
 GBFS_STATION_STATUS_URL = "https://gbfs.citibikenyc.com/gbfs/en/station_status.json"
@@ -121,6 +152,17 @@ class ScoreOfferRequest(BaseModel):
     use_osrm: bool = False
 
 
+class ExplanationDetail(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
+    code: str
+    label: str
+    impact: Literal["positive", "negative", "neutral"]
+    value: float
+    unit: str
+    source: Literal["cost", "time", "fuel", "target", "context", "routing"]
+
+
 class ScoreOfferResponse(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
@@ -128,6 +170,7 @@ class ScoreOfferResponse(BaseModel):
     courier_id: str | None = None
     accept_score: float
     decision: str
+    decision_threshold: float | None = None
     eur_per_hour_net: float
     estimated_net_eur: float | None = None
     target_hourly_net_eur: float | None = None
@@ -139,6 +182,7 @@ class ScoreOfferResponse(BaseModel):
     route_notes: list[str] | None = None
     model_used: str
     explanation: list[str]
+    explanation_details: list[ExplanationDetail] | None = None
 
 
 class RankOffersRequest(BaseModel):
@@ -169,6 +213,7 @@ class RankedOfferItem(BaseModel):
     courier_id: str | None = None
     accept_score: float
     decision: str
+    decision_threshold: float | None = None
     eur_per_hour_net: float
     estimated_net_eur: float
     delta_vs_top_eur_h: float
@@ -179,6 +224,7 @@ class RankedOfferItem(BaseModel):
     route_duration_min: float | None = None
     model_used: str
     explanation: list[str]
+    explanation_details: list[ExplanationDetail] | None = None
 
 
 class RankOffersResponse(BaseModel):
@@ -252,9 +298,16 @@ async def _duck_query(request: Request, sql: str, params: list[Any] | None = Non
 
 def _as_float(value: Any, default: float) -> float:
     try:
-        return float(value)
+        out = float(value)
     except (TypeError, ValueError):
         return default
+    if not math.isfinite(out):
+        return default
+    return out
+
+
+def _non_negative_float(value: Any, default: float) -> float:
+    return max(0.0, _as_float(value, default))
 
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -283,6 +336,88 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     if txt in {"0", "false", "no", "n", "off"}:
         return False
     return default
+
+
+def _compute_heuristic_score(features: dict[str, float]) -> tuple[float, float, list[str]]:
+    return heuristic_score(features, weights=SCORE_WEIGHTS)
+
+
+def _decision_for_offer(features: dict[str, float], accept_prob: float) -> tuple[str, float]:
+    return hybrid_accept_decision(
+        features=features,
+        accept_score=float(accept_prob),
+        base_threshold=ACCEPT_BASE_THRESHOLD,
+        below_target_penalty_max=ACCEPT_BELOW_TARGET_PENALTY_MAX,
+        high_fuel_penalty=ACCEPT_HIGH_FUEL_PENALTY,
+        above_target_bonus=ACCEPT_ABOVE_TARGET_BONUS,
+    )
+
+
+def _build_explanation_details(
+    *,
+    features: dict[str, float],
+    accept_prob: float,
+    decision_threshold: float,
+    route_meta: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    route_source = None
+    route_duration_min = None
+    if route_meta:
+        route_source = str(route_meta.get("route_source", "estimated"))
+        route_duration_min = _as_float(
+            route_meta.get("route_duration_min"),
+            float(features.get("total_duration_min", 0.0)),
+        )
+    return explanation_details(
+        features=features,
+        accept_score=float(accept_prob),
+        decision_threshold=float(decision_threshold),
+        route_source=route_source,
+        route_duration_min=route_duration_min,
+    )
+
+
+def _build_scored_offer_snapshot(
+    *,
+    payload: dict[str, Any],
+    features: dict[str, float],
+    eur_per_hour: float,
+    accept_prob: float,
+    decision: str,
+    decision_threshold: float,
+    breakdown: dict[str, float],
+    route_meta: dict[str, Any],
+    model_used: str,
+    reasons: list[str],
+    details: list[dict[str, Any]],
+    extras: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    record = {
+        "offer_id": payload.get("offer_id"),
+        "courier_id": payload.get("courier_id"),
+        "accept_score": round(float(accept_prob), 4),
+        "decision": decision,
+        "decision_threshold": round(float(decision_threshold), 4),
+        "eur_per_hour_net": round(float(eur_per_hour), 2),
+        "estimated_net_eur": round(float(features.get("estimated_net_eur", 0.0)), 2),
+        "target_hourly_net_eur": round(float(features.get("target_hourly_net_eur", 0.0)), 2),
+        "target_gap_eur_h": round(float(features.get("target_gap_eur_h", 0.0)), 2),
+        "costs": breakdown,
+        "route_source": str(route_meta.get("route_source", "estimated")),
+        "route_distance_km": round(
+            float(route_meta.get("route_distance_km", features.get("total_distance_km", 0.0))), 3
+        ),
+        "route_duration_min": round(
+            float(route_meta.get("route_duration_min", features.get("total_duration_min", 0.0))), 3
+        ),
+        "route_notes": list(route_meta.get("route_notes", [])),
+        "model_used": model_used,
+        "explanation": reasons,
+        "explanation_details": details,
+    }
+    if extras:
+        record.update(extras)
+    return record
 
 
 def _parse_fuel_price_usd_gallon(xml_text: str, grade: str) -> float:
@@ -908,9 +1043,10 @@ async def _gbfs_loop(app) -> None:
 
 
 async def _irve_loop(app) -> None:
-    """Load NYC EV charging stations from OpenChargeMap and store in Redis. Refreshes every 6h.
+    """Load NYC EV charging stations from OpenChargeMap and store in Redis.
 
-    Field name "irve" kept for Redis key compatibility â€” the source is OpenChargeMap (NYC).
+    Refreshes every 6h. Field name "irve" is kept for Redis key compatibility;
+    the source is OpenChargeMap (NYC).
     """
     await asyncio.sleep(10)
 
@@ -1050,20 +1186,27 @@ async def score_offer(request: Request, body: ScoreOfferRequest) -> ScoreOfferRe
             payload, route_meta = await _apply_osrm_route_context(redis_client, payload, osrm_client)
 
     features = build_feature_map(payload)
-    heuristic_prob, eur_per_hour, reasons = heuristic_score(features)
+    heuristic_prob, eur_per_hour, reasons = _compute_heuristic_score(features)
     breakdown = cost_breakdown(features)
 
     model_payload = getattr(request.app.state, "copilot_model", None)
     model_prob, model_used = model_score(model_payload, features)
     accept_prob = model_prob if model_prob is not None else heuristic_prob
 
-    decision = "accept" if accept_prob >= 0.5 else "reject"
+    decision, decision_threshold = _decision_for_offer(features, float(accept_prob))
+    details = _build_explanation_details(
+        features=features,
+        accept_prob=float(accept_prob),
+        decision_threshold=decision_threshold,
+        route_meta=route_meta,
+    )
 
     return ScoreOfferResponse(
         offer_id=payload.get("offer_id"),
         courier_id=payload.get("courier_id"),
         accept_score=round(float(accept_prob), 4),
         decision=decision,
+        decision_threshold=round(float(decision_threshold), 4),
         eur_per_hour_net=round(float(eur_per_hour), 2),
         estimated_net_eur=round(float(features.get("estimated_net_eur", 0.0)), 2),
         target_hourly_net_eur=round(float(features.get("target_hourly_net_eur", 0.0)), 2),
@@ -1075,6 +1218,7 @@ async def score_offer(request: Request, body: ScoreOfferRequest) -> ScoreOfferRe
         route_notes=list(route_meta.get("route_notes", [])),
         model_used=model_used,
         explanation=reasons,
+        explanation_details=details,
     )
 
 
@@ -1082,24 +1226,42 @@ def _rank_offer_items(
     scored: list[dict[str, Any]],
     rank_by: str,
     reject_below_eur_h: float | None,
+    *,
+    default_reject_floor: float = RANK_REJECT_EUR_H_DEFAULT,
+    top_pick_min_eur_h: float = RANK_TOP_PICK_MIN_EUR_H,
+    top_pick_min_edge_eur_h: float = RANK_TOP_PICK_MIN_EDGE_EUR_H,
+    below_target_slack_eur_h: float = RANK_BELOW_TARGET_SLACK_EUR_H,
 ) -> tuple[list[RankedOfferItem], float, float, float]:
     """Pure ranking + annotation layer, exposed separately from the handler
     so unit tests can exercise the sort/floor/top_pick logic without going
     through FastAPI + Redis + OSRM. Takes the list of already-scored dicts
     and returns `(items, best_eur_h, worst_eur_h, median_eur_h)`.
     """
+    metric = rank_by if rank_by in {"eur_per_hour_net", "estimated_net_eur", "accept_score"} else "eur_per_hour_net"
     key_map = {
         "eur_per_hour_net": lambda it: (it["eur_per_hour_net"], it["estimated_net_eur"], it["accept_score"]),
         "estimated_net_eur": lambda it: (it["estimated_net_eur"], it["eur_per_hour_net"], it["accept_score"]),
-        "accept_score":     lambda it: (it["accept_score"], it["eur_per_hour_net"], it["estimated_net_eur"]),
+        "accept_score": lambda it: (it["accept_score"], it["eur_per_hour_net"], it["estimated_net_eur"]),
     }
-    ordered = sorted(scored, key=key_map[rank_by], reverse=True)
+    tie_sorted = sorted(scored, key=lambda it: str(it.get("offer_id") or ""))
+    ordered = sorted(tie_sorted, key=key_map[metric], reverse=True)
+
+    default_reject_floor = _non_negative_float(default_reject_floor, RANK_REJECT_EUR_H_DEFAULT)
+    top_pick_min_eur_h = _non_negative_float(top_pick_min_eur_h, RANK_TOP_PICK_MIN_EUR_H)
+    top_pick_min_edge_eur_h = _non_negative_float(top_pick_min_edge_eur_h, RANK_TOP_PICK_MIN_EDGE_EUR_H)
+    below_target_slack_eur_h = _non_negative_float(below_target_slack_eur_h, RANK_BELOW_TARGET_SLACK_EUR_H)
 
     hourly_values = [float(it["eur_per_hour_net"]) for it in ordered]
     best_eur_h = hourly_values[0] if hourly_values else 0.0
     worst_eur_h = hourly_values[-1] if hourly_values else 0.0
     median_eur_h = (
         sorted(hourly_values)[len(hourly_values) // 2] if hourly_values else 0.0
+    )
+    second_best_eur_h = hourly_values[1] if len(hourly_values) > 1 else best_eur_h
+    effective_reject_floor = (
+        _non_negative_float(reject_below_eur_h, default_reject_floor)
+        if reject_below_eur_h is not None
+        else default_reject_floor
     )
 
     items: list[RankedOfferItem] = []
@@ -1108,24 +1270,34 @@ def _rank_offer_items(
         target = float(it.get("target_hourly_net_eur") or 0.0)
         delta_top = round(eur_h - best_eur_h, 2)
         delta_median = round(eur_h - median_eur_h, 2)
+        top_edge = eur_h - second_best_eur_h if idx == 0 else 0.0
+        top_pick_eligible = (
+            idx == 0
+            and eur_h >= top_pick_min_eur_h
+            and (
+                len(hourly_values) <= 1
+                or top_edge >= top_pick_min_edge_eur_h
+            )
+        )
 
-        if reject_below_eur_h is not None and eur_h < reject_below_eur_h:
+        if eur_h < effective_reject_floor:
             recommendation = "reject"
-        elif idx == 0:
+        elif top_pick_eligible:
             recommendation = "top_pick"
-        elif target > 0 and eur_h < target:
+        elif target > 0 and eur_h < (target - below_target_slack_eur_h):
             recommendation = "below_target"
         else:
             recommendation = "viable"
 
         items.append(RankedOfferItem(
             rank=idx + 1,
-            top_pick=(idx == 0 and recommendation != "reject"),
+            top_pick=(recommendation == "top_pick"),
             recommendation=recommendation,
             offer_id=it.get("offer_id"),
             courier_id=it.get("courier_id"),
             accept_score=it["accept_score"],
             decision=it["decision"],
+            decision_threshold=float(it.get("decision_threshold")) if it.get("decision_threshold") is not None else None,
             eur_per_hour_net=eur_h,
             estimated_net_eur=float(it["estimated_net_eur"]),
             delta_vs_top_eur_h=delta_top,
@@ -1136,6 +1308,7 @@ def _rank_offer_items(
             route_duration_min=it.get("route_duration_min"),
             model_used=it.get("model_used", "heuristic"),
             explanation=list(it.get("explanation") or []),
+            explanation_details=list(it.get("explanation_details") or []),
         ))
     return items, best_eur_h, worst_eur_h, median_eur_h
 
@@ -1165,7 +1338,7 @@ async def _score_offer_payload(
         payload, route_meta = await _apply_osrm_route_context(redis_client, payload, osrm_client)
 
     features = build_feature_map(payload)
-    heuristic_prob, eur_per_hour, reasons = heuristic_score(features)
+    heuristic_prob, eur_per_hour, reasons = _compute_heuristic_score(features)
     model_prob, model_used = model_score(model_payload, features)
     accept_prob = model_prob if model_prob is not None else heuristic_prob
     return payload, route_meta, features, float(accept_prob), float(eur_per_hour), reasons, model_used
@@ -1196,26 +1369,29 @@ async def rank_offers(request: Request, body: RankOffersRequest) -> RankOffersRe
                     redis_client, model_payload, offer, osrm_client, body.use_osrm
                 )
             )
+            decision, decision_threshold = _decision_for_offer(features, float(accept_prob))
+            details = _build_explanation_details(
+                features=features,
+                accept_prob=float(accept_prob),
+                decision_threshold=decision_threshold,
+                route_meta=route_meta,
+            )
             breakdown = cost_breakdown(features)
-            scored.append({
-                "offer_id": payload.get("offer_id"),
-                "courier_id": payload.get("courier_id"),
-                "accept_score": round(accept_prob, 4),
-                "decision": "accept" if accept_prob >= 0.5 else "reject",
-                "eur_per_hour_net": round(eur_per_hour, 2),
-                "estimated_net_eur": round(float(features.get("estimated_net_eur", 0.0)), 2),
-                "target_hourly_net_eur": float(features.get("target_hourly_net_eur", 0.0)),
-                "costs": breakdown,
-                "route_source": str(route_meta.get("route_source", "estimated")),
-                "route_distance_km": round(
-                    float(route_meta.get("route_distance_km", features.get("total_distance_km", 0.0))), 3
-                ),
-                "route_duration_min": round(
-                    float(route_meta.get("route_duration_min", features.get("total_duration_min", 0.0))), 3
-                ),
-                "model_used": model_used,
-                "explanation": reasons,
-            })
+            scored.append(
+                _build_scored_offer_snapshot(
+                    payload=payload,
+                    features=features,
+                    eur_per_hour=eur_per_hour,
+                    accept_prob=accept_prob,
+                    decision=decision,
+                    decision_threshold=decision_threshold,
+                    breakdown=breakdown,
+                    route_meta=route_meta,
+                    model_used=model_used,
+                    reasons=reasons,
+                    details=details,
+                )
+            )
     finally:
         if osrm_client is not None:
             await osrm_client.aclose()
@@ -1419,7 +1595,10 @@ async def driver_offers(
     min_accept_score: float = Query(0.0, ge=0.0, le=1.0),
     target_hourly_net_eur: float | None = Query(None, ge=0.0, le=150.0),
     sort_by: Literal["score", "net", "recent"] = Query("score"),
-    use_osrm: bool = Query(False, description="Si true, recalcule les trajets via OSRM (plus prÃ©cis, plus lent)."),
+    use_osrm: bool = Query(
+        False,
+        description="If true, recompute routes via OSRM (more precise, slower).",
+    ),
 ):
     redis_client: aioredis.Redis = request.app.state.redis
     offer_ids = await redis_client.lrange(f"{DRIVER_OFFERS_PREFIX}{driver_id}:offers", 0, limit - 1)
@@ -1450,38 +1629,39 @@ async def driver_offers(
                 payload, route_meta = await _apply_osrm_route_context(redis_client, payload, osrm_client)
 
             features = build_feature_map(payload)
-            heur_prob, eur_per_hour, reasons = heuristic_score(features)
-            breakdown = cost_breakdown(features)
+            heur_prob, eur_per_hour, reasons = _compute_heuristic_score(features)
             model_payload = getattr(request.app.state, "copilot_model", None)
             model_prob, model_used = model_score(model_payload, features)
             accept_prob = model_prob if model_prob is not None else heur_prob
             if accept_prob < min_accept_score:
                 continue
+            decision, decision_threshold = _decision_for_offer(features, float(accept_prob))
+            details = _build_explanation_details(
+                features=features,
+                accept_prob=float(accept_prob),
+                decision_threshold=decision_threshold,
+                route_meta=route_meta,
+            )
+            breakdown = cost_breakdown(features)
 
             offers.append(
-                {
-                    "offer_id": off.get("offer_id"),
-                    "courier_id": off.get("courier_id"),
-                    "zone_id": off.get("zone_id"),
-                    "ts": off.get("ts"),
-                    "accept_score": round(float(accept_prob), 4),
-                    "decision": "accept" if accept_prob >= 0.5 else "reject",
-                    "eur_per_hour_net": round(float(eur_per_hour), 2),
-                    "estimated_net_eur": round(float(features.get("estimated_net_eur", 0.0)), 2),
-                    "target_hourly_net_eur": round(float(features.get("target_hourly_net_eur", 0.0)), 2),
-                    "target_gap_eur_h": round(float(features.get("target_gap_eur_h", 0.0)), 2),
-                    "costs": breakdown,
-                    "route_source": str(route_meta.get("route_source", "estimated")),
-                    "route_distance_km": round(
-                        float(route_meta.get("route_distance_km", features.get("total_distance_km", 0.0))), 3
-                    ),
-                    "route_duration_min": round(
-                        float(route_meta.get("route_duration_min", features.get("total_duration_min", 0.0))), 3
-                    ),
-                    "route_notes": list(route_meta.get("route_notes", [])),
-                    "model_used": model_used,
-                    "explanation": reasons,
-                }
+                _build_scored_offer_snapshot(
+                    payload=payload,
+                    features=features,
+                    eur_per_hour=eur_per_hour,
+                    accept_prob=accept_prob,
+                    decision=decision,
+                    decision_threshold=decision_threshold,
+                    breakdown=breakdown,
+                    route_meta=route_meta,
+                    model_used=model_used,
+                    reasons=reasons,
+                    details=details,
+                    extras={
+                        "zone_id": off.get("zone_id"),
+                        "ts": off.get("ts"),
+                    },
+                )
             )
     finally:
         if osrm_client is not None:
@@ -1515,7 +1695,10 @@ async def best_offers_around(
     scan_limit: int = Query(120, ge=10, le=400),
     min_accept_score: float = Query(0.25, ge=0.0, le=1.0),
     target_hourly_net_eur: float | None = Query(None, ge=0.0, le=150.0),
-    use_osrm: bool = Query(False, description="Si true, utilise OSRM pour recalculer pickup/trajet."),
+    use_osrm: bool = Query(
+        False,
+        description="If true, recompute routes via OSRM (more precise, slower).",
+    ),
 ):
     redis_client: aioredis.Redis = request.app.state.redis
 
@@ -1578,42 +1761,43 @@ async def best_offers_around(
             if pickup_distance_km > radius_km:
                 continue
 
-            heur_prob, eur_per_hour, reasons = heuristic_score(features)
+            heur_prob, eur_per_hour, reasons = _compute_heuristic_score(features)
             model_prob, model_used = model_score(model_payload, features)
             accept_prob = model_prob if model_prob is not None else heur_prob
             if accept_prob < min_accept_score:
                 continue
+            decision, decision_threshold = _decision_for_offer(features, float(accept_prob))
+            details = _build_explanation_details(
+                features=features,
+                accept_prob=float(accept_prob),
+                decision_threshold=decision_threshold,
+                route_meta=route_meta,
+            )
 
             rec_score, rec_action, rec_signals = recommendation_score(features, accept_prob)
             breakdown = cost_breakdown(features)
             offers.append(
-                {
-                    "offer_id": payload.get("offer_id"),
-                    "courier_id": payload.get("courier_id"),
-                    "zone_id": payload.get("zone_id"),
-                    "ts": payload.get("ts"),
-                    "distance_to_pickup_km": round(pickup_distance_km, 3),
-                    "accept_score": round(float(accept_prob), 4),
-                    "decision": "accept" if accept_prob >= 0.5 else "reject",
-                    "eur_per_hour_net": round(float(eur_per_hour), 2),
-                    "estimated_net_eur": round(float(features.get("estimated_net_eur", 0.0)), 2),
-                    "target_hourly_net_eur": round(float(features.get("target_hourly_net_eur", 0.0)), 2),
-                    "target_gap_eur_h": round(float(features.get("target_gap_eur_h", 0.0)), 2),
-                    "recommendation_score": rec_score,
-                    "recommendation_action": rec_action,
-                    "recommendation_signals": rec_signals,
-                    "costs": breakdown,
-                    "route_source": str(route_meta.get("route_source", "estimated")),
-                    "route_distance_km": round(
-                        float(route_meta.get("route_distance_km", features.get("total_distance_km", 0.0))), 3
-                    ),
-                    "route_duration_min": round(
-                        float(route_meta.get("route_duration_min", features.get("total_duration_min", 0.0))), 3
-                    ),
-                    "route_notes": list(route_meta.get("route_notes", [])),
-                    "model_used": model_used,
-                    "explanation": reasons,
-                }
+                _build_scored_offer_snapshot(
+                    payload=payload,
+                    features=features,
+                    eur_per_hour=eur_per_hour,
+                    accept_prob=accept_prob,
+                    decision=decision,
+                    decision_threshold=decision_threshold,
+                    breakdown=breakdown,
+                    route_meta=route_meta,
+                    model_used=model_used,
+                    reasons=reasons,
+                    details=details,
+                    extras={
+                        "zone_id": payload.get("zone_id"),
+                        "ts": payload.get("ts"),
+                        "distance_to_pickup_km": round(pickup_distance_km, 3),
+                        "recommendation_score": rec_score,
+                        "recommendation_action": rec_action,
+                        "recommendation_signals": rec_signals,
+                    },
+                )
             )
     finally:
         if osrm_client is not None:
@@ -1655,7 +1839,10 @@ async def instant_dispatch(
     forecast_horizon_min: float = Query(DEFAULT_DISPATCH_FORECAST_HORIZON_MIN, ge=10.0, le=90.0),
     dispatch_strategy: Literal["conservative", "balanced", "aggressive"] = Query("balanced"),
     target_hourly_net_eur: float | None = Query(None, ge=0.0, le=150.0),
-    use_osrm: bool = Query(False, description="Si true, calcule les ETA de repositionnement via OSRM."),
+    use_osrm: bool = Query(
+        False,
+        description="If true, recompute routes via OSRM (more precise, slower).",
+    ),
 ):
     redis_client: aioredis.Redis = request.app.state.redis
     lat, lon = await _resolve_driver_origin(redis_client, driver_id, lat, lon)
@@ -2411,3 +2598,4 @@ async def copilot_health(request: Request):
         "events_path": str(EVENTS_PATH),
         "model_path": str(MODEL_PATH),
     }
+

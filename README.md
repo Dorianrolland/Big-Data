@@ -338,6 +338,17 @@ This repository now includes a local-first copilot workflow for courier decision
 - `GET /copilot/health`
 - `GET /copilot` (mobile-first PWA)
 
+### Scoring v2 tuning knobs
+
+Scoring/ranking can be tuned at runtime via env vars (defaults shown in `.env.example`):
+
+- score weights: `COPILOT_SCORE_W_NET_HOURLY`, `COPILOT_SCORE_W_NET_TRIP`, `COPILOT_SCORE_W_FUEL`, `COPILOT_SCORE_W_TIME`, `COPILOT_SCORE_W_CONTEXT`
+- hybrid accept threshold: `COPILOT_ACCEPT_BASE_THRESHOLD`, `COPILOT_ACCEPT_BELOW_TARGET_PENALTY_MAX`, `COPILOT_ACCEPT_HIGH_FUEL_PENALTY`, `COPILOT_ACCEPT_ABOVE_TARGET_BONUS`
+- ranking labels: `COPILOT_RANK_REJECT_EUR_H_DEFAULT`, `COPILOT_RANK_TOP_PICK_MIN_EUR_H`, `COPILOT_RANK_TOP_PICK_MIN_EDGE_EUR_H`, `COPILOT_RANK_BELOW_TARGET_SLACK_EUR_H`
+
+`POST /copilot/score-offer`, `POST /copilot/rank-offers`, and `GET /copilot/driver/{id}/offers` now expose an optional `explanation_details` field while preserving existing `explanation` compatibility.
+The scoring payload also exposes `decision_threshold` so UI/ops can understand why a borderline offer was accepted or rejected.
+
 ### Driver ingest API (real devices)
 
 Gateway URL: `http://localhost:8010`
@@ -374,7 +385,13 @@ The report checks:
 - hot path geosearch p99
 - copilot score-offer p95
 - ingestion throughput delta
-- DLQ file count
+- no new DLQ errors during the benchmark window
+
+Notes:
+
+- historical DLQ files do not fail the global `passed` by default
+- to enforce strict empty-DLQ mode, run:
+  `python scripts/perf-lot4.py --require-dlq-empty ...`
 
 ### New storage layout
 

@@ -88,6 +88,21 @@ def dlq_stats() -> dict[str, Any]:
     return {"files": len(files), "size_mb": round(size_mb, 4)}
 
 
+def dlq_window_delta(start: dict[str, Any], end: dict[str, Any]) -> dict[str, Any]:
+    files_start = int(start.get("files", 0))
+    files_end = int(end.get("files", 0))
+    size_start = float(start.get("size_mb", 0.0))
+    size_end = float(end.get("size_mb", 0.0))
+    return {
+        "files_start": files_start,
+        "files_end": files_end,
+        "files_delta": files_end - files_start,
+        "size_mb_start": round(size_start, 4),
+        "size_mb_end": round(size_end, 4),
+        "size_mb_delta": round(size_end - size_start, 4),
+    }
+
+
 def replay_count(base_url: str, minutes: int = 15) -> int:
     now = datetime.now(timezone.utc)
     since = now - timedelta(minutes=minutes)
@@ -138,17 +153,47 @@ def measure_ingestion_rate(base_url: str, seconds: int) -> dict[str, Any]:
     }
 
 
-def evaluate_checks(hot_perf: dict, score_perf: dict, ingest: dict, dlq: dict) -> dict[str, bool]:
+def evaluate_checks(
+    hot_perf: dict,
+    score_perf: dict,
+    ingest: dict,
+    dlq: dict,
+    dlq_window: dict,
+) -> dict[str, bool]:
+    # Positive growth means fresh DLQ errors were produced during the benchmark window.
+    files_delta = int(dlq_window.get("files_delta", 0))
+    size_delta = float(dlq_window.get("size_mb_delta", 0.0))
     checks = {
         "hot_path_p99_lt_10ms": float(hot_perf.get("p99_ms", 9999)) < 10.0,
         "score_offer_p95_lt_150ms": float(score_perf.get("p95_ms", 9999)) < 150.0,
         "score_offer_error_free": int(score_perf.get("errors", 1)) == 0,
         "ingestion_rate_gt_20_msg_s": float(ingest.get("ingestion_msg_s", 0.0)) > 20.0,
         "dlq_is_empty": int(dlq.get("files", 1)) == 0,
+        "dlq_no_new_errors_in_window": files_delta <= 0 and size_delta <= 0.0001,
     }
     if int(ingest.get("window_s", 0)) >= 65:
         checks["cold_event_parquet_growth_after_flush"] = int(ingest.get("event_parquet_files_delta", 0)) > 0
     return checks
+
+
+def required_check_keys(checks: dict[str, bool], *, require_dlq_empty: bool) -> list[str]:
+    keys = [
+        "hot_path_p99_lt_10ms",
+        "score_offer_p95_lt_150ms",
+        "score_offer_error_free",
+        "ingestion_rate_gt_20_msg_s",
+        "dlq_no_new_errors_in_window",
+    ]
+    if "cold_event_parquet_growth_after_flush" in checks:
+        keys.append("cold_event_parquet_growth_after_flush")
+    if require_dlq_empty:
+        keys.append("dlq_is_empty")
+    return keys
+
+
+def compute_passed(checks: dict[str, bool], *, require_dlq_empty: bool) -> bool:
+    keys = required_check_keys(checks, require_dlq_empty=require_dlq_empty)
+    return all(bool(checks.get(key, False)) for key in keys)
 
 
 def write_markdown(report: dict[str, Any]) -> None:
@@ -172,6 +217,9 @@ def write_markdown(report: dict[str, Any]) -> None:
             "`cold_event_parquet_growth_after_flush`\n"
         )
 
+    pass_policy = report.get("pass_policy", {})
+    dlq_window = report.get("dlq_window", {})
+
     content = f"""# Preuve Technique (Lot 4)
 
 Generated at: {report['generated_at_utc']}
@@ -185,6 +233,9 @@ Generated at: {report['generated_at_utc']}
 - Replay growth check mode: {replay_note}
 - Cold event parquet growth: {report['ingestion']['event_parquet_files_delta']} files
 - DLQ files: {report['dlq']['files']}
+- DLQ files growth during window: {dlq_window.get('files_delta', 0)}
+- DLQ size growth during window: {dlq_window.get('size_mb_delta', 0.0)} MB
+- Pass policy require `dlq_is_empty`: {bool(pass_policy.get('require_dlq_empty', False))}
 
 ## Acceptance Checks
 
@@ -192,6 +243,7 @@ Generated at: {report['generated_at_utc']}
 - {mark(checks['score_offer_p95_lt_150ms'])} `score_offer_p95_lt_150ms`
 - {mark(checks['score_offer_error_free'])} `score_offer_error_free`
 - {mark(checks['ingestion_rate_gt_20_msg_s'])} `ingestion_rate_gt_20_msg_s`
+- {mark(checks['dlq_no_new_errors_in_window'])} `dlq_no_new_errors_in_window`
 - {mark(checks['dlq_is_empty'])} `dlq_is_empty`
 {replay_check_line}
 
@@ -212,6 +264,11 @@ def main() -> None:
     parser.add_argument("--score-requests", type=int, default=300)
     parser.add_argument("--score-concurrency", type=int, default=30)
     parser.add_argument("--score-timeout", type=float, default=10.0)
+    parser.add_argument(
+        "--require-dlq-empty",
+        action="store_true",
+        help="Fail the global pass if DLQ already contains historical files.",
+    )
     args = parser.parse_args()
 
     base_url = args.url.rstrip("/")
@@ -227,11 +284,19 @@ def main() -> None:
     )
     score["concurrency"] = args.score_concurrency
 
+    dlq_start = dlq_stats()
     ingest = measure_ingestion_rate(base_url=base_url, seconds=args.ingest_window)
     dlq = dlq_stats()
+    dlq_window = dlq_window_delta(dlq_start, dlq)
 
-    checks = evaluate_checks(hot_perf=hot, score_perf=score, ingest=ingest, dlq=dlq)
-    passed = all(checks.values())
+    checks = evaluate_checks(
+        hot_perf=hot,
+        score_perf=score,
+        ingest=ingest,
+        dlq=dlq,
+        dlq_window=dlq_window,
+    )
+    passed = compute_passed(checks, require_dlq_empty=bool(args.require_dlq_empty))
 
     report = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -240,8 +305,13 @@ def main() -> None:
         "score_offer": score,
         "ingestion": ingest,
         "dlq": dlq,
+        "dlq_window": dlq_window,
         "checks": checks,
         "passed": passed,
+        "pass_policy": {
+            "require_dlq_empty": bool(args.require_dlq_empty),
+            "required_checks": required_check_keys(checks, require_dlq_empty=bool(args.require_dlq_empty)),
+        },
     }
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)

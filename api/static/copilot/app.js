@@ -222,6 +222,8 @@ function humanizeReason(reason) {
     traffic_penalty: 'traffic penalty',
     high_platform_fee: 'high platform fee',
     fuel_cost_penalty: 'fuel cost penalty',
+    long_offer_duration: 'long offer duration',
+    short_offer_efficiency: 'short offer efficiency',
     long_pickup_detour: 'long pickup detour',
     balanced_offer_profile: 'balanced profile',
     zone_high_demand_pressure: 'zone high demand',
@@ -244,6 +246,34 @@ function humanizeReason(reason) {
     zone_coordinates_unavailable: 'zone coordinates unavailable',
   };
   return mapping[reason] || String(reason || '').replaceAll('_', ' ');
+}
+
+function formatExplanationDetail(detail) {
+  if (!detail || typeof detail !== 'object') return '';
+  const label = String(detail.label || humanizeReason(detail.code || 'detail')).trim();
+  const unit = String(detail.unit || '').trim();
+  const value = Number(detail.value);
+  const hasNumber = Number.isFinite(value);
+  let renderedValue = hasNumber ? fmt(value, unit === 'probability' || unit === 'normalized' ? 3 : 1) : String(detail.value || '');
+
+  let unitLabel = '';
+  if (unit === 'pct') unitLabel = '%';
+  else if (unit === 'eur_per_hour') unitLabel = 'EUR/h';
+  else if (unit === 'probability' || unit === 'normalized') unitLabel = '';
+  else if (unit) unitLabel = unit.replaceAll('_', ' ');
+
+  if (unitLabel) {
+    renderedValue = unitLabel === '%' ? `${renderedValue}${unitLabel}` : `${renderedValue} ${unitLabel}`;
+  }
+  const impact = String(detail.impact || 'neutral').toUpperCase();
+  return `${label}: ${renderedValue} (${impact})`;
+}
+
+function explanationDetailChips(details, limit = 2) {
+  const rows = Array.isArray(details) ? details.slice(0, Math.max(0, limit)) : [];
+  return rows
+    .map((d) => `<span>${formatExplanationDetail(d)}</span>`)
+    .join('');
 }
 
 function routeSummary(offer) {
@@ -1245,6 +1275,7 @@ function renderOffers() {
     card.className = 'offer';
 
     const reasons = Array.isArray(offer.explanation) ? offer.explanation : [];
+    const detailChips = explanationDetailChips(offer.explanation_details, 2);
     const zone = offer.zone_id || 'unknown_zone';
 
     card.innerHTML = `
@@ -1254,10 +1285,10 @@ function renderOffers() {
       </div>
       <div class="offer-meta">
         <span class="muted">zone ${zone}</span>
-        <span><strong>${fmt(offer.accept_score, 3)}</strong> score - <strong>${fmt(offer.eur_per_hour_net, 1)}</strong> EUR/h</span>
+        <span><strong>${fmt(offer.accept_score, 3)}</strong> score - <strong>${fmt(offer.eur_per_hour_net, 1)}</strong> EUR/h - ${String(offer.model_used || 'heuristic')}</span>
       </div>
       <div class="muted">${routeSummary(offer)}</div>
-      <div class="chips">${reasons.map((r) => `<span>${humanizeReason(r)}</span>`).join('')}</div>
+      <div class="chips">${reasons.map((r) => `<span>${humanizeReason(r)}</span>`).join('')}${detailChips}</div>
       <div class="offer-actions">
         <button class="ghost" data-action="score-offer" data-offer-id="${offer.offer_id || ''}" data-courier-id="${offer.courier_id || ''}">Score This Offer</button>
       </div>
@@ -1287,10 +1318,11 @@ function renderBestOffers() {
     const reasons = Array.isArray(offer.explanation) ? offer.explanation : [];
     const signals = Array.isArray(offer.recommendation_signals) ? offer.recommendation_signals : [];
     const routeNotes = Array.isArray(offer.route_notes) ? offer.route_notes : [];
+    const details = explanationDetailChips(offer.explanation_details, 2);
 
     const chips = [...reasons, ...signals, ...routeNotes]
       .map((r) => `<span>${humanizeReason(r)}</span>`)
-      .join('');
+      .join('') + details;
 
     card.innerHTML = `
       <div class="offer-top">
@@ -1299,7 +1331,7 @@ function renderBestOffers() {
       </div>
       <div class="offer-meta">
         <span class="muted">pickup ${fmt(offer.distance_to_pickup_km, 2)} km</span>
-        <span><strong>${fmt(offer.recommendation_score, 3)}</strong> rec - <strong>${fmt(offer.accept_score, 3)}</strong> ml</span>
+        <span><strong>${fmt(offer.recommendation_score, 3)}</strong> rec - <strong>${fmt(offer.accept_score, 3)}</strong> ${String(offer.model_used || 'heuristic')}</span>
       </div>
       <div class="offer-meta">
         <span>${routeSummary(offer)}</span>
@@ -1735,8 +1767,12 @@ async function scoreManualOffer(payloadOverride = null) {
     scoreEur.textContent = fmt(score.eur_per_hour_net, 1);
 
     const expl = Array.isArray(score.explanation) ? score.explanation.map(humanizeReason).join(' - ') : '-';
+    const detailSummary = Array.isArray(score.explanation_details)
+      ? score.explanation_details.slice(0, 2).map(formatExplanationDetail).filter(Boolean).join(' | ')
+      : '';
     const route = score.route_source ? ` | ${routeSummary(score)}` : '';
-    scoreReasons.textContent = `[${score.model_used || 'unknown'}] ${expl}${route}`;
+    const detailsText = detailSummary ? ` | ${detailSummary}` : '';
+    scoreReasons.textContent = `[${score.model_used || 'unknown'}] ${expl}${detailsText}${route}`;
   } catch (err) {
     scoreReasons.textContent = `Score failed: ${err.message}`;
   }

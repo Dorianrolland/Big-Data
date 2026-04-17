@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Mapping
 
 FEATURE_COLUMNS = [
     "estimated_fare_eur",
@@ -23,13 +23,81 @@ def sigmoid(x: float) -> float:
 
 def as_float(value: Any, default: float) -> float:
     try:
-        return float(value)
+        out = float(value)
     except (TypeError, ValueError):
         return default
+    if not math.isfinite(out):
+        return default
+    return out
 
 
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(value, high))
+
+
+DEFAULT_SCORE_WEIGHTS = {
+    "net_hourly": 0.46,
+    "net_trip": 0.18,
+    "fuel_efficiency": 0.16,
+    "time_efficiency": 0.12,
+    "context": 0.08,
+}
+
+
+def normalize_score_weights(raw_weights: Mapping[str, float] | None = None) -> dict[str, float]:
+    weights = {k: float(v) for k, v in DEFAULT_SCORE_WEIGHTS.items()}
+    if raw_weights:
+        for key in DEFAULT_SCORE_WEIGHTS:
+            if key in raw_weights:
+                weights[key] = max(0.0, float(raw_weights[key]))
+
+    total = sum(weights.values())
+    if total <= 0.0:
+        return {k: float(v) for k, v in DEFAULT_SCORE_WEIGHTS.items()}
+    return {k: float(v / total) for k, v in weights.items()}
+
+
+def score_components(features: dict[str, float]) -> dict[str, float]:
+    net_hourly = float(features.get("estimated_net_eur_h", 0.0))
+    net_trip = float(features.get("estimated_net_eur", 0.0))
+    total_duration_min = max(float(features.get("total_duration_min", 1.0)), 1.0)
+    pressure_ratio = max(float(features.get("pressure_ratio", 1.0)), 0.0)
+    weather_factor = max(float(features.get("weather_factor", 1.0)), 0.0)
+    traffic_factor = max(float(features.get("traffic_factor", 1.0)), 0.0)
+    estimated_fare = max(float(features.get("estimated_fare_eur", 0.0)), 0.0)
+    fuel_cost = max(float(features.get("fuel_cost_eur", 0.0)), 0.0)
+
+    fuel_share = fuel_cost / max(estimated_fare, 0.01)
+    pressure_component = clamp((pressure_ratio - 0.75) / 1.0, 0.0, 1.0)
+    weather_component = clamp((weather_factor - 0.85) / 0.35, 0.0, 1.0)
+    traffic_component = 1.0 - clamp((traffic_factor - 0.9) / 0.7, 0.0, 1.0)
+
+    return {
+        "net_hourly": clamp((net_hourly + 5.0) / 35.0, 0.0, 1.0),
+        "net_trip": clamp((net_trip + 1.5) / 18.0, 0.0, 1.0),
+        "fuel_efficiency": 1.0 - clamp((fuel_share - 0.06) / 0.25, 0.0, 1.0),
+        "time_efficiency": 1.0 - clamp((total_duration_min - 14.0) / 32.0, 0.0, 1.0),
+        "context": clamp(
+            (pressure_component * 0.55) + (weather_component * 0.25) + (traffic_component * 0.20),
+            0.0,
+            1.0,
+        ),
+    }
+
+
+def weighted_offer_score(
+    features: dict[str, float],
+    *,
+    weights: Mapping[str, float] | None = None,
+) -> tuple[float, dict[str, float], dict[str, float]]:
+    components = score_components(features)
+    normalized = normalize_score_weights(weights)
+    contributions = {
+        key: float(normalized[key] * components[key]) for key in DEFAULT_SCORE_WEIGHTS
+    }
+    base_score = sum(contributions.values())
+    score = clamp((0.06 + 0.88 * base_score), 0.01, 0.99)
+    return score, components, contributions
 
 
 def build_feature_map(raw: dict[str, Any]) -> dict[str, float]:
@@ -83,9 +151,14 @@ def build_feature_map(raw: dict[str, Any]) -> dict[str, float]:
     }
 
 
-def heuristic_score(features: dict[str, float]) -> tuple[float, float, list[str]]:
+def heuristic_score(
+    features: dict[str, float],
+    *,
+    weights: Mapping[str, float] | None = None,
+) -> tuple[float, float, list[str]]:
     estimated_fare = features["estimated_fare_eur"]
     total_distance_km = max(features.get("total_distance_km", features["estimated_distance_km"]), 0.0)
+    total_duration_min = max(features.get("total_duration_min", features["estimated_duration_min"]), 1.0)
     distance_to_pickup = max(features.get("distance_to_pickup_km", 0.0), 0.0)
     demand_index = features["demand_index"]
     supply_index = max(features["supply_index"], 0.2)
@@ -98,17 +171,7 @@ def heuristic_score(features: dict[str, float]) -> tuple[float, float, list[str]
     eur_per_hour_net = features.get("estimated_net_eur_h", 0.0)
     pressure_ratio = demand_index / supply_index
     pickup_ratio = min(distance_to_pickup / max(total_distance_km, 0.1), 1.0)
-    target_signal = max(-1.0, min(target_gap_eur_h / 12.0, 1.0))
-
-    logits = (
-        (eur_per_hour_net - 16.0) / 9.5
-        + (pressure_ratio - 1.0) * 0.85
-        + (weather_factor - 1.0) * 0.4
-        - (traffic_factor - 1.0) * 0.35
-        + target_signal * 0.35
-        - pickup_ratio * 0.25
-    )
-    score = max(0.01, min(sigmoid(logits), 0.99))
+    score, _, _ = weighted_offer_score(features, weights=weights)
 
     reasons: list[str] = []
     if eur_per_hour_net >= 22:
@@ -129,6 +192,10 @@ def heuristic_score(features: dict[str, float]) -> tuple[float, float, list[str]
         reasons.append("weather_downside")
     if traffic_factor > 1.2:
         reasons.append("traffic_penalty")
+    if total_duration_min >= 35.0:
+        reasons.append("long_offer_duration")
+    elif total_duration_min <= 15.0 and eur_per_hour_net >= 18.0:
+        reasons.append("short_offer_efficiency")
     if platform_fee_pct >= 30:
         reasons.append("high_platform_fee")
     if estimated_fare > 0 and fuel_cost_eur / estimated_fare > 0.2:
@@ -194,6 +261,194 @@ def recommendation_score(features: dict[str, float], accept_score: float) -> tup
         signals.append("pickup_near")
 
     return score, action, signals
+
+
+def hybrid_accept_threshold(
+    features: dict[str, float],
+    *,
+    base_threshold: float = 0.5,
+    below_target_penalty_max: float = 0.12,
+    high_fuel_penalty: float = 0.06,
+    above_target_bonus: float = 0.04,
+) -> float:
+    target_gap = float(features.get("target_gap_eur_h", 0.0))
+    estimated_fare = max(float(features.get("estimated_fare_eur", 0.0)), 0.0)
+    fuel_cost = max(float(features.get("fuel_cost_eur", 0.0)), 0.0)
+    fuel_share = fuel_cost / max(estimated_fare, 0.01)
+
+    below_target_penalty = 0.0
+    if target_gap < 0.0:
+        below_target_penalty = clamp(abs(target_gap) / 12.0, 0.0, 1.0) * max(0.0, below_target_penalty_max)
+
+    fuel_penalty = 0.0
+    if fuel_share > 0.18:
+        fuel_penalty = clamp((fuel_share - 0.18) / 0.22, 0.0, 1.0) * max(0.0, high_fuel_penalty)
+
+    target_bonus = 0.0
+    if target_gap > 3.0:
+        target_bonus = clamp((target_gap - 3.0) / 9.0, 0.0, 1.0) * max(0.0, above_target_bonus)
+
+    threshold = float(base_threshold) + below_target_penalty + fuel_penalty - target_bonus
+    return clamp(threshold, 0.35, 0.9)
+
+
+def hybrid_accept_decision(
+    *,
+    features: dict[str, float],
+    accept_score: float,
+    base_threshold: float = 0.5,
+    below_target_penalty_max: float = 0.12,
+    high_fuel_penalty: float = 0.06,
+    above_target_bonus: float = 0.04,
+) -> tuple[str, float]:
+    threshold = hybrid_accept_threshold(
+        features,
+        base_threshold=base_threshold,
+        below_target_penalty_max=below_target_penalty_max,
+        high_fuel_penalty=high_fuel_penalty,
+        above_target_bonus=above_target_bonus,
+    )
+    return ("accept" if float(accept_score) >= threshold else "reject", threshold)
+
+
+def _detail_impact(value: float, *, good_threshold: float, bad_threshold: float) -> str:
+    if value >= good_threshold:
+        return "positive"
+    if value <= bad_threshold:
+        return "negative"
+    return "neutral"
+
+
+def explanation_details(
+    *,
+    features: dict[str, float],
+    accept_score: float,
+    decision_threshold: float | None = None,
+    route_source: str | None = None,
+    route_duration_min: float | None = None,
+) -> list[dict[str, Any]]:
+    comps = score_components(features)
+    estimated_net_eur_h = float(features.get("estimated_net_eur_h", 0.0))
+    estimated_net_eur = float(features.get("estimated_net_eur", 0.0))
+    total_duration_min = max(float(features.get("total_duration_min", 1.0)), 1.0)
+    target_gap = float(features.get("target_gap_eur_h", 0.0))
+    pressure_ratio = max(float(features.get("pressure_ratio", 1.0)), 0.0)
+    traffic_factor = max(float(features.get("traffic_factor", 1.0)), 0.0)
+    estimated_fare = max(float(features.get("estimated_fare_eur", 0.0)), 0.0)
+    fuel_cost = max(float(features.get("fuel_cost_eur", 0.0)), 0.0)
+    fuel_share_pct = (fuel_cost / max(estimated_fare, 0.01)) * 100.0
+
+    details: list[dict[str, Any]] = [
+        {
+            "code": "net_hourly",
+            "label": "Net hourly yield",
+            "impact": _detail_impact(estimated_net_eur_h, good_threshold=20.0, bad_threshold=12.0),
+            "value": round(estimated_net_eur_h, 3),
+            "unit": "eur_per_hour",
+            "source": "cost",
+        },
+        {
+            "code": "net_trip",
+            "label": "Net trip gain",
+            "impact": _detail_impact(estimated_net_eur, good_threshold=8.0, bad_threshold=3.0),
+            "value": round(estimated_net_eur, 3),
+            "unit": "eur",
+            "source": "cost",
+        },
+        {
+            "code": "fuel_share_of_fare",
+            "label": "Fuel share of fare",
+            "impact": "negative" if fuel_share_pct >= 22.0 else "neutral" if fuel_share_pct >= 12.0 else "positive",
+            "value": round(fuel_share_pct, 3),
+            "unit": "pct",
+            "source": "fuel",
+        },
+        {
+            "code": "total_time",
+            "label": "Total time to complete",
+            "impact": "negative" if total_duration_min >= 35.0 else "neutral" if total_duration_min >= 22.0 else "positive",
+            "value": round(total_duration_min, 3),
+            "unit": "min",
+            "source": "time",
+        },
+        {
+            "code": "target_gap",
+            "label": "Target gap",
+            "impact": "positive" if target_gap >= 1.0 else "negative" if target_gap <= -1.0 else "neutral",
+            "value": round(target_gap, 3),
+            "unit": "eur_per_hour",
+            "source": "target",
+        },
+        {
+            "code": "demand_pressure",
+            "label": "Demand pressure ratio",
+            "impact": _detail_impact(pressure_ratio, good_threshold=1.2, bad_threshold=0.9),
+            "value": round(pressure_ratio, 3),
+            "unit": "ratio",
+            "source": "context",
+        },
+        {
+            "code": "traffic_factor",
+            "label": "Traffic factor",
+            "impact": "negative" if traffic_factor >= 1.2 else "neutral" if traffic_factor >= 1.05 else "positive",
+            "value": round(traffic_factor, 3),
+            "unit": "factor",
+            "source": "context",
+        },
+        {
+            "code": "score_component_net_hourly",
+            "label": "Score component net hourly",
+            "impact": _detail_impact(comps["net_hourly"], good_threshold=0.62, bad_threshold=0.42),
+            "value": round(comps["net_hourly"], 3),
+            "unit": "normalized",
+            "source": "cost",
+        },
+        {
+            "code": "score_component_fuel",
+            "label": "Score component fuel efficiency",
+            "impact": _detail_impact(comps["fuel_efficiency"], good_threshold=0.62, bad_threshold=0.42),
+            "value": round(comps["fuel_efficiency"], 3),
+            "unit": "normalized",
+            "source": "fuel",
+        },
+        {
+            "code": "accept_score",
+            "label": "Acceptance score",
+            "impact": _detail_impact(float(accept_score), good_threshold=0.65, bad_threshold=0.45),
+            "value": round(float(accept_score), 4),
+            "unit": "probability",
+            "source": "context",
+        },
+    ]
+
+    if decision_threshold is not None:
+        details.append(
+            {
+                "code": "decision_threshold",
+                "label": "Hybrid accept threshold",
+                "impact": "neutral",
+                "value": round(float(decision_threshold), 4),
+                "unit": "probability",
+                "source": "target",
+            }
+        )
+
+    if route_duration_min is not None:
+        label = "Route duration estimate"
+        if route_source:
+            label = f"Route duration ({route_source})"
+        details.append(
+            {
+                "code": "route_duration",
+                "label": label,
+                "impact": "negative" if route_duration_min >= 30.0 else "neutral" if route_duration_min >= 18.0 else "positive",
+                "value": round(float(route_duration_min), 3),
+                "unit": "min",
+                "source": "routing",
+            }
+        )
+
+    return details
 
 
 def forecast_zone_metrics(
@@ -433,4 +688,6 @@ def model_score(model_payload: dict[str, Any] | None, features: dict[str, float]
 
     row = [[features.get(col, 0.0) for col in columns]]
     prob = float(model.predict_proba(row)[0][1])
+    if not math.isfinite(prob):
+        return None, "heuristic"
     return max(0.01, min(prob, 0.99)), "ml"
