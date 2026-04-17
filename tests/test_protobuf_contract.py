@@ -14,6 +14,7 @@ def test_protobuf_roundtrip_position():
         status="available",
         accuracy_m=4.0,
         battery_pct=86.0,
+        source_platform="driver_ingest",
     )
     encoded = msg.SerializeToString()
 
@@ -22,6 +23,7 @@ def test_protobuf_roundtrip_position():
 
     assert decoded.courier_id == "L001"
     assert decoded.event_type == "courier.position.v1"
+    assert decoded.source_platform == "driver_ingest"
 
 
 def test_protobuf_roundtrip_offer():
@@ -42,6 +44,7 @@ def test_protobuf_roundtrip_offer():
         weather_factor=1.0,
         traffic_factor=1.1,
         zone_id="nyc_142",
+        source_platform="uber_eats",
     )
 
     encoded = msg.SerializeToString()
@@ -50,6 +53,7 @@ def test_protobuf_roundtrip_offer():
 
     assert decoded.offer_id == "OFR01"
     assert decoded.estimated_fare_eur > 0
+    assert decoded.source_platform == "uber_eats"
 
 
 def test_protobuf_roundtrip_order_event():
@@ -65,6 +69,7 @@ def test_protobuf_roundtrip_order_event():
         actual_fare_eur=12.2,
         actual_distance_km=3.4,
         actual_duration_min=17.0,
+        source_platform="uber_eats",
     )
 
     encoded = msg.SerializeToString()
@@ -73,6 +78,7 @@ def test_protobuf_roundtrip_order_event():
 
     assert decoded.order_id == "ORD01"
     assert decoded.status == "accepted"
+    assert decoded.source_platform == "uber_eats"
 
 
 def test_protobuf_roundtrip_context_signal():

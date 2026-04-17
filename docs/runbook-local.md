@@ -68,6 +68,50 @@ powershell -ExecutionPolicy Bypass -File scripts/proof-lot4.ps1
 - `POST http://localhost:8010/ingest/v1/position`
 - `POST http://localhost:8010/ingest/v1/positions`
 
+## Single-driver copilot mode (default profile: 10m train / 2m live)
+
+The default local profile is now:
+- `TLC_SCENARIO=single_driver`
+- `TLC_TRAIN_MONTH_COUNT=10`
+- `TLC_LIVE_MONTH_COUNT=2`
+- `TLC_RESET_RUNTIME_ON_START=true`
+
+Start in this mode:
+
+```bash
+make up
+```
+
+Or with explicit profile file:
+
+```bash
+docker compose --env-file env/single_driver_10m2m.env up -d --build
+```
+
+Open the focused map:
+
+```text
+http://localhost:8001/map?focus=drv_demo_001
+```
+
+Reset runtime state (cursors + Redis hot keys, model kept):
+
+```bash
+make single-driver-reset
+```
+
+Observe health and quality signals:
+
+```bash
+curl -s http://localhost:8001/copilot/health
+```
+
+Check these fields:
+- `data_quality.supply_variance`
+- `data_quality.traffic_nonzero_rate`
+- `routing_quality.routing_success_rate`
+- `routing_quality.hold_rate`
+
 ## Real device mode (no replay)
 
 Stop TLC replay so only real device GPS is visible on the map:

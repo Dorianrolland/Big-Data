@@ -14,6 +14,7 @@ message CourierPositionV1 {
   string status = 9;
   float accuracy_m = 10;
   float battery_pct = 11;
+  string source_platform = 12;
 }
 
 message OrderOfferV1 {
@@ -33,6 +34,7 @@ message OrderOfferV1 {
   float weather_factor = 14;
   float traffic_factor = 15;
   string zone_id = 16;
+  string source_platform = 17;
 }
 
 message OrderEventV1 {
@@ -47,6 +49,7 @@ message OrderEventV1 {
   float actual_distance_km = 9;
   float actual_duration_min = 10;
   string zone_id = 11;
+  string source_platform = 12;
 }
 
 message ContextSignalV1 {

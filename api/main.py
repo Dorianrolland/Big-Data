@@ -29,7 +29,7 @@ from redis.exceptions import RedisError
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import Gauge
 from prometheus_fastapi_instrumentator import Instrumentator
@@ -51,6 +51,8 @@ DATA_PATH = Path(os.getenv("DATA_PATH", "/data/parquet"))
 REDIS_CONNECT_TIMEOUT_SECONDS = float(os.getenv("REDIS_CONNECT_TIMEOUT_SECONDS", "1.5"))
 REDIS_OP_TIMEOUT_SECONDS = float(os.getenv("REDIS_OP_TIMEOUT_SECONDS", "6.0"))
 DUCKDB_QUERY_TIMEOUT_SECONDS = float(os.getenv("DUCKDB_QUERY_TIMEOUT_SECONDS", "12.0"))
+TLC_SCENARIO = (os.getenv("TLC_SCENARIO", "fleet") or "fleet").strip().lower()
+TLC_SINGLE_DRIVER_ID = (os.getenv("TLC_SINGLE_DRIVER_ID", "drv_demo_001") or "drv_demo_001").strip()
 
 GEO_KEY          = "fleet:geo"
 HASH_PREFIX      = "fleet:livreur:"
@@ -261,8 +263,10 @@ if _DASHBOARD_DIR.exists():
 app.include_router(copilot_router)
 
 @app.get("/map", include_in_schema=False)
-async def live_map():
+async def live_map(request: Request):
     """Dashboard HTML live — carte Leaflet sans clignotement."""
+    if TLC_SCENARIO == "single_driver" and not request.query_params.get("focus"):
+        return RedirectResponse(url=f"/map?focus={TLC_SINGLE_DRIVER_ID}", status_code=307)
     p = Path(__file__).parent / "static" / "index.html"
     if p.exists():
         return FileResponse(str(p), media_type="text/html")
@@ -702,7 +706,18 @@ async def livreur_focus_status():
             return 0
 
     providers = [p for p in (raw.get("routing_providers") or "").split(",") if p]
-    is_healthy = (age_seconds is not None and age_seconds < 60.0) and bool(providers)
+    routing_health_raw = raw.get("routing_health_json") or "{}"
+    try:
+        routing_health = json.loads(routing_health_raw)
+        if not isinstance(routing_health, dict):
+            routing_health = {}
+    except Exception:
+        routing_health = {}
+
+    routing_degraded_raw = str(raw.get("routing_degraded", "0") or "0").strip().lower()
+    routing_degraded = routing_degraded_raw in {"1", "true", "yes", "on"}
+    routing_last_error = raw.get("routing_last_error") or ""
+    is_healthy = (age_seconds is not None and age_seconds < 60.0) and bool(providers) and (not routing_degraded)
 
     return {
         "driver_id": raw.get("driver_id") or "",
@@ -713,6 +728,9 @@ async def livreur_focus_status():
         "is_healthy": is_healthy,
         "stale_reason": raw.get("stale_reason") or "",
         "routing_providers": providers,
+        "routing_health": routing_health,
+        "routing_degraded": routing_degraded,
+        "routing_last_error": routing_last_error,
         "positions": _to_int("positions"),
         "trips": _to_int("trips"),
         "repositions": _to_int("repositions"),

@@ -628,6 +628,7 @@ function setFocusPillState(stale, ageS) {
   const pill = ensureFocusPill();
   if (!pill) return;
   const meta = focusState.statusMeta;
+  const degraded = !!(meta && meta.routing_degraded);
   const suffix = meta && meta.trips != null
     ? ' · trips:' + meta.trips + (meta.routing_errors > 0 ? ' · err:' + meta.routing_errors : '')
     : '';
@@ -637,6 +638,12 @@ function setFocusPillState(stale, ageS) {
     pill.style.color = '#f85149';
     pill.style.border = '1px solid rgba(248,81,73,.4)';
     pill.textContent = 'FOCUS: ' + FOCUS_DRIVER + ' — STALE ' + (ageS != null ? Math.round(ageS) + 's' : '') + suffix;
+  } else if (degraded) {
+    pill.className = 'pill';
+    pill.style.background = 'rgba(240,136,62,.15)';
+    pill.style.color = '#f0883e';
+    pill.style.border = '1px solid rgba(240,136,62,.4)';
+    pill.textContent = 'FOCUS: ' + FOCUS_DRIVER + ' — ROUTAGE DÉGRADÉ' + suffix;
   } else {
     pill.className = 'pill pill-live';
     pill.textContent = 'FOCUS: ' + FOCUS_DRIVER + suffix;
@@ -651,12 +658,17 @@ function setFocusPillState(stale, ageS) {
       'virtual_time: ' + (meta.virtual_time || '?'),
       'providers: ' + (meta.routing_providers && meta.routing_providers.length
         ? meta.routing_providers.join(',') : '(none)'),
+      'routing_degraded: ' + (!!meta.routing_degraded),
       'trips: ' + (meta.trips || 0),
       'repositions: ' + (meta.repositions || 0),
       'lunch_breaks: ' + (meta.lunch_breaks || 0),
       'routing_errors: ' + (meta.routing_errors || 0),
       'positions emitted: ' + (meta.positions || 0),
     ];
+    if (meta.routing_last_error) parts.push('routing_last_error: ' + meta.routing_last_error);
+    if (meta.routing_health && typeof meta.routing_health === 'object') {
+      parts.push('routing_health: ' + JSON.stringify(meta.routing_health));
+    }
     if (meta.stale_reason) parts.push('stale_reason: ' + meta.stale_reason);
     pill.title = parts.join('\n');
   }
