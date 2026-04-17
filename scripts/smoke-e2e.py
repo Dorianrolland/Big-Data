@@ -113,11 +113,16 @@ def dlq_stats(path: Path) -> dict[str, Any]:
 
 
 def fallback_driver_ids() -> list[str]:
+    candidates: list[str] = []
     raw = str(os.getenv("COPILOT_SMOKE_DRIVER_FALLBACKS", "")).strip()
     if raw:
-        candidates = [token.strip() for token in raw.split(",") if token.strip()]
-    else:
-        candidates = list(DEFAULT_FALLBACK_DRIVER_IDS)
+        candidates.extend(token.strip() for token in raw.split(",") if token.strip())
+
+    single_driver = str(os.getenv("TLC_SINGLE_DRIVER_ID", "")).strip()
+    if single_driver:
+        candidates.append(single_driver)
+
+    candidates.extend(DEFAULT_FALLBACK_DRIVER_IDS)
 
     deduped: list[str] = []
     for item in candidates:
@@ -163,7 +168,8 @@ def discover_driver_id(base_url: str, timeout_s: int) -> str:
         except Exception:
             continue
 
-    for fallback_id in fallback_driver_ids():
+    fallback_ids = fallback_driver_ids()
+    for fallback_id in fallback_ids:
         if fallback_id in nearby_ids:
             continue
         try:
@@ -174,8 +180,10 @@ def discover_driver_id(base_url: str, timeout_s: int) -> str:
 
     if nearby_ids:
         return nearby_ids[0]
+    if fallback_ids:
+        return fallback_ids[0]
     raise RuntimeError(
-        "unable to auto-discover driver_id: no nearby drivers with offers and no fallback driver available"
+        "unable to auto-discover driver_id: no nearby drivers and no fallback driver configured"
     )
 
 

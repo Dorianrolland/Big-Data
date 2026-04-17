@@ -139,8 +139,15 @@ def test_benchmark_score_offer_normalizes_minimum_requests(monkeypatch):
 
 
 def test_fallback_driver_ids_from_env(monkeypatch):
-    monkeypatch.setattr(smoke_e2e.os, "getenv", lambda *_args, **_kwargs: "drv_a, drv_b,drv_a,,")
-    assert smoke_e2e.fallback_driver_ids() == ["drv_a", "drv_b"]
+    def fake_getenv(key: str, default: str = "") -> str:
+        if key == "COPILOT_SMOKE_DRIVER_FALLBACKS":
+            return "drv_a, drv_b,drv_a,,"
+        if key == "TLC_SINGLE_DRIVER_ID":
+            return "drv_single"
+        return default
+
+    monkeypatch.setattr(smoke_e2e.os, "getenv", fake_getenv)
+    assert smoke_e2e.fallback_driver_ids() == ["drv_a", "drv_b", "drv_single", "drv_demo_001", "L001"]
 
 
 def test_discover_driver_id_prefers_nearby_with_offers(monkeypatch):
@@ -170,13 +177,20 @@ def test_discover_driver_id_falls_back_when_nearby_empty(monkeypatch):
 
 def test_discover_driver_id_raises_when_no_candidate(monkeypatch):
     monkeypatch.setattr(smoke_e2e, "wait_for_json", lambda *_args, **_kwargs: {"livreurs": []})
-    monkeypatch.setattr(smoke_e2e, "fallback_driver_ids", lambda: ["drv_demo_001"])
+    monkeypatch.setattr(smoke_e2e, "fallback_driver_ids", lambda: [])
     monkeypatch.setattr(smoke_e2e, "driver_has_offers", lambda *_args, **_kwargs: False)
     try:
         smoke_e2e.discover_driver_id("http://localhost:8001", timeout_s=120)
         assert False, "expected RuntimeError"
     except RuntimeError as exc:
         assert "auto-discover driver_id" in str(exc)
+
+
+def test_discover_driver_id_returns_fallback_even_without_offers(monkeypatch):
+    monkeypatch.setattr(smoke_e2e, "wait_for_json", lambda *_args, **_kwargs: {"livreurs": []})
+    monkeypatch.setattr(smoke_e2e, "fallback_driver_ids", lambda: ["drv_demo_001"])
+    monkeypatch.setattr(smoke_e2e, "driver_has_offers", lambda *_args, **_kwargs: False)
+    assert smoke_e2e.discover_driver_id("http://localhost:8001", timeout_s=120) == "drv_demo_001"
 
 
 def test_discover_driver_id_returns_first_nearby_when_no_candidate_has_offers(monkeypatch):
