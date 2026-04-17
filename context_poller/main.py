@@ -15,6 +15,8 @@ Signal fields populated from real data:
 from __future__ import annotations
 
 import asyncio
+from collections import deque
+from datetime import datetime
 import hashlib
 import json
 import logging
@@ -23,6 +25,7 @@ import os
 import signal
 import time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 import redis.asyncio as aioredis
@@ -39,12 +42,17 @@ log = logging.getLogger("context-poller")
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "redpanda:9092")
 CONTEXT_SIGNALS_TOPIC = os.getenv("CONTEXT_SIGNALS_TOPIC", "context-signals-v1")
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
-COURIER_GEO_KEY = os.getenv("COURIER_GEO_KEY", "fleet:livreurs")
+COURIER_GEO_KEY = os.getenv("COURIER_GEO_KEY", "fleet:geo")
 
 CONTEXT_TICK_SECONDS = float(os.getenv("CONTEXT_TICK_SECONDS", "30"))
 GBFS_POLL_SECONDS = float(os.getenv("GBFS_POLL_SECONDS", "60"))
 WEATHER_POLL_SECONDS = float(os.getenv("WEATHER_POLL_SECONDS", "600"))
 NYC311_POLL_SECONDS = float(os.getenv("NYC311_POLL_SECONDS", "300"))
+CONTEXT_QUALITY_KEY = os.getenv("CONTEXT_QUALITY_KEY", "copilot:context:quality")
+CONTEXT_QUALITY_TTL_SECONDS = int(os.getenv("CONTEXT_QUALITY_TTL_SECONDS", "7200"))
+CONTEXT_QUALITY_WINDOW_CYCLES = int(os.getenv("CONTEXT_QUALITY_WINDOW_CYCLES", "10"))
+CONTEXT_SUPPLY_VARIANCE_EPSILON = float(os.getenv("CONTEXT_SUPPLY_VARIANCE_EPSILON", "0.03"))
+CONTEXT_SUPPLY_FLAT_MIN_CYCLES = int(os.getenv("CONTEXT_SUPPLY_FLAT_MIN_CYCLES", "6"))
 
 GBFS_STATION_INFO_URL = os.getenv(
     "GBFS_STATION_INFO_URL",
@@ -72,6 +80,7 @@ SUPPLY_RADIUS_KM = float(os.getenv("SUPPLY_RADIUS_KM", "1.0"))
 TRAFFIC_RADIUS_KM = float(os.getenv("TRAFFIC_RADIUS_KM", "1.5"))
 
 EARTH_KM = 6371.0
+NYC_TZ = ZoneInfo("America/New_York")
 
 
 def utc_now_iso() -> str:
@@ -263,11 +272,29 @@ def _compute_weather_factor(state: ContextState) -> float:
     return round(f, 3)
 
 
-def _compute_traffic_factor(state: ContextState, lat: float, lon: float) -> float:
+def _rush_hour_factor(now_ts: float | None = None) -> float:
+    now_local = datetime.fromtimestamp(now_ts or time.time(), tz=NYC_TZ)
+    hour = now_local.hour + (now_local.minute / 60.0)
+    if 7.0 <= hour < 10.0:
+        return 0.18
+    if 16.0 <= hour < 20.0:
+        return 0.22
+    if 11.0 <= hour < 14.0:
+        return 0.07
+    return 0.0
+
+
+def _compute_traffic_factor(state: ContextState, lat: float, lon: float, now_ts: float | None = None) -> float:
     local = _count_within(state.nyc311_incidents, lat, lon, TRAFFIC_RADIUS_KM)
     precip = state.weather_precip_mm
-    f = 1.0 + min(0.4, local / 15.0) + min(0.2, precip / 6.0)
-    return round(f, 3)
+    f = 1.0 + min(0.45, local / 12.0) + min(0.2, precip / 6.0) + _rush_hour_factor(now_ts)
+    return round(min(2.2, f), 3)
+
+
+def _supply_index_from_member_count(member_count: int) -> float:
+    """Map nearby couriers to supply index with low-supply visibility."""
+    count = max(0, int(member_count))
+    return round(max(0.2, min(5.0, count / 4.0)), 3)
 
 
 async def _zone_supply_index(redis_client: aioredis.Redis, lat: float, lon: float) -> float:
@@ -279,9 +306,67 @@ async def _zone_supply_index(redis_client: aioredis.Redis, lat: float, lon: floa
             unit="km",
             radius=SUPPLY_RADIUS_KM,
         )
-        return round(max(1.0, len(members) / 4.0), 3)
+        return _supply_index_from_member_count(len(members))
     except Exception:
         return 1.0
+
+
+async def _publish_quality_snapshot(
+    redis_client: aioredis.Redis,
+    *,
+    supply_values: list[float],
+    traffic_values: list[float],
+    supply_mean_history: deque[float],
+    sent_cycles: int,
+    source_tag: str,
+) -> None:
+    if not supply_values:
+        return
+
+    supply_mean = sum(supply_values) / len(supply_values)
+    supply_var = sum((value - supply_mean) ** 2 for value in supply_values) / len(supply_values)
+    supply_std = math.sqrt(supply_var)
+    supply_mean_history.append(round(supply_mean, 4))
+
+    span = (max(supply_mean_history) - min(supply_mean_history)) if supply_mean_history else 0.0
+    flat_alert = (
+        len(supply_mean_history) >= max(2, CONTEXT_SUPPLY_FLAT_MIN_CYCLES)
+        and span <= CONTEXT_SUPPLY_VARIANCE_EPSILON
+    )
+    traffic_nonzero_rate = (
+        sum(1 for value in traffic_values if value > 1.01) / len(traffic_values) if traffic_values else 0.0
+    )
+
+    payload = {
+        "updated_at": utc_now_iso(),
+        "cycles_published": str(sent_cycles),
+        "sources": source_tag,
+        "supply_key": COURIER_GEO_KEY,
+        "zones_count": str(len(supply_values)),
+        "supply_min": f"{min(supply_values):.3f}",
+        "supply_max": f"{max(supply_values):.3f}",
+        "supply_mean": f"{supply_mean:.3f}",
+        "supply_std": f"{supply_std:.3f}",
+        "supply_variance": f"{supply_var:.5f}",
+        "supply_window_span": f"{span:.5f}",
+        "supply_window_cycles": str(len(supply_mean_history)),
+        "supply_flat_alert": "1" if flat_alert else "0",
+        "supply_flat_threshold": f"{CONTEXT_SUPPLY_VARIANCE_EPSILON:.5f}",
+        "traffic_nonzero_rate": f"{traffic_nonzero_rate:.3f}",
+        "traffic_mean": f"{(sum(traffic_values) / len(traffic_values)):.3f}" if traffic_values else "1.000",
+    }
+    await redis_client.hset(CONTEXT_QUALITY_KEY, mapping=payload)
+    await redis_client.expire(CONTEXT_QUALITY_KEY, CONTEXT_QUALITY_TTL_SECONDS)
+
+    if flat_alert:
+        log.warning(
+            "context quality alert: supply_index appears flat across %d cycles "
+            "(span=%.5f <= %.5f, key=%s)",
+            len(supply_mean_history),
+            span,
+            CONTEXT_SUPPLY_VARIANCE_EPSILON,
+            COURIER_GEO_KEY,
+        )
 
 
 async def publisher_loop(
@@ -293,6 +378,7 @@ async def publisher_loop(
 ) -> None:
     log.info("publisher starting (tick=%.1fs zones=%d)", CONTEXT_TICK_SECONDS, len(centroids))
     sent_cycles = 0
+    supply_mean_history: deque[float] = deque(maxlen=max(2, CONTEXT_QUALITY_WINDOW_CYCLES))
     while not stop.is_set():
         tick_started = time.time()
         if not state.sources_active:
@@ -307,12 +393,16 @@ async def publisher_loop(
         sources_tag = "+".join(sorted(state.sources_active)) or "none"
         ts_iso = utc_now_iso()
         sends = []
+        supply_values: list[float] = []
+        traffic_values: list[float] = []
 
         for loc_id, (lat, lon) in centroids.items():
             zone_id = f"nyc_{loc_id}"
             demand = _compute_zone_demand(state, lat, lon)
-            traffic = _compute_traffic_factor(state, lat, lon)
+            traffic = _compute_traffic_factor(state, lat, lon, now_ts=tick_started)
             supply = await _zone_supply_index(redis_client, lat, lon)
+            supply_values.append(supply)
+            traffic_values.append(traffic)
             sig = ContextSignalV1(
                 event_id=event_id("ctx", f"{zone_id}_{int(tick_started)}"),
                 event_type="context.signal.v1",
@@ -333,13 +423,28 @@ async def publisher_loop(
         else:
             sent_cycles += 1
             elapsed = time.time() - tick_started
+            await _publish_quality_snapshot(
+                redis_client,
+                supply_values=supply_values,
+                traffic_values=traffic_values,
+                supply_mean_history=supply_mean_history,
+                sent_cycles=sent_cycles,
+                source_tag=sources_tag,
+            )
             if sent_cycles % 5 == 1:
                 log.info(
-                    "published cycle=%d zones=%d sources=%s weather=%.2f took=%.2fs",
+                    "published cycle=%d zones=%d sources=%s weather=%.2f supply_mean=%.2f "
+                    "traffic_nonzero=%.2f took=%.2fs",
                     sent_cycles,
                     len(centroids),
                     sources_tag,
                     weather,
+                    (sum(supply_values) / len(supply_values)) if supply_values else 0.0,
+                    (
+                        sum(1 for value in traffic_values if value > 1.01) / len(traffic_values)
+                        if traffic_values
+                        else 0.0
+                    ),
                     elapsed,
                 )
 

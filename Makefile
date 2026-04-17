@@ -1,7 +1,11 @@
-.PHONY: up down logs build clean restart status train-copilot train-copilot-10m demo-copilot demo-rank demo-next-zone bench-copilot smoke-e2e perf-lot4 proof-lot4 real-mode sim-mode demo-ingest prepare-routing-osrm single-driver-reset single-driver-up single-driver-down single-driver-logs focus-map
+.PHONY: up fleet-up down logs build clean restart status train-copilot train-copilot-10m demo-copilot demo-rank demo-next-zone bench-copilot smoke-e2e perf-lot4 proof-lot4 real-mode sim-mode demo-ingest prepare-routing-osrm single-driver-reset single-driver-up single-driver-down single-driver-logs focus-map
 
 ## Lance l'intégralité du stack (build + démarrage)
 up:
+	TLC_SCENARIO=$${TLC_SCENARIO:-single_driver} \
+	TLC_TRAIN_MONTH_COUNT=$${TLC_TRAIN_MONTH_COUNT:-10} \
+	TLC_LIVE_MONTH_COUNT=$${TLC_LIVE_MONTH_COUNT:-2} \
+	TLC_RESET_RUNTIME_ON_START=$${TLC_RESET_RUNTIME_ON_START:-true} \
 	docker compose up --build -d
 	@echo ""
 	@echo "✓ FleetStream démarré !"
@@ -169,3 +173,12 @@ demo-ingest:
 	@echo ""
 	@echo "→ Vérif API live map source (Redis hot path):"
 	curl -s "http://localhost:8001/livreurs/L001" | python3 -m json.tool
+
+## Lance explicitement le mode flotte (utile pour stress/perf uniquement)
+fleet-up:
+	TLC_SCENARIO=fleet \
+	TLC_TRAIN_MONTH_COUNT=0 \
+	TLC_LIVE_MONTH_COUNT=0 \
+	TLC_RESET_RUNTIME_ON_START=false \
+	docker compose up --build -d
+	@echo "Fleet mode active (stress/perf)."

@@ -79,6 +79,7 @@ EVENT_SCHEMA = pa.schema(
         pa.field("weather_factor", pa.float32()),
         pa.field("traffic_factor", pa.float32()),
         pa.field("source", pa.string()),
+        pa.field("source_platform", pa.string()),
         pa.field("ts", pa.timestamp("ms", tz="UTC")),
     ]
 )
@@ -205,6 +206,7 @@ def write_events(records: list[dict]) -> None:
                 "weather_factor": arr("weather_factor", pa.float32()),
                 "traffic_factor": arr("traffic_factor", pa.float32()),
                 "source": pa.array([x.get("source", "") for x in items]),
+                "source_platform": pa.array([x.get("source_platform", "") for x in items]),
                 "ts": ts_array,
             },
             schema=EVENT_SCHEMA,
@@ -255,7 +257,8 @@ def parse_offer(raw: bytes, topic: str) -> dict:
         "supply_index": None,
         "weather_factor": msg.weather_factor,
         "traffic_factor": msg.traffic_factor,
-        "source": "synthetic-marketplace",
+        "source": "normalized-order-offer",
+        "source_platform": msg.source_platform or "unknown",
         "ts": msg.ts,
     }
 
@@ -286,7 +289,8 @@ def parse_order_event(raw: bytes, topic: str) -> dict:
         "supply_index": None,
         "weather_factor": None,
         "traffic_factor": None,
-        "source": "synthetic-marketplace",
+        "source": "normalized-order-event",
+        "source_platform": msg.source_platform or "unknown",
         "ts": msg.ts,
     }
 
@@ -318,6 +322,7 @@ def parse_context(raw: bytes, topic: str) -> dict:
         "weather_factor": msg.weather_factor,
         "traffic_factor": msg.traffic_factor,
         "source": msg.source,
+        "source_platform": "context_poller_public",
         "ts": msg.ts,
     }
 

@@ -325,7 +325,8 @@ This repository now includes a local-first copilot workflow for courier decision
 
 - `copilot-features`: consumes offers/context and writes realtime feature vectors into Redis.
 - `driver-ingest`: secure HTTP gateway for real mobile GPS ingestion (`CourierPositionV1` -> `livreurs-gps`).
-- `uber-driver-connector`: optional connector to Uber Driver API (`/partners/me`, `/partners/trips`) that publishes normalized events to `order-events-v1`.
+- `driver-ingest` now carries a platform-agnostic contract via `source_platform`
+  (Uber Eats, DoorDash, Deliveroo, custom adapters) while keeping the same protobuf backbone.
 - Existing services (`tlc-replay`, `context-poller`, `hot-consumer`, `cold-consumer`, `api`) now support the copilot event flow.
 
 ### New API endpoints

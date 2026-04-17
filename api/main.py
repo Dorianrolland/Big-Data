@@ -29,7 +29,7 @@ from redis.exceptions import RedisError
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import Gauge
 from prometheus_fastapi_instrumentator import Instrumentator
@@ -51,6 +51,8 @@ DATA_PATH = Path(os.getenv("DATA_PATH", "/data/parquet"))
 REDIS_CONNECT_TIMEOUT_SECONDS = float(os.getenv("REDIS_CONNECT_TIMEOUT_SECONDS", "1.5"))
 REDIS_OP_TIMEOUT_SECONDS = float(os.getenv("REDIS_OP_TIMEOUT_SECONDS", "6.0"))
 DUCKDB_QUERY_TIMEOUT_SECONDS = float(os.getenv("DUCKDB_QUERY_TIMEOUT_SECONDS", "12.0"))
+TLC_SCENARIO = (os.getenv("TLC_SCENARIO", "fleet") or "fleet").strip().lower()
+TLC_SINGLE_DRIVER_ID = (os.getenv("TLC_SINGLE_DRIVER_ID", "drv_demo_001") or "drv_demo_001").strip()
 
 GEO_KEY          = "fleet:geo"
 HASH_PREFIX      = "fleet:livreur:"
@@ -261,8 +263,10 @@ if _DASHBOARD_DIR.exists():
 app.include_router(copilot_router)
 
 @app.get("/map", include_in_schema=False)
-async def live_map():
+async def live_map(request: Request):
     """Dashboard HTML live — carte Leaflet sans clignotement."""
+    if TLC_SCENARIO == "single_driver" and not request.query_params.get("focus"):
+        return RedirectResponse(url=f"/map?focus={TLC_SINGLE_DRIVER_ID}", status_code=307)
     p = Path(__file__).parent / "static" / "index.html"
     if p.exists():
         return FileResponse(str(p), media_type="text/html")

@@ -66,12 +66,13 @@ TLC_MAX_ACTIVE_TRIPS = int(os.getenv("TLC_MAX_ACTIVE_TRIPS", "800"))
 TLC_INGEST_BATCH_SIZE = int(os.getenv("TLC_INGEST_BATCH_SIZE", "2000"))
 TLC_LOOP_ON_FINISH = os.getenv("TLC_LOOP_ON_FINISH", "true").lower() in {"1", "true", "yes", "on"}
 
-TLC_SCENARIO = os.getenv("TLC_SCENARIO", "fleet").strip().lower() or "fleet"
+TLC_SCENARIO = os.getenv("TLC_SCENARIO", "single_driver").strip().lower() or "single_driver"
 TLC_RESET_RUNTIME_ON_START = os.getenv("TLC_RESET_RUNTIME_ON_START", "false").lower() in {
     "1", "true", "yes", "on",
 }
 TLC_TRAIN_MONTH_COUNT = int(os.getenv("TLC_TRAIN_MONTH_COUNT", "0") or "0")
 TLC_LIVE_MONTH_COUNT = int(os.getenv("TLC_LIVE_MONTH_COUNT", "0") or "0")
+TLC_SOURCE_PLATFORM = (os.getenv("TLC_SOURCE_PLATFORM", "tlc_hvfhv_historical") or "tlc_hvfhv_historical").strip()
 
 STATUS_KEY = "copilot:replay:tlc:status"
 CURSOR_KEY = "copilot:replay:tlc:cursor"
@@ -529,6 +530,7 @@ class TLCReplay:
             weather_factor=1.0,
             traffic_factor=1.0,
             zone_id=f"nyc_{trip.pu_loc}",
+            source_platform=TLC_SOURCE_PLATFORM,
         )
 
     def _build_event(self, trip: Trip, status: str, ts: datetime, actuals: bool) -> OrderEventV1:
@@ -544,6 +546,7 @@ class TLCReplay:
             actual_distance_km=trip.trip_km if actuals else 0.0,
             actual_duration_min=trip.trip_min if actuals else 0.0,
             zone_id=f"nyc_{trip.pu_loc}",
+            source_platform=TLC_SOURCE_PLATFORM,
         )
 
     def _build_position(self, trip: Trip, lat: float, lon: float, ts: datetime, status: str) -> CourierPositionV1:
@@ -559,6 +562,7 @@ class TLCReplay:
             status=status,
             accuracy_m=8.0,
             battery_pct=100.0,
+            source_platform=TLC_SOURCE_PLATFORM,
         )
 
     async def _emit_trip_start(self, trip: Trip) -> None:
@@ -885,4 +889,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-

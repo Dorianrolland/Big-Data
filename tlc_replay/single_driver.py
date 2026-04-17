@@ -69,6 +69,9 @@ NIGHT_ACCEL_FACTOR = max(1, int(os.getenv("TLC_NIGHT_ACCEL_FACTOR", "8")))
 
 STATUS_KEY_SINGLE = "copilot:replay:tlc:single:status"
 CURSOR_KEY_SINGLE = "copilot:replay:tlc:single:cursor"
+SINGLE_SOURCE_PLATFORM = (
+    os.getenv("TLC_SOURCE_PLATFORM", "tlc_hvfhv_historical") or "tlc_hvfhv_historical"
+).strip()
 
 
 def _parse_hhmm(value: str, fallback: dtime) -> dtime:
@@ -140,6 +143,9 @@ class SingleDriverScenario:
         self.stats_reposition = 0
         self.stats_lunch = 0
         self.stats_routing_errors = 0
+        self.stats_route_requests = 0
+        self.stats_route_success = 0
+        self.stats_hold_ticks = 0
         self._active_trip: "Trip | None" = None
         self._active_trip_route: Route | None = None
         self._active_trip_cum: list[float] = []
@@ -222,6 +228,7 @@ class SingleDriverScenario:
             status=status,
             accuracy_m=8.0,
             battery_pct=100.0,
+            source_platform=SINGLE_SOURCE_PLATFORM,
         )
         await self.replay._send(_courier_topic(), SINGLE_DRIVER_ID, pos.SerializeToString())
         self.stats_positions += 1
@@ -245,6 +252,7 @@ class SingleDriverScenario:
             weather_factor=1.0,
             traffic_factor=1.0,
             zone_id=f"nyc_{trip.pu_loc}",
+            source_platform=SINGLE_SOURCE_PLATFORM,
         )
         await self.replay._send(_offers_topic(), SINGLE_DRIVER_ID, offer.SerializeToString())
 
@@ -261,12 +269,23 @@ class SingleDriverScenario:
             actual_distance_km=trip.trip_km if actuals else 0.0,
             actual_duration_min=trip.trip_min if actuals else 0.0,
             zone_id=f"nyc_{trip.pu_loc}",
+            source_platform=SINGLE_SOURCE_PLATFORM,
         )
         await self.replay._send(_events_topic(), SINGLE_DRIVER_ID, evt.SerializeToString())
 
     async def _status(self, vt: datetime) -> None:
         if self.replay.redis is None:
             return
+        route_success_rate = (
+            self.stats_route_success / self.stats_route_requests
+            if self.stats_route_requests > 0
+            else 0.0
+        )
+        hold_ratio = (
+            self.stats_hold_ticks / self.stats_positions
+            if self.stats_positions > 0
+            else 0.0
+        )
         payload = {
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "virtual_time": vt.astimezone(timezone.utc).isoformat(),
@@ -276,6 +295,11 @@ class SingleDriverScenario:
             "repositions": str(self.stats_reposition),
             "lunch_breaks": str(self.stats_lunch),
             "routing_errors": str(self.stats_routing_errors),
+            "route_requests": str(self.stats_route_requests),
+            "route_successes": str(self.stats_route_success),
+            "hold_ticks": str(self.stats_hold_ticks),
+            "routing_success_rate": f"{route_success_rate:.4f}",
+            "hold_ratio": f"{hold_ratio:.4f}",
             "routing_providers": ",".join(self.routing.active_providers),
             "routing_health_json": json.dumps(self._startup_health, separators=(",", ":"), sort_keys=True),
             "routing_degraded": "1" if self._is_routing_degraded() else "0",
@@ -505,6 +529,7 @@ class SingleDriverScenario:
         assert self.state is not None
         origin = (self.state.lat, self.state.lon)
         dest = (trip.pickup_lat, trip.pickup_lon)
+        self.stats_route_requests += 1
         try:
             route = await self.routing.route_segment(origin, dest)
         except RoutingUnavailableError as exc:
@@ -517,6 +542,7 @@ class SingleDriverScenario:
             return
 
         self.state.stale_reason = None
+        self.stats_route_success += 1
         self.stats_reposition += 1
         self.state.last_route = route
         self.state.last_route_cumkm = cumulative_distances_km(route.geometry)
@@ -533,6 +559,7 @@ class SingleDriverScenario:
         assert self.state is not None
         origin = (trip.pickup_lat, trip.pickup_lon)
         dest = (trip.dropoff_lat, trip.dropoff_lon)
+        self.stats_route_requests += 1
         try:
             route = await self.routing.route_segment(origin, dest)
         except RoutingUnavailableError as exc:
@@ -547,6 +574,7 @@ class SingleDriverScenario:
             self.state.route_end = trip.dropoff_ts
             return
         self.state.stale_reason = None
+        self.stats_route_success += 1
         self._active_trip = trip
         self._active_trip_route = route
         self._active_trip_cum = cumulative_distances_km(route.geometry)
@@ -563,6 +591,7 @@ class SingleDriverScenario:
         end = self.state.route_end
         if route is None or start is None or end is None or end <= start:
             # degraded / held: emit keepalive at last point
+            self.stats_hold_ticks += 1
             await self._emit_position(vt, target_status, 0.0)
             return
         elapsed = (vt - start).total_seconds()

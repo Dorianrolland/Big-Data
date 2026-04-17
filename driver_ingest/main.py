@@ -112,6 +112,7 @@ class PositionIn(BaseModel):
     status: Literal["available", "delivering", "idle", "pickup_arrived", "unknown"] = "unknown"
     accuracy_m: float = Field(8.0, ge=0.0, le=10000.0)
     battery_pct: float = Field(100.0, ge=0.0, le=100.0)
+    source_platform: str = Field("driver_ingest", min_length=2, max_length=64)
     ts: str | None = None
 
 
@@ -219,6 +220,7 @@ def _to_proto(position: PositionIn) -> tuple[str, bytes]:
         status=position.status,
         accuracy_m=float(position.accuracy_m),
         battery_pct=float(position.battery_pct),
+        source_platform=position.source_platform,
     )
     return event_id, payload.SerializeToString()
 

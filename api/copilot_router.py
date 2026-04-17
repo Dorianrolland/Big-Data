@@ -48,10 +48,12 @@ GBFS_KEY = "copilot:context:gbfs"
 IRVE_KEY = "copilot:context:irve"
 TLC_REPLAY_KEY = "copilot:replay:tlc:status"
 FUEL_CONTEXT_KEY = "copilot:context:fuel"
+CONTEXT_QUALITY_KEY = "copilot:context:quality"
 ZONE_CONTEXT_PREFIX = "copilot:context:zone:"
 OFFER_KEY_PREFIX = "copilot:offer:"
 DRIVER_OFFERS_PREFIX = "copilot:driver:"
 COURIER_HASH_PREFIX = "fleet:livreur:"
+SINGLE_REPLAY_STATUS_KEY = "copilot:replay:tlc:single:status"
 MISSION_JOURNAL_PREFIX = "copilot:mission:journal:"
 MISSION_JOURNAL_MAX_ITEMS = int(os.getenv("COPILOT_MISSION_JOURNAL_MAX_ITEMS", "200"))
 FUEL_CONTEXT_TTL_SECONDS = int(os.getenv("COPILOT_FUEL_CONTEXT_TTL_SECONDS", "86400"))
@@ -2336,7 +2338,18 @@ async def copilot_health(request: Request):
     gbfs = await redis_client.hgetall(GBFS_KEY)
     irve = await redis_client.hgetall(IRVE_KEY)
     fuel = await redis_client.hgetall(FUEL_CONTEXT_KEY)
+    context_quality = await redis_client.hgetall(CONTEXT_QUALITY_KEY)
     tlc_replay = await redis_client.hgetall(TLC_REPLAY_KEY)
+    single_replay = await redis_client.hgetall(SINGLE_REPLAY_STATUS_KEY)
+
+    route_requests = int(_as_float(single_replay.get("route_requests"), 0.0))
+    route_successes = int(_as_float(single_replay.get("route_successes"), 0.0))
+    hold_ticks = int(_as_float(single_replay.get("hold_ticks"), 0.0))
+    positions = int(_as_float(single_replay.get("positions"), 0.0))
+    routing_success_rate = (
+        round(route_successes / route_requests, 4) if route_requests > 0 else None
+    )
+    hold_rate = round(hold_ticks / positions, 4) if positions > 0 else None
 
     return {
         "model_loaded": bool(model_payload),
@@ -2369,6 +2382,30 @@ async def copilot_health(request: Request):
             "fuel_sync_status": fuel.get("fuel_sync_status"),
             "fuel_sync_checked_at": fuel.get("fuel_sync_checked_at"),
             "updated_at": fuel.get("updated_at"),
+        },
+        "data_quality": {
+            "supply_key": context_quality.get("supply_key"),
+            "supply_variance": round(_as_float(context_quality.get("supply_variance"), 0.0), 6),
+            "supply_window_span": round(_as_float(context_quality.get("supply_window_span"), 0.0), 6),
+            "supply_window_cycles": int(_as_float(context_quality.get("supply_window_cycles"), 0.0)),
+            "supply_flat_alert": _as_bool(context_quality.get("supply_flat_alert"), False),
+            "traffic_nonzero_rate": round(_as_float(context_quality.get("traffic_nonzero_rate"), 0.0), 4),
+            "traffic_mean": round(_as_float(context_quality.get("traffic_mean"), 1.0), 4),
+            "updated_at": context_quality.get("updated_at"),
+        },
+        "routing_quality": {
+            "driver_id": single_replay.get("driver_id"),
+            "state": single_replay.get("state"),
+            "routing_degraded": _as_bool(single_replay.get("routing_degraded"), False),
+            "routing_last_error": single_replay.get("routing_last_error"),
+            "route_requests": route_requests,
+            "route_successes": route_successes,
+            "routing_success_rate": routing_success_rate,
+            "hold_ticks": hold_ticks,
+            "hold_rate": hold_rate,
+            "routing_errors": int(_as_float(single_replay.get("routing_errors"), 0.0)),
+            "providers": [p for p in (single_replay.get("routing_providers") or "").split(",") if p],
+            "updated_at": single_replay.get("updated_at"),
         },
         "tlc_replay": tlc_replay,
         "events_path": str(EVENTS_PATH),
