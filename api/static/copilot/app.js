@@ -18,6 +18,11 @@ const state = {
   missionJournalDriver: null,
   zones: [],
   replay: [],
+  selectedOfferKey: null,
+  selectedOfferSource: null,
+  flowStep: 'choose',
+  lastScoredOfferId: null,
+  lastActionSummary: null,
   autoRefreshTimer: null,
 };
 
@@ -58,6 +63,7 @@ const dispatchLegendEl = $('dispatchLegend');
 const zonesEl = $('zones');
 const replaySummary = $('replaySummary');
 const replayTimeline = $('replayTimeline');
+const uxStatusLine = $('uxStatusLine');
 
 const scoreProb = $('scoreProb');
 const scoreDecision = $('scoreDecision');
@@ -106,10 +112,19 @@ const journalSuccessRateEl = $('journalSuccessRate');
 const journalRealizedDeltaEl = $('journalRealizedDelta');
 const journalPredictedDeltaEl = $('journalPredictedDelta');
 const journalAvgElapsedEl = $('journalAvgElapsed');
+const flowStepChooseEl = $('flowStepChoose');
+const flowStepScoreEl = $('flowStepScore');
+const flowStepActionEl = $('flowStepAction');
+const decisionStatusEl = $('decisionStatus');
+const decisionOfferCardEl = $('decisionOfferCard');
+const decisionQuickScoreBtn = $('decisionQuickScoreBtn');
+const decisionScoreBtn = $('decisionScoreBtn');
+const decisionActionBtn = $('decisionActionBtn');
 
 const API_TIMEOUT_MS = 12000;
 const API_RETRY_DELAY_MS = 350;
 const API_RETRY_GET = 1;
+const UI_STATE_TYPES = ['loading', 'error', 'empty', 'success'];
 
 function waitMs(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -120,6 +135,21 @@ function normalizeApiError(error) {
     return new Error('Request timeout');
   }
   return error instanceof Error ? error : new Error(String(error || 'Request failed'));
+}
+
+function errorMessage(error, fallback = 'Request failed') {
+  if (error instanceof Error && error.message) return error.message;
+  const msg = String(error || '').trim();
+  return msg || fallback;
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
 }
 
 async function api(path, opts = {}) {
@@ -171,6 +201,42 @@ async function api(path, opts = {}) {
 function fmt(num, digits = 2) {
   if (!Number.isFinite(Number(num))) return '-';
   return Number(num).toFixed(digits);
+}
+
+function renderListState(target, type, text) {
+  if (!target) return;
+  const kind = UI_STATE_TYPES.includes(type) ? type : 'empty';
+  target.setAttribute('aria-busy', kind === 'loading' ? 'true' : 'false');
+  target.innerHTML = '';
+  const node = document.createElement('div');
+  node.className = `state-message ${kind}`;
+  node.textContent = String(text || '').trim();
+  target.appendChild(node);
+}
+
+function setUxStatus(type, text) {
+  if (!uxStatusLine) return;
+  uxStatusLine.className = `state-message ${UI_STATE_TYPES.includes(type) ? type : 'loading'}`;
+  uxStatusLine.textContent = text;
+}
+
+async function withBusyButton(button, pendingLabel, action) {
+  if (typeof action !== 'function') {
+    return undefined;
+  }
+  if (!button) {
+    return action();
+  }
+  const prevDisabled = Boolean(button.disabled);
+  const prevLabel = button.textContent;
+  button.disabled = true;
+  if (pendingLabel) button.textContent = pendingLabel;
+  try {
+    return await action();
+  } finally {
+    button.disabled = prevDisabled;
+    button.textContent = prevLabel;
+  }
 }
 
 function toIso(ts) {
@@ -266,7 +332,7 @@ function formatExplanationDetail(detail) {
     renderedValue = unitLabel === '%' ? `${renderedValue}${unitLabel}` : `${renderedValue} ${unitLabel}`;
   }
   const impact = String(detail.impact || 'neutral').toUpperCase();
-  return `${label}: ${renderedValue} (${impact})`;
+  return `${escapeHtml(label)}: ${escapeHtml(renderedValue)} (${escapeHtml(impact)})`;
 }
 
 function explanationDetailChips(details, limit = 2) {
@@ -284,6 +350,163 @@ function routeSummary(offer) {
     return `route ${src}`;
   }
   return `route ${src} - ${fmt(dist, 1)} km / ${fmt(dur, 1)} min`;
+}
+
+function offerKey(offer, source, indexHint = 0) {
+  const offerId = String(offer?.offer_id || '').trim();
+  if (offerId) return `offer:${offerId}`;
+  const zoneId = String(offer?.zone_id || 'zone').trim();
+  return `${source}:${zoneId}:${indexHint}`;
+}
+
+function allOfferCandidates() {
+  const best = state.bestOffers.map((offer, idx) => ({
+    offer,
+    source: 'best',
+    key: offerKey(offer, 'best', idx),
+  }));
+  const latest = state.offers.map((offer, idx) => ({
+    offer,
+    source: 'offers',
+    key: offerKey(offer, 'offers', idx),
+  }));
+  return [...best, ...latest];
+}
+
+function getSelectedOfferCandidate() {
+  if (!state.selectedOfferKey) return null;
+  return allOfferCandidates().find((item) => item.key === state.selectedOfferKey) || null;
+}
+
+function getTopOfferCandidate() {
+  const candidates = allOfferCandidates();
+  return candidates.length ? candidates[0] : null;
+}
+
+function ensureSelectedOffer() {
+  const selected = getSelectedOfferCandidate();
+  if (selected) return selected;
+  const fallback = getTopOfferCandidate();
+  if (!fallback) {
+    state.selectedOfferKey = null;
+    state.selectedOfferSource = null;
+    return null;
+  }
+  state.selectedOfferKey = fallback.key;
+  state.selectedOfferSource = fallback.source;
+  return fallback;
+}
+
+function setFlowStep(step) {
+  const allowed = ['choose', 'score', 'action'];
+  state.flowStep = allowed.includes(step) ? step : 'choose';
+  const order = ['choose', 'score', 'action'];
+  const level = Math.max(0, order.indexOf(state.flowStep));
+  const nodes = [flowStepChooseEl, flowStepScoreEl, flowStepActionEl];
+  nodes.forEach((node, idx) => {
+    if (!node) return;
+    node.classList.toggle('active', idx <= level);
+  });
+}
+
+function offerMetricsHtml(offer) {
+  const costs = offer && typeof offer.costs === 'object' && offer.costs ? offer.costs : {};
+  const eta = Number(offer?.route_duration_min);
+  const netHourly = Number(offer?.eur_per_hour_net);
+  const netTrip = Number(offer?.estimated_net_eur);
+  const fuel = Number(costs.fuel_cost_eur);
+  const platform = Number(costs.platform_fee_eur);
+  const targetGap = Number(offer?.target_gap_eur_h);
+  const costTotal = Number.isFinite(fuel) || Number.isFinite(platform)
+    ? `${fmt(fuel, 2)} / ${fmt(platform, 2)}`
+    : '-';
+  const gapText = Number.isFinite(targetGap) ? fmtSigned(targetGap, 1) : '-';
+
+  return `
+    <div class="offer-metrics">
+      <div class="offer-metric"><div class="k">Net EUR/h</div><div class="v">${fmt(netHourly, 1)}</div></div>
+      <div class="offer-metric"><div class="k">Net Trip</div><div class="v">${fmt(netTrip, 2)}</div></div>
+      <div class="offer-metric"><div class="k">ETA min</div><div class="v">${fmt(eta, 1)}</div></div>
+      <div class="offer-metric"><div class="k">Fuel/Fee</div><div class="v">${costTotal}</div></div>
+    </div>
+    <div class="muted">target gap ${gapText} EUR/h</div>
+  `;
+}
+
+function resolveSelectedActionRoute() {
+  const selected = getSelectedOfferCandidate();
+  if (!selected || !selected.offer) return null;
+  const offer = selected.offer;
+  const originLat = asFloatOrNull(state.dispatch?.origin?.lat);
+  const originLon = asFloatOrNull(state.dispatch?.origin?.lon);
+
+  const candidateLats = [offer.zone_lat, offer.pickup_lat, offer.dest_lat, offer.dropoff_lat];
+  const candidateLons = [offer.zone_lon, offer.pickup_lon, offer.dest_lon, offer.dropoff_lon];
+  let destLat = candidateLats.map(asFloatOrNull).find((x) => x != null) ?? null;
+  let destLon = candidateLons.map(asFloatOrNull).find((x) => x != null) ?? null;
+  if ((destLat == null || destLon == null) && state.dispatch && Array.isArray(state.dispatch.reposition_candidates)) {
+    const matched = state.dispatch.reposition_candidates.find((z) => String(z.zone_id || '') === String(offer.zone_id || ''));
+    if (matched) {
+      destLat = asFloatOrNull(matched.zone_lat);
+      destLon = asFloatOrNull(matched.zone_lon);
+    }
+  }
+  if (originLat == null || originLon == null || destLat == null || destLon == null) {
+    return null;
+  }
+  return { originLat, originLon, destLat, destLon };
+}
+
+function renderDecisionFlow() {
+  const selected = ensureSelectedOffer();
+  if (!decisionOfferCardEl || !decisionStatusEl || !decisionScoreBtn || !decisionActionBtn) return;
+
+  if (!selected) {
+    decisionOfferCardEl.className = 'offer';
+    decisionOfferCardEl.innerHTML = '<div class="muted">No offer selected yet.</div>';
+    decisionStatusEl.className = 'state-message empty';
+    decisionStatusEl.textContent = 'Choose an offer to start the 3-step flow.';
+    decisionScoreBtn.disabled = true;
+    decisionActionBtn.disabled = true;
+    setFlowStep('choose');
+    return;
+  }
+
+  const offer = selected.offer;
+  const action = String(offer.recommendation_action || offer.decision || 'consider').toUpperCase();
+  decisionOfferCardEl.className = 'offer selected';
+  decisionOfferCardEl.innerHTML = `
+    <div class="offer-top">
+      <strong>${escapeHtml(offer.offer_id || 'offer')}</strong>
+      <span class="badge ${asRecommendationClass(String(offer.recommendation_action || offer.decision || '').toLowerCase())}">${escapeHtml(action)}</span>
+    </div>
+    <div class="offer-meta">
+      <span class="muted">source ${escapeHtml(selected.source)}</span>
+      <span><strong>${fmt(offer.accept_score, 3)}</strong> score - ${escapeHtml(String(offer.model_used || 'heuristic'))}</span>
+    </div>
+    ${offerMetricsHtml(offer)}
+    <div class="muted">${escapeHtml(routeSummary(offer))}</div>
+  `;
+
+  const canRoute = Boolean(resolveSelectedActionRoute());
+  decisionScoreBtn.disabled = false;
+  decisionActionBtn.disabled = !canRoute;
+  decisionActionBtn.textContent = canRoute ? 'Open Action Route' : 'Route Unavailable';
+  if (state.flowStep === 'action' && state.lastActionSummary) {
+    decisionStatusEl.className = 'state-message success';
+    decisionStatusEl.textContent = state.lastActionSummary;
+    setFlowStep('action');
+    return;
+  }
+  if (state.lastScoredOfferId && String(state.lastScoredOfferId) === String(offer.offer_id || '')) {
+    decisionStatusEl.className = 'state-message success';
+    decisionStatusEl.textContent = `Scored ${offer.offer_id || 'offer'}. Final step: run action route.`;
+    setFlowStep('score');
+    return;
+  }
+  decisionStatusEl.className = 'state-message loading';
+  decisionStatusEl.textContent = `Selected ${offer.offer_id || 'offer'}. Step 2: score it. Step 3: execute route action.`;
+  setFlowStep('choose');
 }
 
 const dispatchMapState = {
@@ -1083,7 +1306,7 @@ async function submitMissionReportIfNeeded(mission) {
     await refreshMissionJournal(false);
   } catch (err) {
     mission.reportSubmitting = false;
-    mission.reportError = err.message;
+    mission.reportError = errorMessage(err, 'mission report failed');
   } finally {
     renderMissionPanel();
   }
@@ -1145,6 +1368,10 @@ function renderMissionJournal() {
     .map((mission, idx) => {
       const success = Boolean(mission.success);
       const completed = mission.completed_at ? new Date(mission.completed_at).toLocaleString() : '-';
+      const safeZone = escapeHtml(mission.zone_id || 'zone');
+      const safeStrategy = escapeHtml(String(mission.dispatch_strategy || 'balanced').toUpperCase());
+      const safeCompleted = escapeHtml(completed);
+      const safeStopReason = escapeHtml(mission.stop_reason || '-');
       const realizedDelta = Number.isFinite(Number(mission.realized_delta_eur_h))
         ? `${fmtSigned(mission.realized_delta_eur_h, 2)} EUR/h`
         : '-';
@@ -1155,18 +1382,18 @@ function renderMissionJournal() {
       return `
         <article class="offer">
           <div class="offer-top">
-            <strong>#${idx + 1} ${mission.zone_id || 'zone'} - ${String(mission.dispatch_strategy || 'balanced').toUpperCase()}</strong>
+            <strong>#${idx + 1} ${safeZone} - ${safeStrategy}</strong>
             <span class="badge ${success ? 'accept' : 'reject'}">${success ? 'SUCCESS' : 'MISSED'}</span>
           </div>
           <div class="offer-meta">
-            <span class="muted">${completed}</span>
+            <span class="muted">${safeCompleted}</span>
             <span>${elapsed}</span>
           </div>
           <div class="offer-meta">
             <span>pred ${predictedDelta}</span>
             <span>real ${realizedDelta}</span>
           </div>
-          <div class="muted">reason: ${mission.stop_reason || '-'}</div>
+          <div class="muted">reason: ${safeStopReason}</div>
         </article>
       `;
     })
@@ -1186,7 +1413,7 @@ async function refreshMissionJournal(showLoading) {
   } catch (err) {
     state.missionJournal = [];
     state.missionJournalStats = null;
-    state.missionJournalError = err.message;
+    state.missionJournalError = errorMessage(err, 'mission journal unavailable');
   }
   renderMissionJournal();
 }
@@ -1266,13 +1493,20 @@ function renderOffers() {
   offersEl.innerHTML = '';
 
   if (!rows.length) {
-    offersEl.innerHTML = '<div class="muted">No offer matches the current filter.</div>';
+    renderListState(offersEl, 'empty', 'No offer matches the current filter.');
     return;
   }
 
-  rows.forEach((offer) => {
+  rows.forEach((offer, idx) => {
     const card = document.createElement('article');
-    card.className = 'offer';
+    const key = offerKey(offer, 'offers', idx);
+    const isSelected = key === state.selectedOfferKey;
+    card.className = `offer selectable${isSelected ? ' selected' : ''}`;
+    card.setAttribute('data-offer-key', key);
+    card.setAttribute('tabindex', '0');
+    card.setAttribute('role', 'button');
+    card.setAttribute('aria-pressed', isSelected ? 'true' : 'false');
+    card.setAttribute('aria-label', `Select offer ${String(offer.offer_id || idx + 1)}`);
 
     const reasons = Array.isArray(offer.explanation) ? offer.explanation : [];
     const detailChips = explanationDetailChips(offer.explanation_details, 2);
@@ -1280,17 +1514,20 @@ function renderOffers() {
 
     card.innerHTML = `
       <div class="offer-top">
-        <strong>${offer.offer_id || 'manual-offer'}</strong>
-        <span class="badge ${asDecisionClass(offer.decision)}">${(offer.decision || 'n/a').toUpperCase()}</span>
+        <strong>${escapeHtml(offer.offer_id || 'manual-offer')}</strong>
+        <span class="badge ${asDecisionClass(offer.decision)}">${escapeHtml((offer.decision || 'n/a').toUpperCase())}</span>
       </div>
       <div class="offer-meta">
-        <span class="muted">zone ${zone}</span>
-        <span><strong>${fmt(offer.accept_score, 3)}</strong> score - <strong>${fmt(offer.eur_per_hour_net, 1)}</strong> EUR/h - ${String(offer.model_used || 'heuristic')}</span>
+        <span class="muted">zone ${escapeHtml(zone)}</span>
+        <span><strong>${fmt(offer.accept_score, 3)}</strong> score - ${escapeHtml(String(offer.model_used || 'heuristic'))}</span>
       </div>
-      <div class="muted">${routeSummary(offer)}</div>
-      <div class="chips">${reasons.map((r) => `<span>${humanizeReason(r)}</span>`).join('')}${detailChips}</div>
+      ${offerMetricsHtml(offer)}
+      <div class="muted">${escapeHtml(routeSummary(offer))}</div>
+      <div class="chips">${reasons.map((r) => `<span>${escapeHtml(humanizeReason(r))}</span>`).join('')}${detailChips}</div>
       <div class="offer-actions">
-        <button class="ghost" data-action="score-offer" data-offer-id="${offer.offer_id || ''}" data-courier-id="${offer.courier_id || ''}">Score This Offer</button>
+        <button class="ghost" data-action="pick-offer" data-offer-key="${key}">Choose</button>
+        <button data-action="pick-score-offer" data-offer-key="${key}">Pick + Score</button>
+        <button class="ghost" data-action="score-offer" data-offer-id="${escapeHtml(offer.offer_id || '')}" data-courier-id="${escapeHtml(offer.courier_id || '')}">Score</button>
       </div>
     `;
 
@@ -1302,18 +1539,25 @@ function renderBestOffers() {
   bestOffersEl.innerHTML = '';
 
   if (state.bestOffersError) {
-    bestOffersEl.innerHTML = `<div class="muted">Best offers unavailable: ${state.bestOffersError}</div>`;
+    renderListState(bestOffersEl, 'error', `Best offers unavailable: ${state.bestOffersError}`);
     return;
   }
 
   if (!state.bestOffers.length) {
-    bestOffersEl.innerHTML = '<div class="muted">No profitable nearby offers for current filters.</div>';
+    renderListState(bestOffersEl, 'empty', 'No profitable nearby offers for current filters.');
     return;
   }
 
   state.bestOffers.forEach((offer, idx) => {
     const card = document.createElement('article');
-    card.className = 'offer';
+    const key = offerKey(offer, 'best', idx);
+    const isSelected = key === state.selectedOfferKey;
+    card.className = `offer selectable${isSelected ? ' selected' : ''}`;
+    card.setAttribute('data-offer-key', key);
+    card.setAttribute('tabindex', '0');
+    card.setAttribute('role', 'button');
+    card.setAttribute('aria-pressed', isSelected ? 'true' : 'false');
+    card.setAttribute('aria-label', `Select best offer ${String(offer.offer_id || idx + 1)}`);
 
     const reasons = Array.isArray(offer.explanation) ? offer.explanation : [];
     const signals = Array.isArray(offer.recommendation_signals) ? offer.recommendation_signals : [];
@@ -1321,25 +1565,28 @@ function renderBestOffers() {
     const details = explanationDetailChips(offer.explanation_details, 2);
 
     const chips = [...reasons, ...signals, ...routeNotes]
-      .map((r) => `<span>${humanizeReason(r)}</span>`)
+      .map((r) => `<span>${escapeHtml(humanizeReason(r))}</span>`)
       .join('') + details;
 
     card.innerHTML = `
       <div class="offer-top">
-        <strong>#${idx + 1} ${offer.offer_id || 'offer'}</strong>
-        <span class="badge ${asRecommendationClass(offer.recommendation_action)}">${String(offer.recommendation_action || 'skip').toUpperCase()}</span>
+        <strong>#${idx + 1} ${escapeHtml(offer.offer_id || 'offer')}</strong>
+        <span class="badge ${asRecommendationClass(offer.recommendation_action)}">${escapeHtml(String(offer.recommendation_action || 'skip').toUpperCase())}</span>
       </div>
       <div class="offer-meta">
         <span class="muted">pickup ${fmt(offer.distance_to_pickup_km, 2)} km</span>
-        <span><strong>${fmt(offer.recommendation_score, 3)}</strong> rec - <strong>${fmt(offer.accept_score, 3)}</strong> ${String(offer.model_used || 'heuristic')}</span>
+        <span><strong>${fmt(offer.recommendation_score, 3)}</strong> rec - <strong>${fmt(offer.accept_score, 3)}</strong> ${escapeHtml(String(offer.model_used || 'heuristic'))}</span>
       </div>
+      ${offerMetricsHtml(offer)}
       <div class="offer-meta">
-        <span>${routeSummary(offer)}</span>
-        <span><strong>${fmt(offer.eur_per_hour_net, 1)}</strong> EUR/h</span>
+        <span>${escapeHtml(routeSummary(offer))}</span>
+        <span><strong>${fmt(offer.target_gap_eur_h, 1)}</strong> gap EUR/h</span>
       </div>
       <div class="chips">${chips}</div>
       <div class="offer-actions">
-        <button class="ghost" data-action="score-offer" data-offer-id="${offer.offer_id || ''}" data-courier-id="${offer.courier_id || ''}">Score This Offer</button>
+        <button class="ghost" data-action="pick-offer" data-offer-key="${key}">Choose</button>
+        <button data-action="pick-score-offer" data-offer-key="${key}">Pick + Score</button>
+        <button class="ghost" data-action="score-offer" data-offer-id="${escapeHtml(offer.offer_id || '')}" data-courier-id="${escapeHtml(offer.courier_id || '')}">Score</button>
       </div>
     `;
 
@@ -1352,6 +1599,7 @@ function renderDispatch() {
 
   if (state.dispatchError) {
     dispatchSummaryEl.textContent = `Dispatch unavailable: ${state.dispatchError}`;
+    renderListState(dispatchPlanEl, 'error', 'Instant dispatch could not be computed right now.');
     renderDispatchMap(null);
     return;
   }
@@ -1359,6 +1607,7 @@ function renderDispatch() {
   const plan = state.dispatch;
   if (!plan) {
     dispatchSummaryEl.textContent = 'No dispatch recommendation yet.';
+    renderListState(dispatchPlanEl, 'empty', 'Refresh driver data to compute dispatch recommendation.');
     renderDispatchMap(null);
     return;
   }
@@ -1371,12 +1620,14 @@ function renderDispatch() {
   const top = document.createElement('article');
   top.className = 'offer';
   const strategy = String(plan.dispatch_strategy || 'balanced').toUpperCase();
+  const decisionLabel = escapeHtml(decision.toUpperCase());
+  const strategyLabel = escapeHtml(strategy);
   top.innerHTML = `
     <div class="offer-top">
       <strong>Target ${fmt(plan.target_hourly_net_eur, 1)} EUR/h</strong>
-      <span class="badge ${asDispatchClass(decision)}">${decision.toUpperCase()}</span>
+      <span class="badge ${asDispatchClass(decision)}">${decisionLabel}</span>
     </div>
-    <div class="muted">Strategy ${strategy} - Local candidates ${Number(plan.local_candidates_count || 0)} - Reposition candidates ${Number(plan.reposition_candidates_count || 0)} - max ETA ${fmt(plan.max_reposition_eta_min, 1)} min (effective ${fmt(plan.effective_max_reposition_eta_min, 1)} min) - forecast ${fmt(plan.forecast_horizon_min, 0)} min (effective ${fmt(plan.effective_forecast_horizon_min, 0)} min)</div>
+    <div class="muted">Strategy ${strategyLabel} - Local candidates ${Number(plan.local_candidates_count || 0)} - Reposition candidates ${Number(plan.reposition_candidates_count || 0)} - max ETA ${fmt(plan.max_reposition_eta_min, 1)} min (effective ${fmt(plan.effective_max_reposition_eta_min, 1)} min) - forecast ${fmt(plan.forecast_horizon_min, 0)} min (effective ${fmt(plan.effective_forecast_horizon_min, 0)} min)</div>
   `;
   dispatchPlanEl.appendChild(top);
 
@@ -1386,24 +1637,28 @@ function renderDispatch() {
     card.className = 'offer';
     const signals = Array.isArray(stay.signals) ? stay.signals : [];
     const reasonsList = Array.isArray(stay.reasons) ? stay.reasons : [];
-    const chips = [...signals, ...reasonsList].slice(0, 8).map((r) => `<span>${humanizeReason(r)}</span>`).join('');
+    const chips = [...signals, ...reasonsList]
+      .slice(0, 8)
+      .map((r) => `<span>${escapeHtml(humanizeReason(r))}</span>`)
+      .join('');
 
     card.innerHTML = `
       <div class="offer-top">
-        <strong>Stay candidate - ${stay.offer_id || 'offer'}</strong>
-        <span class="badge ${asRecommendationClass(stay.recommendation_action)}">${String(stay.recommendation_action || 'consider').toUpperCase()}</span>
+        <strong>Stay candidate - ${escapeHtml(stay.offer_id || 'offer')}</strong>
+        <span class="badge ${asRecommendationClass(stay.recommendation_action)}">${escapeHtml(String(stay.recommendation_action || 'consider').toUpperCase())}</span>
       </div>
       <div class="offer-meta">
-        <span class="muted">zone ${stay.zone_id || '-'}</span>
+        <span class="muted">zone ${escapeHtml(stay.zone_id || '-')}</span>
         <span><strong>${fmt(stay.recommendation_score, 3)}</strong> rec - <strong>${fmt(stay.eur_per_hour_net, 1)}</strong> EUR/h</span>
       </div>
+      ${offerMetricsHtml(stay)}
       <div class="offer-meta">
         <span>pickup ${fmt(stay.distance_to_pickup_km, 2)} km</span>
-        <span>route ${stay.route_source || 'estimated'} - ${fmt(stay.route_duration_min, 1)} min</span>
+        <span>route ${escapeHtml(stay.route_source || 'estimated')} - ${fmt(stay.route_duration_min, 1)} min</span>
       </div>
       <div class="chips">${chips}</div>
       <div class="offer-actions">
-        <button class="ghost" data-action="score-offer" data-offer-id="${stay.offer_id || ''}" data-courier-id="${currentDriverId()}">Score This Offer</button>
+        <button class="ghost" data-action="score-offer" data-offer-id="${escapeHtml(stay.offer_id || '')}" data-courier-id="${escapeHtml(currentDriverId())}">Score</button>
       </div>
     `;
     dispatchPlanEl.appendChild(card);
@@ -1419,10 +1674,16 @@ function renderDispatch() {
     card.className = 'zone';
     card.innerHTML = `
       <div class="zone-top">
-        <strong>Reposition candidate - ${move.zone_id || 'zone'}</strong>
+        <strong>Reposition candidate - ${escapeHtml(move.zone_id || 'zone')}</strong>
         <span>${fmt(move.dispatch_score, 3)}</span>
       </div>
-      <div class="muted">ETA ${fmt(move.eta_min, 1)} min - ${fmt(move.route_distance_km, 1)} km - route ${move.route_source || 'estimated'}</div>
+      <div class="muted">ETA ${fmt(move.eta_min, 1)} min - ${fmt(move.route_distance_km, 1)} km - route ${escapeHtml(move.route_source || 'estimated')}</div>
+      <div class="offer-metrics">
+        <div class="offer-metric"><div class="k">Net EUR/h</div><div class="v">${fmt(move.risk_adjusted_potential_eur_h, 1)}</div></div>
+        <div class="offer-metric"><div class="k">Gross EUR/h</div><div class="v">${fmt(move.estimated_potential_eur_h, 1)}</div></div>
+        <div class="offer-metric"><div class="k">ETA min</div><div class="v">${fmt(move.eta_min, 1)}</div></div>
+        <div class="offer-metric"><div class="k">Reposition Cost</div><div class="v">${fmt(move.reposition_total_cost_eur, 2)}</div></div>
+      </div>
       <div class="muted">Gross ${fmt(move.estimated_potential_eur_h, 1)} EUR/h - Risk-adjusted ${fmt(move.risk_adjusted_potential_eur_h, 1)} EUR/h - net gain vs stay ${fmt(move.net_gain_vs_stay_eur_h, 1)} EUR/h</div>
       <div class="muted">fuel ${fmt(move.travel_cost_eur, 2)} EUR - time ${fmt(move.time_cost_eur, 2)} EUR - risk ${fmt(move.risk_cost_eur, 2)} EUR - total ${fmt(move.reposition_total_cost_eur, 2)} EUR</div>
       <div class="muted">demand ${fmt(move.demand_index, 2)} / supply ${fmt(move.supply_index, 2)} - forecast pressure ${fmt(move.forecast_pressure_ratio, 2)} - opportunity ${fmt(move.opportunity_score, 2)}</div>
@@ -1439,7 +1700,7 @@ function renderDispatch() {
         <button
           class="ghost"
           data-action="start-mission"
-          data-zone-id="${move.zone_id || 'zone'}"
+          data-zone-id="${escapeHtml(move.zone_id || 'zone')}"
           data-dest-lat="${zoneLat == null ? '' : zoneLat}"
           data-dest-lon="${zoneLon == null ? '' : zoneLon}"
           data-score="${fmt(move.dispatch_score, 3)}"
@@ -1461,7 +1722,7 @@ function renderZones() {
   const zones = state.zones.slice(0, 8);
 
   if (!zones.length) {
-    zonesEl.innerHTML = '<div class="muted">No zone recommendations yet.</div>';
+    renderListState(zonesEl, 'empty', 'No zone recommendations yet.');
     return;
   }
 
@@ -1503,8 +1764,14 @@ function renderZones() {
 
     row.innerHTML = `
       <div class="zone-top">
-        <strong>#${idx + 1} ${zone.zone_id || 'unknown_zone'}</strong>
+        <strong>#${idx + 1} ${escapeHtml(zone.zone_id || 'unknown_zone')}</strong>
         <span>${fmt(adjustedScore, 2)}</span>
+      </div>
+      <div class="offer-metrics">
+        <div class="offer-metric"><div class="k">Opportunity</div><div class="v">${fmt(adjustedScore, 2)}</div></div>
+        <div class="offer-metric"><div class="k">ETA min</div><div class="v">${fmt(repoTime, 1)}</div></div>
+        <div class="offer-metric"><div class="k">Fuel EUR</div><div class="v">${fmt(fuelCost, 2)}</div></div>
+        <div class="offer-metric"><div class="k">Distance km</div><div class="v">${fmt(distance, 2)}</div></div>
       </div>
       <div class="muted">demand ${fmt(zone.demand_index, 2)} / supply ${fmt(zone.supply_index, 2)} - weather ${fmt(zone.weather_factor, 2)} - traffic ${fmt(zone.traffic_factor, 2)}</div>
       ${costLine}
@@ -1524,7 +1791,7 @@ function renderReplay() {
 
   if (!events.length) {
     replaySummary.textContent = 'No replay events in selected window.';
-    replayTimeline.innerHTML = '<div class="muted">Try a wider window (Last 2h or Today).</div>';
+    renderListState(replayTimeline, 'empty', 'Try a wider window (Last 2h or Today).');
     return;
   }
 
@@ -1544,12 +1811,19 @@ function renderReplay() {
   replaySummary.textContent = `${events.length} events - ${summary} - window ${firstTs} -> ${lastTs}`;
 
   events.slice(-20).reverse().forEach((evt) => {
+    const eventType = escapeHtml(evt.event_type || 'event');
+    const status = escapeHtml(evt.status || 'n/a');
+    const offerId = escapeHtml(evt.offer_id || '-');
+    const orderId = escapeHtml(evt.order_id || '-');
+    const zoneId = escapeHtml(evt.zone_id || '-');
+    const ts = escapeHtml(evt.ts || '-');
+    const topic = escapeHtml(evt.topic || '-');
     const row = document.createElement('div');
     row.className = 'event-row';
     row.innerHTML = `
-      <strong>${evt.event_type || 'event'} - ${evt.status || 'n/a'}</strong>
-      <div>offer ${evt.offer_id || '-'} - order ${evt.order_id || '-'} - zone ${evt.zone_id || '-'}</div>
-      <div class="muted">${evt.ts} - topic ${evt.topic || '-'}</div>
+      <strong>${eventType} - ${status}</strong>
+      <div>offer ${offerId} - order ${orderId} - zone ${zoneId}</div>
+      <div class="muted">${ts} - topic ${topic}</div>
     `;
     replayTimeline.appendChild(row);
   });
@@ -1620,7 +1894,7 @@ async function refreshFuelContextNow(force = false) {
     const status = payload?.refresh_result?.status || payload?.fuel_sync_status || 'ok';
     if (missionStatusEl) missionStatusEl.textContent = `Fuel context sync status: ${status}.`;
   } catch (err) {
-    const msg = String(err?.message || '');
+    const msg = errorMessage(err, 'fuel sync failed');
     if (msg.includes('404')) {
       try {
         await api('/copilot/fuel-context');
@@ -1653,10 +1927,11 @@ async function refreshDriverData() {
     refreshMissionJournal(true).catch(() => {});
   }
 
-  offersEl.innerHTML = '<div class="muted">Loading offers...</div>';
-  bestOffersEl.innerHTML = '<div class="muted">Loading nearby recommendations...</div>';
+  setUxStatus('loading', `Refreshing offers, score, and action plan for ${driver}...`);
+  renderListState(offersEl, 'loading', 'Loading offers...');
+  renderListState(bestOffersEl, 'loading', 'Loading nearby recommendations...');
   dispatchSummaryEl.textContent = 'Loading instant dispatch recommendation...';
-  dispatchPlanEl.innerHTML = '';
+  renderListState(dispatchPlanEl, 'loading', 'Computing instant dispatch recommendation...');
   if (dispatchMapState.map) {
     clearDispatchLeafletLayers();
   } else {
@@ -1664,14 +1939,14 @@ async function refreshDriverData() {
     dispatchMapEl.textContent = 'Rendering dispatch map...';
   }
   dispatchLegendEl.innerHTML = '';
-  zonesEl.innerHTML = '<div class="muted">Loading zones...</div>';
+  renderListState(zonesEl, 'loading', 'Loading zones...');
 
   try {
     const [offersResp, zonesResp, bestResp, dispatchResp] = await Promise.all([
       api(`/copilot/driver/${encodeURIComponent(driver)}/offers?limit=${Math.max(limit, 20)}`),
       api(buildZoneQuery(driver)),
-      api(buildAroundQuery(driver)).catch((err) => ({ offers: [], _error: err.message })),
-      api(buildDispatchQuery(driver)).catch((err) => ({ _error: err.message })),
+      api(buildAroundQuery(driver)).catch((err) => ({ offers: [], _error: errorMessage(err, 'best offers unavailable') })),
+      api(buildDispatchQuery(driver)).catch((err) => ({ _error: errorMessage(err, 'dispatch unavailable') })),
     ]);
 
     state.offers = Array.isArray(offersResp.offers) ? offersResp.offers : [];
@@ -1682,15 +1957,19 @@ async function refreshDriverData() {
     state.dispatchError = dispatchResp._error || null;
 
     renderKpis();
+    ensureSelectedOffer();
     renderOffers();
     renderBestOffers();
     renderDispatch();
     renderMissionPanel();
     renderZones();
+    renderDecisionFlow();
+    setUxStatus('success', 'Ready: choose an offer, score it, then trigger the action route.');
   } catch (err) {
-    offersEl.innerHTML = `<div class="muted">Failed loading offers: ${err.message}</div>`;
-    bestOffersEl.innerHTML = `<div class="muted">Failed loading nearby recommendations: ${err.message}</div>`;
-    dispatchSummaryEl.textContent = `Dispatch failed: ${err.message}`;
+    const msg = errorMessage(err, 'driver refresh failed');
+    renderListState(offersEl, 'error', `Unable to load offers: ${msg}`);
+    renderListState(bestOffersEl, 'error', `Unable to load nearby recommendations: ${msg}`);
+    dispatchSummaryEl.textContent = `Dispatch unavailable: ${msg}`;
     dispatchPlanEl.innerHTML = '';
     if (dispatchMapState.map) {
       clearDispatchLeafletLayers();
@@ -1700,15 +1979,21 @@ async function refreshDriverData() {
       dispatchMapEl.textContent = 'Dispatch map unavailable.';
     }
     dispatchLegendEl.innerHTML = '';
-    zonesEl.innerHTML = `<div class="muted">Failed loading zones: ${err.message}</div>`;
+    renderListState(zonesEl, 'error', `Unable to load zones: ${msg}`);
     state.offers = [];
     state.bestOffers = [];
-    state.bestOffersError = err.message;
+    state.bestOffersError = msg;
     state.dispatch = null;
-    state.dispatchError = err.message;
+    state.dispatchError = msg;
     state.zones = [];
+    state.selectedOfferKey = null;
+    state.selectedOfferSource = null;
+    state.lastScoredOfferId = null;
+    state.lastActionSummary = null;
     renderKpis();
     renderMissionPanel();
+    renderDecisionFlow();
+    setUxStatus('error', `Data refresh failed: ${msg}`);
   } finally {
     state.refreshDriverInFlight = false;
     if (state.refreshDriverQueued) {
@@ -1727,7 +2012,7 @@ async function replayWindow() {
   const toTs = toInput.value.trim();
 
   replaySummary.textContent = 'Loading replay...';
-  replayTimeline.innerHTML = '';
+  renderListState(replayTimeline, 'loading', 'Loading replay events...');
 
   try {
     const replay = await api(
@@ -1736,10 +2021,11 @@ async function replayWindow() {
     state.replay = Array.isArray(replay.events) ? replay.events : [];
     renderReplay();
   } catch (err) {
+    const msg = errorMessage(err, 'replay unavailable');
     state.replay = [];
     kpiReplay.textContent = '-';
-    replaySummary.textContent = `Replay failed: ${err.message}`;
-    replayTimeline.innerHTML = '';
+    replaySummary.textContent = `Replay unavailable: ${msg}`;
+    renderListState(replayTimeline, 'error', `Replay request failed: ${msg}`);
   }
 }
 
@@ -1773,8 +2059,25 @@ async function scoreManualOffer(payloadOverride = null) {
     const route = score.route_source ? ` | ${routeSummary(score)}` : '';
     const detailsText = detailSummary ? ` | ${detailSummary}` : '';
     scoreReasons.textContent = `[${score.model_used || 'unknown'}] ${expl}${detailsText}${route}`;
+
+    if (payload.offer_id) {
+      state.lastScoredOfferId = String(payload.offer_id);
+    }
+    setFlowStep('score');
+    if (decisionStatusEl) {
+      decisionStatusEl.className = 'state-message success';
+      decisionStatusEl.textContent = `Scored ${payload.offer_id || 'manual offer'}: ${String(score.decision || '-').toUpperCase()} at ${fmt(score.accept_score, 3)}.`;
+    }
+    setUxStatus('success', `Offer scored: ${String(score.decision || '-').toUpperCase()} (${fmt(score.accept_score, 3)}).`);
+    renderDecisionFlow();
   } catch (err) {
-    scoreReasons.textContent = `Score failed: ${err.message}`;
+    const msg = errorMessage(err, 'score failed');
+    scoreReasons.textContent = `Score unavailable: ${msg}`;
+    if (decisionStatusEl) {
+      decisionStatusEl.className = 'state-message error';
+      decisionStatusEl.textContent = `Could not score selected offer: ${msg}`;
+    }
+    setUxStatus('error', `Score failed: ${msg}`);
   }
 }
 
@@ -1794,13 +2097,115 @@ function applyPreset(name) {
   $('traffic').value = p.traffic;
 }
 
+function selectOfferByKey(key) {
+  const target = allOfferCandidates().find((item) => item.key === key);
+  if (!target) return null;
+  state.selectedOfferKey = target.key;
+  state.selectedOfferSource = target.source;
+  state.lastActionSummary = null;
+  if (state.lastScoredOfferId && String(state.lastScoredOfferId) !== String(target.offer.offer_id || '')) {
+    state.lastScoredOfferId = null;
+  }
+  setFlowStep('choose');
+  if (decisionStatusEl) {
+    decisionStatusEl.className = 'state-message loading';
+    decisionStatusEl.textContent = `Selected ${target.offer.offer_id || 'offer'}. Next: score it.`;
+  }
+  setUxStatus('loading', 'Offer selected. Step 2: score. Step 3: action route.');
+  renderOffers();
+  renderBestOffers();
+  renderDecisionFlow();
+  return target;
+}
+
+async function scoreOfferByCandidate(candidate) {
+  if (!candidate || !candidate.offer) return;
+  const offer = candidate.offer;
+  await scoreManualOffer({
+    offer_id: offer.offer_id || '',
+    courier_id: offer.courier_id || currentDriverId(),
+    use_osrm: Boolean(aroundUseOsrmInput.checked),
+  });
+}
+
+async function pickAndScoreByKey(key) {
+  const selected = selectOfferByKey(key);
+  if (!selected) return;
+  await scoreOfferByCandidate(selected);
+}
+
+async function scoreSelectedOffer() {
+  const selected = ensureSelectedOffer();
+  if (!selected) {
+    setUxStatus('error', 'No offer selected to score.');
+    return;
+  }
+  await scoreOfferByCandidate(selected);
+}
+
+function runSelectedActionRoute() {
+  const route = resolveSelectedActionRoute();
+  const selected = getSelectedOfferCandidate();
+  if (!route) {
+    if (decisionStatusEl) {
+      decisionStatusEl.className = 'state-message error';
+      decisionStatusEl.textContent = 'Action route unavailable. Refresh dispatch and select a mapped offer.';
+    }
+    setUxStatus('error', 'Action route unavailable for selected offer.');
+    return;
+  }
+  window.open(mapsDirectionsUrl(route.originLat, route.originLon, route.destLat, route.destLon), '_blank', 'noopener,noreferrer');
+  state.lastActionSummary = `Action route opened for ${selected?.offer?.offer_id || 'selected offer'}.`;
+  setFlowStep('action');
+  if (decisionStatusEl) {
+    decisionStatusEl.className = 'state-message success';
+    decisionStatusEl.textContent = 'Action launched: route opened in maps.';
+  }
+  setUxStatus('success', 'Action step completed: route opened.');
+  renderDecisionFlow();
+}
+
+async function quickScoreTopOffer() {
+  const top = getTopOfferCandidate();
+  if (!top) {
+    setUxStatus('error', 'No offers available for quick scoring.');
+    return;
+  }
+  await pickAndScoreByKey(top.key);
+}
+
 function bindOfferActionDelegation(container) {
   if (!container) return;
   container.addEventListener('click', async (event) => {
-    const btn = event.target.closest('button[data-action]');
+    const target = event?.target && typeof event.target.closest === 'function' ? event.target : null;
+    if (!target) return;
+
+    const card = target.closest('article[data-offer-key]');
+    if (card && !target.closest('button')) {
+      const key = card.getAttribute('data-offer-key') || '';
+      if (key) selectOfferByKey(key);
+    }
+
+    const btn = target.closest('button[data-action]');
     if (!btn) return;
 
     const action = btn.getAttribute('data-action') || '';
+    if (action === 'pick-offer') {
+      const key = btn.getAttribute('data-offer-key') || '';
+      if (!key) return;
+      selectOfferByKey(key);
+      return;
+    }
+
+    if (action === 'pick-score-offer') {
+      const key = btn.getAttribute('data-offer-key') || '';
+      if (!key) return;
+      await withBusyButton(btn, 'Scoring...', async () => {
+        await pickAndScoreByKey(key);
+      });
+      return;
+    }
+
     if (action === 'go-zone') {
       const originLat = asFloatOrNull(btn.getAttribute('data-origin-lat'));
       const originLon = asFloatOrNull(btn.getAttribute('data-origin-lon'));
@@ -1814,15 +2219,9 @@ function bindOfferActionDelegation(container) {
     if (action === 'start-mission') {
       const target = parseMissionTargetFromAction(btn);
       if (!target) return;
-      btn.disabled = true;
-      const prev = btn.textContent;
-      btn.textContent = 'Starting...';
-      try {
+      await withBusyButton(btn, 'Starting...', async () => {
         await startMission(target);
-      } finally {
-        btn.disabled = false;
-        btn.textContent = prev;
-      }
+      });
       return;
     }
 
@@ -1830,25 +2229,41 @@ function bindOfferActionDelegation(container) {
 
     const offerId = btn.getAttribute('data-offer-id') || '';
     const courierId = btn.getAttribute('data-courier-id') || currentDriverId();
-    btn.disabled = true;
-    btn.textContent = 'Scoring...';
-
-    try {
+    await withBusyButton(btn, 'Scoring...', async () => {
       await scoreManualOffer({
         offer_id: offerId,
         courier_id: courierId,
         use_osrm: Boolean(aroundUseOsrmInput.checked),
       });
-    } finally {
-      btn.disabled = false;
-      btn.textContent = 'Score This Offer';
-    }
+    });
+  });
+
+  container.addEventListener('keydown', (event) => {
+    const keyName = String(event?.key || '');
+    if (keyName !== 'Enter' && keyName !== ' ') return;
+
+    const target = event?.target && typeof event.target.closest === 'function' ? event.target : null;
+    if (!target) return;
+    if (target.closest('button')) return;
+
+    const card = target.closest('article[data-offer-key]');
+    if (!card) return;
+
+    const key = card.getAttribute('data-offer-key') || '';
+    if (!key) return;
+    event.preventDefault();
+    selectOfferByKey(key);
   });
 }
 
 function safeBind(element, eventName, handler) {
   if (!element || typeof element.addEventListener !== 'function') return;
   element.addEventListener(eventName, handler);
+}
+
+function bindChangeAndInput(element, handler) {
+  safeBind(element, 'change', handler);
+  safeBind(element, 'input', handler);
 }
 
 function startAutoRefreshLoop() {
@@ -1903,6 +2318,17 @@ safeBind(refreshFuelBtn, 'click', () => {
 });
 safeBind($('replayBtn'), 'click', replayWindow);
 safeBind($('scoreBtn'), 'click', () => scoreManualOffer());
+safeBind(decisionQuickScoreBtn, 'click', () => {
+  withBusyButton(decisionQuickScoreBtn, 'Scoring...', async () => {
+    await quickScoreTopOffer();
+  }).catch(() => {});
+});
+safeBind(decisionScoreBtn, 'click', () => {
+  withBusyButton(decisionScoreBtn, 'Scoring...', async () => {
+    await scoreSelectedOffer();
+  }).catch(() => {});
+});
+safeBind(decisionActionBtn, 'click', runSelectedActionRoute);
 safeBind($('presetSafe'), 'click', () => applyPreset('safe'));
 safeBind($('presetBalanced'), 'click', () => applyPreset('balanced'));
 safeBind($('presetSurge'), 'click', () => applyPreset('surge'));
@@ -1914,30 +2340,45 @@ safeBind(missionStopBtn, 'click', () => {
 });
 safeBind(driverInput, 'change', () => {
   stopMission('Driver changed, mission reset.');
+  state.selectedOfferKey = null;
+  state.selectedOfferSource = null;
+  state.lastScoredOfferId = null;
+  state.lastActionSummary = null;
+  setFlowStep('choose');
   refreshDriverData();
 });
-safeBind(offerFilter, 'change', renderOffers);
-safeBind(offerLimit, 'change', refreshDriverDataDebounced);
-safeBind(aroundRadiusInput, 'change', refreshDriverDataDebounced);
-safeBind(aroundLimitInput, 'change', refreshDriverDataDebounced);
-safeBind(aroundMinScoreInput, 'change', refreshDriverDataDebounced);
+safeBind(offerFilter, 'change', () => {
+  renderOffers();
+  renderDecisionFlow();
+});
+bindChangeAndInput(offerLimit, refreshDriverDataDebounced);
+bindChangeAndInput(aroundRadiusInput, refreshDriverDataDebounced);
+bindChangeAndInput(aroundLimitInput, refreshDriverDataDebounced);
+bindChangeAndInput(aroundMinScoreInput, refreshDriverDataDebounced);
 safeBind(aroundUseOsrmInput, 'change', refreshDriverData);
-safeBind(dispatchMaxEtaInput, 'change', refreshDriverDataDebounced);
-safeBind(dispatchForecastHorizonInput, 'change', refreshDriverDataDebounced);
-safeBind(dispatchZoneTopKInput, 'change', refreshDriverDataDebounced);
+bindChangeAndInput(dispatchMaxEtaInput, refreshDriverDataDebounced);
+bindChangeAndInput(dispatchForecastHorizonInput, refreshDriverDataDebounced);
+bindChangeAndInput(dispatchZoneTopKInput, refreshDriverDataDebounced);
 safeBind(dispatchStrategyInput, 'change', refreshDriverData);
-safeBind(zoneDistanceWeightInput, 'change', refreshDriverDataDebounced);
-safeBind(zoneMaxDistanceKmInput, 'change', refreshDriverDataDebounced);
-safeBind(zoneHomeLatInput, 'change', refreshDriverDataDebounced);
-safeBind(zoneHomeLonInput, 'change', refreshDriverDataDebounced);
+bindChangeAndInput(zoneDistanceWeightInput, refreshDriverDataDebounced);
+bindChangeAndInput(zoneMaxDistanceKmInput, refreshDriverDataDebounced);
+bindChangeAndInput(zoneHomeLatInput, refreshDriverDataDebounced);
+bindChangeAndInput(zoneHomeLonInput, refreshDriverDataDebounced);
 safeBind(autoRefreshBox, 'change', startAutoRefreshLoop);
 
 bindOfferActionDelegation(offersEl);
 bindOfferActionDelegation(bestOffersEl);
 bindOfferActionDelegation(dispatchPlanEl);
 bindOfferActionDelegation(dispatchLegendEl);
+setFlowStep('choose');
+renderDecisionFlow();
 renderMissionPanel();
 setWindowMinutes(30);
 applyPreset('balanced');
-refreshAll().then(() => replayWindow());
+refreshAll()
+  .then(() => replayWindow())
+  .catch((err) => {
+    const msg = errorMessage(err, 'initial load failed');
+    setUxStatus('error', `Initial load failed: ${msg}`);
+  });
 startAutoRefreshLoop();
