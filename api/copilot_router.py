@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import glob
 import json
 import logging
 import math
@@ -418,6 +419,17 @@ def _build_scored_offer_snapshot(
     if extras:
         record.update(extras)
     return record
+
+
+def _existing_parquet_globs(globs: list[str]) -> list[str]:
+    existing: list[str] = []
+    for pattern in globs:
+        try:
+            if glob.glob(pattern):
+                existing.append(pattern)
+        except OSError:
+            continue
+    return existing
 
 
 def _parse_fuel_price_usd_gallon(xml_text: str, grade: str) -> float:
@@ -2305,7 +2317,11 @@ async def replay(
     if not globs:
         return {"from": from_ts, "to": to_ts, "driver_id": driver_id, "count": 0, "events": []}
 
-    glob_list_sql = "[" + ", ".join(f"'{g}'" for g in globs) + "]"
+    existing_globs = _existing_parquet_globs(globs)
+    if not existing_globs:
+        return {"from": from_ts, "to": to_ts, "driver_id": driver_id, "count": 0, "events": []}
+
+    glob_list_sql = "[" + ", ".join(f"'{g}'" for g in existing_globs) + "]"
     rows = await _duck_query(
         request,
         f"""

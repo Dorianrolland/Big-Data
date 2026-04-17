@@ -226,7 +226,11 @@ def main() -> int:
             timeout_s=args.timeout,
         )
 
-        zone_payload = request_json(f"{base_url}/copilot/driver/{driver_id}/next-best-zone?top_k=5")
+        zone_payload = wait_for_json(
+            f"{base_url}/copilot/driver/{driver_id}/next-best-zone?top_k=5",
+            lambda x: isinstance(x, dict),
+            timeout_s=args.timeout,
+        )
 
         # Wait until cold path has at least one parquet file in events lake.
         deadline = time.time() + args.timeout
@@ -254,16 +258,28 @@ def main() -> int:
             f"to={urllib.parse.quote(replay_to_ts.isoformat())}&"
             f"limit=100"
         )
-        replay_payload = request_json(replay_url, timeout=90.0)
+        replay_payload = wait_for_json(
+            replay_url,
+            lambda x: isinstance(x, dict),
+            timeout_s=max(30, args.timeout),
+        )
 
-        hot_perf = request_json(f"{base_url}/health/performance?samples=200")
+        hot_perf = wait_for_json(
+            f"{base_url}/health/performance?samples=200",
+            lambda x: isinstance(x, dict),
+            timeout_s=args.timeout,
+        )
         score_perf = benchmark_score_offer(
             base_url=base_url,
             requests_n=args.score_requests,
             concurrency=args.score_concurrency,
             timeout=args.score_timeout,
         )
-        stats_payload = request_json(f"{base_url}/stats")
+        stats_payload = wait_for_json(
+            f"{base_url}/stats",
+            lambda x: isinstance(x, dict),
+            timeout_s=args.timeout,
+        )
         dlq = dlq_stats(DLQ_DIR)
 
         checks = {
@@ -322,7 +338,15 @@ def main() -> int:
         return 0 if passed else 2
 
     except urllib.error.HTTPError as exc:
-        print(f"HTTP error: {exc.code} {exc.reason}", file=sys.stderr)
+        body = ""
+        try:
+            body = exc.read().decode("utf-8")[:400]
+        except Exception:  # noqa: BLE001
+            body = ""
+        details = f" | url={getattr(exc, 'url', 'unknown')}"
+        if body:
+            details += f" | body={body}"
+        print(f"HTTP error: {exc.code} {exc.reason}{details}", file=sys.stderr)
         return 3
     except Exception as exc:  # noqa: BLE001
         print(f"Smoke E2E failed: {exc}", file=sys.stderr)
