@@ -56,12 +56,49 @@ def sigmoid(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-x))
 
 
+def _safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(out):
+        return float(default)
+    return float(out)
+
+
+def _parse_source_event_pressure(source: str) -> tuple[str, float]:
+    raw = str(source or "").strip()
+    if not raw:
+        return "", 0.0
+    if ";" not in raw:
+        return raw, 0.0
+
+    base, *metadata = raw.split(";")
+    source_tag = base.strip()
+    pressure = 0.0
+    for item in metadata:
+        key, sep, value = item.strip().partition("=")
+        if not sep:
+            continue
+        if key.strip().lower() != "event_pressure":
+            continue
+        try:
+            pressure = float(value.strip())
+        except (TypeError, ValueError):
+            pressure = 0.0
+        if not math.isfinite(pressure):
+            pressure = 0.0
+        break
+    pressure = max(0.0, min(2.0, pressure))
+    return source_tag, pressure
+
+
 async def enrich_offer(redis_client: aioredis.Redis, offer: OrderOfferV1) -> dict:
     courier_state = await redis_client.hgetall(f"{COURIER_HASH_PREFIX}{offer.courier_id}")
 
-    courier_lat = float(courier_state.get("lat", offer.pickup_lat))
-    courier_lon = float(courier_state.get("lon", offer.pickup_lon))
-    courier_speed = max(float(courier_state.get("speed_kmh", 18.0)), 6.0)
+    courier_lat = _safe_float(courier_state.get("lat"), float(offer.pickup_lat))
+    courier_lon = _safe_float(courier_state.get("lon"), float(offer.pickup_lon))
+    courier_speed = max(_safe_float(courier_state.get("speed_kmh"), 18.0), 6.0)
     courier_status = courier_state.get("status", "unknown")
 
     distance_to_pickup_km = max(0.0, haversine_km(courier_lat, courier_lon, offer.pickup_lat, offer.pickup_lon))
@@ -69,20 +106,21 @@ async def enrich_offer(redis_client: aioredis.Redis, offer: OrderOfferV1) -> dic
 
     zone_key = f"{ZONE_CONTEXT_PREFIX}{offer.zone_id}"
     zone_state = await redis_client.hgetall(zone_key)
-    demand_index = float(zone_state.get("demand_index", offer.demand_index or 1.0))
-    supply_index = float(zone_state.get("supply_index", 1.0))
-    weather_factor = float(zone_state.get("weather_factor", offer.weather_factor or 1.0))
-    traffic_factor = float(zone_state.get("traffic_factor", offer.traffic_factor or 1.0))
+    demand_index = _safe_float(zone_state.get("demand_index"), float(offer.demand_index or 1.0))
+    supply_index = max(_safe_float(zone_state.get("supply_index"), 1.0), 0.2)
+    weather_factor = _safe_float(zone_state.get("weather_factor"), float(offer.weather_factor or 1.0))
+    traffic_factor = max(_safe_float(zone_state.get("traffic_factor"), float(offer.traffic_factor or 1.0)), 0.2)
+    event_pressure = max(0.0, _safe_float(zone_state.get("event_pressure"), 0.0))
 
     # Enrich with GBFS demand boost (Citi Bike station availability as taxi demand proxy)
-    gbfs_demand_boost = float(zone_state.get("gbfs_demand_boost", 0.0))
+    gbfs_demand_boost = max(0.0, _safe_float(zone_state.get("gbfs_demand_boost"), 0.0))
     demand_index = demand_index + gbfs_demand_boost
 
-    distance_total_km = distance_to_pickup_km + max(float(offer.estimated_distance_km), 0.0)
+    distance_total_km = distance_to_pickup_km + max(_safe_float(offer.estimated_distance_km), 0.0)
     variable_cost_eur = distance_total_km * FUEL_COST_EUR_PER_KM
-    net_revenue_eur = max(-2.0, float(offer.estimated_fare_eur) - variable_cost_eur)
+    net_revenue_eur = max(-2.0, _safe_float(offer.estimated_fare_eur) - variable_cost_eur)
 
-    total_trip_time_min = max(1.0, float(offer.estimated_duration_min) + eta_to_pickup_min)
+    total_trip_time_min = max(1.0, _safe_float(offer.estimated_duration_min) + eta_to_pickup_min)
     eur_per_hour_net = (net_revenue_eur / total_trip_time_min) * 60
 
     pressure_ratio = demand_index / max(supply_index, 0.2)
@@ -130,6 +168,7 @@ async def enrich_offer(redis_client: aioredis.Redis, offer: OrderOfferV1) -> dic
         "supply_index": round(supply_index, 3),
         "weather_factor": round(weather_factor, 3),
         "traffic_factor": round(traffic_factor, 3),
+        "event_pressure": round(event_pressure, 4),
         "pressure_ratio": round(pressure_ratio, 3),
         "eur_per_hour_net": round(eur_per_hour_net, 3),
         "accept_score_heuristic": round(accept_score, 4),
@@ -157,6 +196,7 @@ async def store_offer(redis_client: aioredis.Redis, feature_map: dict) -> None:
 
 async def upsert_context(redis_client: aioredis.Redis, signal_msg: ContextSignalV1) -> None:
     key = f"{ZONE_CONTEXT_PREFIX}{signal_msg.zone_id}"
+    source_tag, event_pressure = _parse_source_event_pressure(signal_msg.source)
     prev_demand_raw, prev_trend_ema_raw, prev_updated_raw = await redis_client.hmget(
         key, ["demand_index", "demand_trend_ema", "updated_at"]
     )
@@ -195,7 +235,8 @@ async def upsert_context(redis_client: aioredis.Redis, signal_msg: ContextSignal
             "demand_trend_ema": round(float(demand_trend_ema), 3),
             "forecast_demand_index_15m": round(float(forecast_demand_15m), 3),
             "context_tick_s": context_tick_s if context_tick_s is not None else "",
-            "source": signal_msg.source,
+            "event_pressure": round(float(event_pressure), 4),
+            "source": source_tag or signal_msg.source,
             "updated_at": str(now_s),
         },
     )

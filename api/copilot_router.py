@@ -64,6 +64,7 @@ IRVE_KEY = "copilot:context:irve"
 TLC_REPLAY_KEY = "copilot:replay:tlc:status"
 FUEL_CONTEXT_KEY = "copilot:context:fuel"
 CONTEXT_QUALITY_KEY = "copilot:context:quality"
+EVENTS_CONTEXT_KEY = "copilot:context:events"
 ZONE_CONTEXT_PREFIX = "copilot:context:zone:"
 OFFER_KEY_PREFIX = "copilot:offer:"
 DRIVER_OFFERS_PREFIX = "copilot:driver:"
@@ -1471,6 +1472,7 @@ async def driver_position(
                 "supply_index": round(_as_float(zone_raw.get("supply_index"), 1.0), 3),
                 "weather_factor": round(_as_float(zone_raw.get("weather_factor"), 1.0), 3),
                 "traffic_factor": round(_as_float(zone_raw.get("traffic_factor"), 1.0), 3),
+                "event_pressure": round(_as_float(zone_raw.get("event_pressure"), 0.0), 4),
                 "updated_at": zone_raw.get("updated_at"),
             }
     return payload
@@ -2224,6 +2226,7 @@ async def next_best_zone(
                 "supply_index": round(supply, 3),
                 "weather_factor": round(weather, 3),
                 "traffic_factor": round(traffic, 3),
+                "event_pressure": round(_as_float(zone.get("event_pressure"), 0.0), 4),
                 "gbfs_demand_boost": round(_as_float(zone.get("gbfs_demand_boost"), 0.0), 3),
                 "demand_trend": round(_as_float(zone.get("demand_trend"), 0.0), 3),
                 "demand_trend_ema": round(_as_float(zone.get("demand_trend_ema"), 0.0), 3),
@@ -2540,6 +2543,7 @@ async def copilot_health(request: Request):
     weather = await redis_client.hgetall(WEATHER_KEY)
     gbfs = await redis_client.hgetall(GBFS_KEY)
     irve = await redis_client.hgetall(IRVE_KEY)
+    events_context = await redis_client.hgetall(EVENTS_CONTEXT_KEY)
     fuel = await redis_client.hgetall(FUEL_CONTEXT_KEY)
     context_quality = await redis_client.hgetall(CONTEXT_QUALITY_KEY)
     tlc_replay = await redis_client.hgetall(TLC_REPLAY_KEY)
@@ -2562,6 +2566,15 @@ async def copilot_health(request: Request):
         "weather_context": weather,
         "gbfs_context": gbfs,
         "irve_context": irve,
+        "events_context": {
+            "source": events_context.get("source"),
+            "status": events_context.get("status"),
+            "events_upcoming_count": int(_as_float(events_context.get("events_upcoming_count"), 0.0)),
+            "events_window_start": events_context.get("events_window_start"),
+            "events_window_end": events_context.get("events_window_end"),
+            "error_type": events_context.get("error_type"),
+            "updated_at": events_context.get("updated_at"),
+        },
         "fuel_context": {
             "fuel_price_eur_l": round(_as_float(fuel.get("fuel_price_eur_l"), DEFAULT_FUEL_PRICE_EUR_L), 3),
             "fuel_price_usd_gallon": (
@@ -2594,6 +2607,15 @@ async def copilot_health(request: Request):
             "supply_flat_alert": _as_bool(context_quality.get("supply_flat_alert"), False),
             "traffic_nonzero_rate": round(_as_float(context_quality.get("traffic_nonzero_rate"), 0.0), 4),
             "traffic_mean": round(_as_float(context_quality.get("traffic_mean"), 1.0), 4),
+            "sources": context_quality.get("sources"),
+            "events_source_active": _as_bool(context_quality.get("events_source_active"), False),
+            "events_rows": int(_as_float(context_quality.get("events_rows"), 0.0)),
+            "events_status": context_quality.get("events_status"),
+            "event_pressure_mean": round(_as_float(context_quality.get("event_pressure_mean"), 0.0), 4),
+            "event_pressure_max": round(_as_float(context_quality.get("event_pressure_max"), 0.0), 4),
+            "event_pressure_nonzero_rate": round(
+                _as_float(context_quality.get("event_pressure_nonzero_rate"), 0.0), 4
+            ),
             "updated_at": context_quality.get("updated_at"),
         },
         "routing_quality": {
