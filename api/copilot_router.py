@@ -2616,6 +2616,14 @@ async def copilot_health(request: Request):
             "event_pressure_nonzero_rate": round(
                 _as_float(context_quality.get("event_pressure_nonzero_rate"), 0.0), 4
             ),
+            "dot_advisory_status": context_quality.get("dot_advisory_status"),
+            "dot_advisory_rows": int(_as_float(context_quality.get("dot_advisory_rows"), 0.0)),
+            "dot_speeds_status": context_quality.get("dot_speeds_status"),
+            "dot_speeds_rows": int(_as_float(context_quality.get("dot_speeds_rows"), 0.0)),
+            "closure_pressure_mean": round(_as_float(context_quality.get("closure_pressure_mean"), 0.0), 4),
+            "closure_pressure_max": round(_as_float(context_quality.get("closure_pressure_max"), 0.0), 4),
+            "speed_pressure_mean": round(_as_float(context_quality.get("speed_pressure_mean"), 0.0), 4),
+            "speed_pressure_max": round(_as_float(context_quality.get("speed_pressure_max"), 0.0), 4),
             "updated_at": context_quality.get("updated_at"),
         },
         "routing_quality": {

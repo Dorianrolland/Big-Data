@@ -39,6 +39,14 @@ def test_health_exposes_events_source_status():
             "event_pressure_mean": "0.1423",
             "event_pressure_max": "0.6312",
             "event_pressure_nonzero_rate": "0.2738",
+            "dot_advisory_status": "ok",
+            "dot_advisory_rows": "44",
+            "dot_speeds_status": "ok",
+            "dot_speeds_rows": "321",
+            "closure_pressure_mean": "0.1142",
+            "closure_pressure_max": "0.3711",
+            "speed_pressure_mean": "0.0834",
+            "speed_pressure_max": "0.2942",
         },
         router.TLC_REPLAY_KEY: {},
         router.SINGLE_REPLAY_STATUS_KEY: {},
@@ -61,3 +69,9 @@ def test_health_exposes_events_source_status():
     assert payload["data_quality"]["events_status"] == "ok"
     assert payload["data_quality"]["events_rows"] == 18
     assert payload["data_quality"]["event_pressure_max"] == 0.6312
+    assert payload["data_quality"]["dot_advisory_status"] == "ok"
+    assert payload["data_quality"]["dot_advisory_rows"] == 44
+    assert payload["data_quality"]["dot_speeds_status"] == "ok"
+    assert payload["data_quality"]["dot_speeds_rows"] == 321
+    assert payload["data_quality"]["closure_pressure_max"] == 0.3711
+    assert payload["data_quality"]["speed_pressure_max"] == 0.2942

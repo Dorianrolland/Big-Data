@@ -34,6 +34,127 @@ def test_traffic_factor_has_rush_hour_floor():
     assert traffic > 1.0
 
 
+def test_traffic_factor_fallback_without_dot_signals_matches_legacy_base():
+    state = ctx.ContextState()
+    state.weather_precip_mm = 1.8
+    state.nyc311_incidents = [(40.7580, -73.9855)]
+    state.dot_closure_records = []
+    state.dot_speed_samples = []
+    now_ts = datetime(2026, 4, 16, 10, 15, tzinfo=ZoneInfo("America/New_York")).timestamp()
+
+    actual = ctx._compute_traffic_factor(state, 40.7580, -73.9855, now_ts=now_ts)
+    expected = round(
+        min(
+            ctx.TRAFFIC_FACTOR_CAP,
+            1.0
+            + min(0.45, 1.0 / 12.0)
+            + min(0.2, 1.8 / 6.0)
+            + ctx._rush_hour_factor(now_ts),
+        ),
+        3,
+    )
+    assert actual == expected
+
+
+def test_closure_pressure_higher_for_nearby_zone():
+    now_ts = datetime(2026, 4, 19, 9, 0, tzinfo=ZoneInfo("UTC")).timestamp()
+    closures = [
+        {
+            "lat": 40.7580,
+            "lon": -73.9855,
+            "start_ts": now_ts - 600.0,
+            "end_ts": now_ts + 4 * 3600.0,
+            "severity": 1.0,
+        }
+    ]
+    near = ctx._compute_closure_pressure(closures, lat=40.7581, lon=-73.9854, now_ts=now_ts)
+    far = ctx._compute_closure_pressure(closures, lat=40.6500, lon=-74.1000, now_ts=now_ts)
+    assert near > 0.0
+    assert near > far
+
+
+def test_speed_pressure_increases_when_speed_is_low():
+    slow = [{"lat": 40.7580, "lon": -73.9855, "speed_kmh": 9.0, "severity": ctx._speed_severity(9.0)}]
+    fast = [{"lat": 40.7580, "lon": -73.9855, "speed_kmh": 45.0, "severity": ctx._speed_severity(45.0)}]
+
+    slow_pressure = ctx._compute_speed_pressure(slow, lat=40.7580, lon=-73.9855)
+    fast_pressure = ctx._compute_speed_pressure(fast, lat=40.7580, lon=-73.9855)
+    assert slow_pressure > fast_pressure
+    assert fast_pressure == 0.0
+
+
+def test_traffic_factor_fusion_penalizes_impacted_zone():
+    state = ctx.ContextState()
+    state.weather_precip_mm = 0.0
+    state.nyc311_incidents = []
+    now_ts = datetime(2026, 4, 19, 13, 0, tzinfo=ZoneInfo("UTC")).timestamp()
+    state.dot_closure_records = [
+        {
+            "lat": 40.7580,
+            "lon": -73.9855,
+            "start_ts": now_ts - 900.0,
+            "end_ts": now_ts + 2 * 3600.0,
+            "severity": 1.1,
+        }
+    ]
+    state.dot_speed_samples = [
+        {"lat": 40.7580, "lon": -73.9855, "speed_kmh": 8.0, "severity": ctx._speed_severity(8.0)}
+    ]
+
+    impacted = ctx._compute_traffic_factor(state, 40.7580, -73.9855, now_ts=now_ts)
+    baseline = ctx._compute_traffic_factor(state, 40.6400, -74.1000, now_ts=now_ts)
+    assert impacted > baseline
+
+
+def test_extract_closure_records_from_weekly_advisory_html():
+    raw_html = """
+        <html><body>
+        <h2>Weekly Traffic Advisory for Saturday April 18, 2026, to Friday April 24, 2026</h2>
+        <h3>Manhattan</h3>
+        <p>Northbound West Street between West 30th and West 34th Street will be closed nightly.</p>
+        <h3>Queens</h3>
+        <p>Single lane closure on Queensboro Bridge in effect overnight.</p>
+        </body></html>
+    """
+    now_ts = datetime(2026, 4, 19, 9, 0, tzinfo=ZoneInfo("UTC")).timestamp()
+    rows = ctx._extract_closure_records_from_weekly_advisory(raw_html, now_ts=now_ts)
+    assert len(rows) >= 2
+    assert all(float(row["end_ts"]) > float(row["start_ts"]) for row in rows)
+
+
+def test_extract_closure_records_handles_cross_borough_heading():
+    raw_html = """
+        <html><body>
+        <h2>Weekly Traffic Advisory for Saturday April 18, 2026, to Friday April 24, 2026</h2>
+        <h3>Bronx/Manhattan</h3>
+        <p>Broadway Bridge over the Harlem River has a single lane closure.</p>
+        </body></html>
+    """
+    now_ts = datetime(2026, 4, 19, 9, 0, tzinfo=ZoneInfo("UTC")).timestamp()
+    rows = ctx._extract_closure_records_from_weekly_advisory(raw_html, now_ts=now_ts)
+    assert len(rows) == 1
+    assert rows[0]["severity"] > 0.0
+
+
+def test_extract_speed_samples_from_text_rows():
+    raw = "40.7580,-73.9855,12.0\n-73.99,40.75,21.0\ninvalid,row"
+    rows = ctx._extract_speed_samples_from_text(raw)
+    assert len(rows) == 2
+    assert rows[0]["severity"] > 0.0
+
+
+def test_extract_speed_samples_from_text_with_extra_columns():
+    raw = "segment_01,2026-04-19T09:00:00Z,-73.9900,40.7500,18.0,ok"
+    rows = ctx._extract_speed_samples_from_text(raw)
+    assert len(rows) == 1
+    assert rows[0]["speed_kmh"] > 20.0
+
+
+def test_normalize_speed_to_kmh_respects_unit_hint():
+    assert round(ctx._normalize_speed_to_kmh(20.0, speed_key="avg_speed_mph"), 3) == round(20.0 * 1.60934, 3)
+    assert ctx._normalize_speed_to_kmh(20.0, speed_key="speed_kmh") == 20.0
+
+
 def test_event_pressure_is_higher_for_nearby_zone():
     now_ts = datetime(2026, 4, 18, 10, 0, tzinfo=ZoneInfo("UTC")).timestamp()
     events = [

@@ -490,6 +490,9 @@ NYC taxi zones every `CONTEXT_TICK_SECONDS`, using only public API data:
 - **Citi Bike GBFS** (`gbfs.lyft.com/gbfs/2.3/bkn/…`) → `demand_index`
 - **Open-Meteo** (`api.open-meteo.com`) → `weather_factor`
 - **NYC 311 Socrata** (`data.cityofnewyork.us/resource/erm2-nwe9.json`) → `traffic_factor`
+- **NYC DOT Weekly Traffic Advisory** (`nyc.gov/.../motorist/weektraf.shtml`) → `closure_pressure` (planned closures)
+- **NYC DOT Traffic Speeds Feed** (`linkdata.nyctmc.org/.../LinkSpeedQuery.txt`) → `speed_pressure` (real-time slowdown)
+  - unit conversion behavior is configurable via `TRAFFIC_SPEED_INPUT_UNIT` (`mph` by default)
 - **NYC Permitted Event Information** (`data.cityofnewyork.us/resource/tvpp-9vvx.json`) → `event_pressure` injecté dans `demand_index` (capé)
 - **Redis GEO** (`fleet:geo`, populated by `hot-consumer` from TLC positions) → `supply_index`
 
