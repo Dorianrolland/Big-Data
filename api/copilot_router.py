@@ -146,6 +146,18 @@ class ScoreOfferRequest(BaseModel):
     supply_index: float = Field(1.0, ge=0)
     weather_factor: float = Field(1.0, ge=0)
     traffic_factor: float = Field(1.0, ge=0)
+    event_pressure: float = Field(0.0, ge=0)
+    event_count_nearby: int | None = Field(None, ge=0, le=5000)
+    weather_precip_mm: float | None = Field(None, ge=0, le=200)
+    weather_wind_kmh: float | None = Field(None, ge=0, le=250)
+    weather_intensity: float | None = Field(None, ge=0, le=1)
+    temporal_hour_local: float | None = Field(None, ge=-1, le=24)
+    is_peak_hour: bool | None = None
+    is_weekend: bool | None = None
+    is_holiday: bool | None = None
+    temporal_pressure: float | None = Field(None, ge=0, le=2)
+    context_fallback_applied: bool | None = None
+    context_stale_sources: int | None = Field(None, ge=0, le=12)
     fuel_price_eur_l: float | None = Field(None, ge=0.5, le=5.0)
     vehicle_consumption_l_100km: float | None = Field(None, ge=2.0, le=30.0)
     platform_fee_pct: float | None = Field(None, ge=0.0, le=60.0)
@@ -338,6 +350,49 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     if txt in {"0", "false", "no", "n", "off"}:
         return False
     return default
+
+
+def _zone_context_payload(zone_raw: dict[str, Any], zone_id_hint: str | None = None) -> dict[str, Any]:
+    demand = _as_float(zone_raw.get("demand_index"), 1.0)
+    supply = max(_as_float(zone_raw.get("supply_index"), 1.0), 0.2)
+    weather = _as_float(zone_raw.get("weather_factor"), 1.0)
+    traffic = max(_as_float(zone_raw.get("traffic_factor"), 1.0), 0.2)
+    return {
+        "zone_id": zone_raw.get("zone_id", zone_id_hint),
+        "demand_index": round(demand, 3),
+        "supply_index": round(supply, 3),
+        "weather_factor": round(weather, 3),
+        "traffic_factor": round(traffic, 3),
+        "event_pressure": round(_as_float(zone_raw.get("event_pressure"), 0.0), 4),
+        "event_count_nearby": int(_as_float(zone_raw.get("event_count_nearby"), 0.0)),
+        "weather_precip_mm": round(_as_float(zone_raw.get("weather_precip_mm"), 0.0), 3),
+        "weather_wind_kmh": round(_as_float(zone_raw.get("weather_wind_kmh"), 0.0), 3),
+        "weather_intensity": round(_as_float(zone_raw.get("weather_intensity"), 0.0), 4),
+        "temporal_hour_local": round(_as_float(zone_raw.get("temporal_hour_local"), -1.0), 3),
+        "is_peak_hour": _as_bool(zone_raw.get("is_peak_hour"), False),
+        "is_weekend": _as_bool(zone_raw.get("is_weekend"), False),
+        "is_holiday": _as_bool(zone_raw.get("is_holiday"), False),
+        "temporal_pressure": round(_as_float(zone_raw.get("temporal_pressure"), 0.0), 4),
+        "context_fallback_applied": _as_bool(zone_raw.get("context_fallback_applied"), False),
+        "context_stale_sources": int(_as_float(zone_raw.get("context_stale_sources"), 0.0)),
+        "freshness_policy": zone_raw.get("freshness_policy"),
+        "age_gbfs_s": round(_as_float(zone_raw.get("age_gbfs_s"), -1.0), 3),
+        "age_weather_s": round(_as_float(zone_raw.get("age_weather_s"), -1.0), 3),
+        "age_nyc311_s": round(_as_float(zone_raw.get("age_nyc311_s"), -1.0), 3),
+        "age_events_s": round(_as_float(zone_raw.get("age_events_s"), -1.0), 3),
+        "age_dot_closure_s": round(_as_float(zone_raw.get("age_dot_closure_s"), -1.0), 3),
+        "age_dot_speeds_s": round(_as_float(zone_raw.get("age_dot_speeds_s"), -1.0), 3),
+        "stale_gbfs": _as_bool(zone_raw.get("stale_gbfs"), False),
+        "stale_weather": _as_bool(zone_raw.get("stale_weather"), False),
+        "stale_nyc311": _as_bool(zone_raw.get("stale_nyc311"), False),
+        "stale_events": _as_bool(zone_raw.get("stale_events"), False),
+        "stale_dot_closure": _as_bool(zone_raw.get("stale_dot_closure"), False),
+        "stale_dot_speeds": _as_bool(zone_raw.get("stale_dot_speeds"), False),
+        "gbfs_demand_boost": round(_as_float(zone_raw.get("gbfs_demand_boost"), 0.0), 3),
+        "demand_trend": round(_as_float(zone_raw.get("demand_trend"), 0.0), 3),
+        "demand_trend_ema": round(_as_float(zone_raw.get("demand_trend_ema"), 0.0), 3),
+        "updated_at": zone_raw.get("updated_at"),
+    }
 
 
 def _compute_heuristic_score(features: dict[str, float]) -> tuple[float, float, list[str]]:
@@ -1466,15 +1521,7 @@ async def driver_position(
     if include_zone_context:
         zone_raw = await redis_client.hgetall(f"{ZONE_CONTEXT_PREFIX}{zone_cell}")
         if zone_raw:
-            payload["zone_context"] = {
-                "zone_id": zone_raw.get("zone_id", zone_cell),
-                "demand_index": round(_as_float(zone_raw.get("demand_index"), 1.0), 3),
-                "supply_index": round(_as_float(zone_raw.get("supply_index"), 1.0), 3),
-                "weather_factor": round(_as_float(zone_raw.get("weather_factor"), 1.0), 3),
-                "traffic_factor": round(_as_float(zone_raw.get("traffic_factor"), 1.0), 3),
-                "event_pressure": round(_as_float(zone_raw.get("event_pressure"), 0.0), 4),
-                "updated_at": zone_raw.get("updated_at"),
-            }
+            payload["zone_context"] = _zone_context_payload(zone_raw, zone_id_hint=zone_cell)
     return payload
 
 
@@ -2213,27 +2260,14 @@ async def next_best_zone(
     for zone in zone_hashes:
         if not zone:
             continue
-        demand = _as_float(zone.get("demand_index"), 1.0)
-        supply = max(_as_float(zone.get("supply_index"), 1.0), 0.2)
-        weather = _as_float(zone.get("weather_factor"), 1.0)
-        traffic = max(_as_float(zone.get("traffic_factor"), 1.0), 0.2)
-
+        context_payload = _zone_context_payload(zone)
+        demand = float(context_payload.get("demand_index") or 1.0)
+        supply = max(float(context_payload.get("supply_index") or 1.0), 0.2)
+        weather = float(context_payload.get("weather_factor") or 1.0)
+        traffic = max(float(context_payload.get("traffic_factor") or 1.0), 0.2)
         opportunity = (demand / supply) * weather / traffic
-        zones.append(
-            {
-                "zone_id": zone.get("zone_id"),
-                "demand_index": round(demand, 3),
-                "supply_index": round(supply, 3),
-                "weather_factor": round(weather, 3),
-                "traffic_factor": round(traffic, 3),
-                "event_pressure": round(_as_float(zone.get("event_pressure"), 0.0), 4),
-                "gbfs_demand_boost": round(_as_float(zone.get("gbfs_demand_boost"), 0.0), 3),
-                "demand_trend": round(_as_float(zone.get("demand_trend"), 0.0), 3),
-                "demand_trend_ema": round(_as_float(zone.get("demand_trend_ema"), 0.0), 3),
-                "updated_at": zone.get("updated_at"),
-                "opportunity_score": round(opportunity, 3),
-            }
-        )
+        context_payload["opportunity_score"] = round(opportunity, 3)
+        zones.append(context_payload)
 
     driver_lat: float | None = lat
     driver_lon: float | None = lon
@@ -2624,6 +2658,21 @@ async def copilot_health(request: Request):
             "closure_pressure_max": round(_as_float(context_quality.get("closure_pressure_max"), 0.0), 4),
             "speed_pressure_mean": round(_as_float(context_quality.get("speed_pressure_mean"), 0.0), 4),
             "speed_pressure_max": round(_as_float(context_quality.get("speed_pressure_max"), 0.0), 4),
+            "freshness_policy": context_quality.get("freshness_policy"),
+            "context_fallback_applied": _as_bool(context_quality.get("context_fallback_applied"), False),
+            "stale_sources_count": int(_as_float(context_quality.get("stale_sources_count"), 0.0)),
+            "age_gbfs_s": round(_as_float(context_quality.get("age_gbfs_s"), -1.0), 3),
+            "age_weather_s": round(_as_float(context_quality.get("age_weather_s"), -1.0), 3),
+            "age_nyc311_s": round(_as_float(context_quality.get("age_nyc311_s"), -1.0), 3),
+            "age_events_s": round(_as_float(context_quality.get("age_events_s"), -1.0), 3),
+            "age_dot_closure_s": round(_as_float(context_quality.get("age_dot_closure_s"), -1.0), 3),
+            "age_dot_speeds_s": round(_as_float(context_quality.get("age_dot_speeds_s"), -1.0), 3),
+            "stale_gbfs": _as_bool(context_quality.get("stale_gbfs"), False),
+            "stale_weather": _as_bool(context_quality.get("stale_weather"), False),
+            "stale_nyc311": _as_bool(context_quality.get("stale_nyc311"), False),
+            "stale_events": _as_bool(context_quality.get("stale_events"), False),
+            "stale_dot_closure": _as_bool(context_quality.get("stale_dot_closure"), False),
+            "stale_dot_speeds": _as_bool(context_quality.get("stale_dot_speeds"), False),
             "updated_at": context_quality.get("updated_at"),
         },
         "routing_quality": {

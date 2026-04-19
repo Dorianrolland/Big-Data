@@ -70,6 +70,22 @@ def test_parse_source_event_pressure_invalid_number_falls_back_to_zero():
     assert pressure == 0.0
 
 
+def test_parse_source_metadata_extracts_temporal_and_freshness_fields():
+    source, metadata = features._parse_source_metadata(
+        "gbfs+open-meteo;event_pressure=0.18;temporal_is_peak=1;freshness_policy=stale_neutral_v1"
+    )
+    assert source == "gbfs+open-meteo"
+    assert metadata["event_pressure"] == "0.18"
+    assert metadata["temporal_is_peak"] == "1"
+    assert metadata["freshness_policy"] == "stale_neutral_v1"
+
+
+def test_parse_source_metadata_legacy_source_without_metadata():
+    source, metadata = features._parse_source_metadata("gbfs+open-meteo+nyc311")
+    assert source == "gbfs+open-meteo+nyc311"
+    assert metadata == {}
+
+
 def test_upsert_context_persists_event_pressure():
     signal = features.ContextSignalV1(
         event_id="ctx_1",
@@ -80,7 +96,23 @@ def test_upsert_context_persists_event_pressure():
         supply_index=0.95,
         weather_factor=1.02,
         traffic_factor=1.1,
-        source="gbfs+open-meteo+nyc311+nyc-events;event_pressure=0.2712",
+        source=(
+            "gbfs+open-meteo+nyc311+nyc-events;"
+            "event_pressure=0.2712;"
+            "event_count_nearby=3;"
+            "weather_precip_mm=2.3;"
+            "weather_wind_kmh=17.4;"
+            "weather_intensity=0.38;"
+            "temporal_hour_local=8.5;"
+            "temporal_is_peak=1;"
+            "temporal_is_weekend=0;"
+            "temporal_is_holiday=0;"
+            "temporal_pressure=0.14;"
+            "freshness_policy=stale_neutral_v1;"
+            "freshness_fallback_applied=1;"
+            "freshness_stale_sources=2;"
+            "age_weather_s=52.0"
+        ),
     )
     redis = _FakeRedis()
 
@@ -91,6 +123,12 @@ def test_upsert_context_persists_event_pressure():
     assert key.endswith("nyc_142")
     assert payload["source"] == "gbfs+open-meteo+nyc311+nyc-events"
     assert float(payload["event_pressure"]) == 0.2712
+    assert int(payload["event_count_nearby"]) == 3
+    assert float(payload["weather_precip_mm"]) == 2.3
+    assert int(payload["is_peak_hour"]) == 1
+    assert payload["freshness_policy"] == "stale_neutral_v1"
+    assert int(payload["context_fallback_applied"]) == 1
+    assert int(payload["context_stale_sources"]) == 2
 
 
 def test_enrich_offer_surfaces_event_pressure():
@@ -108,6 +146,18 @@ def test_enrich_offer_surfaces_event_pressure():
                 "weather_factor": "1.05",
                 "traffic_factor": "1.10",
                 "event_pressure": "0.3375",
+                "event_count_nearby": "4",
+                "weather_precip_mm": "1.7",
+                "weather_wind_kmh": "21.0",
+                "weather_intensity": "0.41",
+                "temporal_hour_local": "17.2",
+                "is_peak_hour": "1",
+                "is_weekend": "0",
+                "is_holiday": "0",
+                "temporal_pressure": "0.14",
+                "context_fallback_applied": "0",
+                "context_stale_sources": "1",
+                "freshness_policy": "stale_neutral_v1",
                 "gbfs_demand_boost": "0.20",
             },
         }
@@ -134,6 +184,10 @@ def test_enrich_offer_surfaces_event_pressure():
     enriched = asyncio.run(features.enrich_offer(redis, offer))
 
     assert enriched["event_pressure"] == 0.3375
+    assert enriched["event_count_nearby"] == 4
+    assert enriched["weather_precip_mm"] == 1.7
+    assert enriched["is_peak_hour"] == 1
+    assert enriched["freshness_policy"] == "stale_neutral_v1"
     assert enriched["demand_index"] == 1.6
 
 

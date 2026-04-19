@@ -47,6 +47,11 @@ def test_health_exposes_events_source_status():
             "closure_pressure_max": "0.3711",
             "speed_pressure_mean": "0.0834",
             "speed_pressure_max": "0.2942",
+            "freshness_policy": "stale_neutral_v1",
+            "context_fallback_applied": "1",
+            "stale_sources_count": "2",
+            "age_weather_s": "52.0",
+            "stale_weather": "1",
         },
         router.TLC_REPLAY_KEY: {},
         router.SINGLE_REPLAY_STATUS_KEY: {},
@@ -75,3 +80,8 @@ def test_health_exposes_events_source_status():
     assert payload["data_quality"]["dot_speeds_rows"] == 321
     assert payload["data_quality"]["closure_pressure_max"] == 0.3711
     assert payload["data_quality"]["speed_pressure_max"] == 0.2942
+    assert payload["data_quality"]["freshness_policy"] == "stale_neutral_v1"
+    assert payload["data_quality"]["context_fallback_applied"] is True
+    assert payload["data_quality"]["stale_sources_count"] == 2
+    assert payload["data_quality"]["age_weather_s"] == 52.0
+    assert payload["data_quality"]["stale_weather"] is True
