@@ -17,6 +17,8 @@ const state = {
   missionJournalError: null,
   missionJournalDriver: null,
   zones: [],
+  shiftPlan: null,
+  shiftPlanError: null,
   replay: [],
   selectedOfferKey: null,
   selectedOfferSource: null,
@@ -61,6 +63,8 @@ const dispatchPlanEl = $('dispatchPlan');
 const dispatchMapEl = $('dispatchMap');
 const dispatchLegendEl = $('dispatchLegend');
 const zonesEl = $('zones');
+const shiftPlanSummaryEl = $('shiftPlanSummary');
+const shiftPlanEl = $('shiftPlanList');
 const replaySummary = $('replaySummary');
 const replayTimeline = $('replayTimeline');
 const uxStatusLine = $('uxStatusLine');
@@ -95,6 +99,9 @@ const zoneDistanceWeightInput = $('zoneDistanceWeight');
 const zoneMaxDistanceKmInput = $('zoneMaxDistanceKm');
 const zoneHomeLatInput = $('zoneHomeLat');
 const zoneHomeLonInput = $('zoneHomeLon');
+const shiftPlanHorizonInput = $('shiftPlanHorizon');
+const shiftPlanTopKInput = $('shiftPlanTopK');
+const refreshShiftPlanBtn = $('refreshShiftPlanBtn');
 const missionStartBestBtn = $('missionStartBestBtn');
 const missionStopBtn = $('missionStopBtn');
 const missionStatusEl = $('missionStatus');
@@ -1784,6 +1791,105 @@ function renderZones() {
   });
 }
 
+function renderShiftPlan() {
+  if (!shiftPlanEl || !shiftPlanSummaryEl) return;
+  shiftPlanEl.innerHTML = '';
+
+  if (state.shiftPlanError) {
+    shiftPlanSummaryEl.textContent = `Shift plan unavailable: ${state.shiftPlanError}`;
+    renderListState(shiftPlanEl, 'error', 'Unable to compute shift plan right now.');
+    return;
+  }
+
+  const plan = state.shiftPlan;
+  const items = Array.isArray(plan?.items) ? plan.items : [];
+  if (!items.length) {
+    shiftPlanSummaryEl.textContent = 'No shift plan yet.';
+    renderListState(shiftPlanEl, 'empty', 'Refresh to compute 60/90 minute hotspots.');
+    return;
+  }
+
+  const horizon = Number(plan?.horizon_min || shiftPlanHorizonInput?.value || 60);
+  const target = Number(plan?.target_hourly_net_eur || 0);
+  shiftPlanSummaryEl.textContent = `Top ${items.length} zones for next ${horizon} min - target ${fmt(target, 1)} EUR/h`;
+
+  const maxScore = Math.max(...items.map((item) => Number(item.shift_score || 0)), 0.001);
+  const originLat = asFloatOrNull(plan?.origin_lat ?? state.dispatch?.origin?.lat);
+  const originLon = asFloatOrNull(plan?.origin_lon ?? state.dispatch?.origin?.lon);
+
+  items.forEach((item, idx) => {
+    const zoneLat = asFloatOrNull(item.zone_lat);
+    const zoneLon = asFloatOrNull(item.zone_lon);
+    const score = Number(item.shift_score || 0);
+    const confidence = Number(item.confidence || 0);
+    const meter = Math.max(6, Math.min(100, (score / maxScore) * 100));
+    const reasons = Array.isArray(item.reasons) ? item.reasons.slice(0, 4) : [];
+    const whyNow = escapeHtml(String(item.why_now || reasons[0] || 'Balanced opportunity now.'));
+    const reasonChips = reasons.map((reason) => `<span>${escapeHtml(reason)}</span>`).join('');
+    const confidencePct = `${fmt(confidence * 100, 0)}%`;
+
+    const goButton =
+      originLat != null && originLon != null && zoneLat != null && zoneLon != null
+        ? `
+          <button
+            class="ghost"
+            data-action="go-zone"
+            data-origin-lat="${originLat}"
+            data-origin-lon="${originLon}"
+            data-dest-lat="${zoneLat}"
+            data-dest-lon="${zoneLon}"
+          >Go Zone</button>
+        `
+        : '';
+
+    const startMissionButton =
+      zoneLat != null && zoneLon != null
+        ? `
+          <button
+            class="ghost"
+            data-action="start-mission"
+            data-zone-id="${escapeHtml(item.zone_id || 'zone')}"
+            data-dest-lat="${zoneLat}"
+            data-dest-lon="${zoneLon}"
+            data-score="${fmt(score, 3)}"
+            data-potential="${fmt(item.estimated_gross_eur_h, 3)}"
+            data-eta="${fmt(item.eta_min, 3)}"
+            data-dispatch-strategy="${String(state.dispatch?.dispatch_strategy || 'balanced').toLowerCase()}"
+            data-effective-max-eta="${asFloatOrNull(state.dispatch?.effective_max_reposition_eta_min) == null ? '' : asFloatOrNull(state.dispatch?.effective_max_reposition_eta_min)}"
+          >Start Mission</button>
+        `
+        : '';
+
+    const row = document.createElement('article');
+    row.className = 'zone';
+    row.innerHTML = `
+      <div class="zone-top">
+        <strong>#${Number(item.rank || idx + 1)} ${escapeHtml(item.zone_id || 'unknown_zone')}</strong>
+        <span>${fmt(score, 3)}</span>
+      </div>
+      <div class="offer-meta">
+        <span class="muted">confidence ${confidencePct}</span>
+        <span>${fmt(item.distance_km, 2)} km - ${fmt(item.eta_min, 1)} min</span>
+      </div>
+      <div class="offer-metrics">
+        <div class="offer-metric"><div class="k">Net EUR/h</div><div class="v">${fmt(item.estimated_net_eur_h, 1)}</div></div>
+        <div class="offer-metric"><div class="k">Gross EUR/h</div><div class="v">${fmt(item.estimated_gross_eur_h, 1)}</div></div>
+        <div class="offer-metric"><div class="k">Gain vs Target</div><div class="v">${fmtSigned(item.net_gain_vs_target_eur_h, 1)}</div></div>
+        <div class="offer-metric"><div class="k">Reposition EUR</div><div class="v">${fmt(item.reposition_total_cost_eur, 2)}</div></div>
+      </div>
+      <div class="muted"><strong>Why now:</strong> ${whyNow}</div>
+      <div class="muted">demand ${fmt(item.demand_index, 2)} / supply ${fmt(item.supply_index, 2)} - event ${fmt(item.event_pressure, 2)} - temporal ${fmt(item.temporal_pressure, 2)} - forecast pressure ${fmt(item.forecast_pressure_ratio, 2)}</div>
+      <div class="chips">${reasonChips}</div>
+      <div class="zone-meter"><div style="width:${meter}%"></div></div>
+      <div class="offer-actions">
+        ${goButton}
+        ${startMissionButton}
+      </div>
+    `;
+    shiftPlanEl.appendChild(row);
+  });
+}
+
 function renderReplay() {
   const events = state.replay;
   kpiReplay.textContent = String(events.length);
@@ -1870,6 +1976,24 @@ function buildDispatchQuery(driver) {
   return `/copilot/driver/${encodeURIComponent(driver)}/instant-dispatch?around_radius_km=${encodeURIComponent(radius)}&around_limit=${encodeURIComponent(aroundLimit)}&scan_limit=${encodeURIComponent(scanLimit)}&zone_top_k=${encodeURIComponent(zoneTopK)}&min_accept_score=${encodeURIComponent(minAccept)}&max_reposition_eta_min=${encodeURIComponent(maxEta)}&forecast_horizon_min=${encodeURIComponent(forecastHorizon)}&dispatch_strategy=${encodeURIComponent(dispatchStrategy)}&use_osrm=${useOsrm}`;
 }
 
+function buildShiftPlanQuery(driver) {
+  const rawHorizon = Number(shiftPlanHorizonInput?.value || 60);
+  const horizon = rawHorizon === 90 ? 90 : 60;
+  const rawTopK = Number(shiftPlanTopKInput?.value || 6);
+  const topK = Math.max(3, Math.min(20, rawTopK || 6));
+  const rawWeight = Number(zoneDistanceWeightInput?.value);
+  const weight = Number.isFinite(rawWeight) ? Math.max(0, Math.min(1, rawWeight)) : 0.3;
+  const rawMax = Number(zoneMaxDistanceKmInput?.value);
+  const useOsrm = aroundUseOsrmInput.checked ? 'true' : 'false';
+
+  let query = `/copilot/driver/${encodeURIComponent(driver)}/shift-plan?horizon_min=${encodeURIComponent(horizon)}&top_k=${encodeURIComponent(topK)}&distance_weight=${encodeURIComponent(weight)}&use_osrm=${useOsrm}`;
+  if (Number.isFinite(rawMax) && rawMax > 0) {
+    const clamped = Math.max(0.5, Math.min(50, rawMax));
+    query += `&max_distance_km=${encodeURIComponent(clamped)}`;
+  }
+  return query;
+}
+
 async function refreshHealth() {
   if (state.refreshHealthInFlight) return;
   state.refreshHealthInFlight = true;
@@ -1932,6 +2056,8 @@ async function refreshDriverData() {
   renderListState(bestOffersEl, 'loading', 'Loading nearby recommendations...');
   dispatchSummaryEl.textContent = 'Loading instant dispatch recommendation...';
   renderListState(dispatchPlanEl, 'loading', 'Computing instant dispatch recommendation...');
+  if (shiftPlanSummaryEl) shiftPlanSummaryEl.textContent = 'Loading shift plan recommendation...';
+  if (shiftPlanEl) renderListState(shiftPlanEl, 'loading', 'Computing shift plan hotspots...');
   if (dispatchMapState.map) {
     clearDispatchLeafletLayers();
   } else {
@@ -1942,11 +2068,12 @@ async function refreshDriverData() {
   renderListState(zonesEl, 'loading', 'Loading zones...');
 
   try {
-    const [offersResp, zonesResp, bestResp, dispatchResp] = await Promise.all([
+    const [offersResp, zonesResp, bestResp, dispatchResp, shiftPlanResp] = await Promise.all([
       api(`/copilot/driver/${encodeURIComponent(driver)}/offers?limit=${Math.max(limit, 20)}`),
       api(buildZoneQuery(driver)),
       api(buildAroundQuery(driver)).catch((err) => ({ offers: [], _error: errorMessage(err, 'best offers unavailable') })),
       api(buildDispatchQuery(driver)).catch((err) => ({ _error: errorMessage(err, 'dispatch unavailable') })),
+      api(buildShiftPlanQuery(driver)).catch((err) => ({ _error: errorMessage(err, 'shift plan unavailable') })),
     ]);
 
     state.offers = Array.isArray(offersResp.offers) ? offersResp.offers : [];
@@ -1955,6 +2082,8 @@ async function refreshDriverData() {
     state.bestOffersError = bestResp._error || null;
     state.dispatch = dispatchResp._error ? null : dispatchResp;
     state.dispatchError = dispatchResp._error || null;
+    state.shiftPlan = shiftPlanResp._error ? null : shiftPlanResp;
+    state.shiftPlanError = shiftPlanResp._error || null;
 
     renderKpis();
     ensureSelectedOffer();
@@ -1963,6 +2092,7 @@ async function refreshDriverData() {
     renderDispatch();
     renderMissionPanel();
     renderZones();
+    renderShiftPlan();
     renderDecisionFlow();
     setUxStatus('success', 'Ready: choose an offer, score it, then trigger the action route.');
   } catch (err) {
@@ -1980,12 +2110,16 @@ async function refreshDriverData() {
     }
     dispatchLegendEl.innerHTML = '';
     renderListState(zonesEl, 'error', `Unable to load zones: ${msg}`);
+    if (shiftPlanSummaryEl) shiftPlanSummaryEl.textContent = `Shift plan unavailable: ${msg}`;
+    if (shiftPlanEl) renderListState(shiftPlanEl, 'error', `Unable to load shift plan: ${msg}`);
     state.offers = [];
     state.bestOffers = [];
     state.bestOffersError = msg;
     state.dispatch = null;
     state.dispatchError = msg;
     state.zones = [];
+    state.shiftPlan = null;
+    state.shiftPlanError = msg;
     state.selectedOfferKey = null;
     state.selectedOfferSource = null;
     state.lastScoredOfferId = null;
@@ -2313,6 +2447,7 @@ safeBind($('windowToday'), 'click', () => {
 
 safeBind($('refreshBtn'), 'click', refreshAll);
 safeBind($('refreshAroundBtn'), 'click', refreshDriverData);
+safeBind(refreshShiftPlanBtn, 'click', refreshDriverData);
 safeBind(refreshFuelBtn, 'click', () => {
   refreshFuelContextNow(false).catch(() => {});
 });
@@ -2364,12 +2499,15 @@ bindChangeAndInput(zoneDistanceWeightInput, refreshDriverDataDebounced);
 bindChangeAndInput(zoneMaxDistanceKmInput, refreshDriverDataDebounced);
 bindChangeAndInput(zoneHomeLatInput, refreshDriverDataDebounced);
 bindChangeAndInput(zoneHomeLonInput, refreshDriverDataDebounced);
+safeBind(shiftPlanHorizonInput, 'change', refreshDriverData);
+bindChangeAndInput(shiftPlanTopKInput, refreshDriverDataDebounced);
 safeBind(autoRefreshBox, 'change', startAutoRefreshLoop);
 
 bindOfferActionDelegation(offersEl);
 bindOfferActionDelegation(bestOffersEl);
 bindOfferActionDelegation(dispatchPlanEl);
 bindOfferActionDelegation(dispatchLegendEl);
+bindOfferActionDelegation(shiftPlanEl);
 setFlowStep('choose');
 renderDecisionFlow();
 renderMissionPanel();

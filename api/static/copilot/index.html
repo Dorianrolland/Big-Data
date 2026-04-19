@@ -739,10 +739,20 @@
                 <option value="aggressive">Aggressive</option>
               </select>
             </label>
+            <label>Shift Horizon
+              <select id="shiftPlanHorizon">
+                <option value="60" selected>60 min</option>
+                <option value="90">90 min</option>
+              </select>
+            </label>
+          </div>
+          <div class="grid two">
+            <label>Shift Plan Zone Limit<input id="shiftPlanTopK" type="number" step="1" min="3" max="20" value="6" /></label>
           </div>
           <div class="quick-row">
             <label class="auto-refresh"><input id="aroundUseOsrm" type="checkbox" /> route-aware (OSRM)</label>
             <button class="ghost" id="refreshAroundBtn">Refresh Best Around</button>
+            <button class="ghost" id="refreshShiftPlanBtn">Refresh Shift Plan</button>
             <button class="ghost" id="refreshFuelBtn">Sync Fuel API</button>
           </div>
           <div class="kpi-grid">
@@ -870,6 +880,12 @@
         <section class="card glass">
           <h2>Next Best Zones</h2>
           <div class="list" id="zones"></div>
+        </section>
+
+        <section class="card glass">
+          <h2>Shift Plan (60-90 min)</h2>
+          <div class="info-line" id="shiftPlanSummary">No shift plan yet.</div>
+          <div class="list" id="shiftPlanList"></div>
         </section>
 
         <section class="card glass">
