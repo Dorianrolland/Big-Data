@@ -2,6 +2,7 @@
 context_poller — streams real NYC market-context signals to Kafka.
 
 Periodically hits public APIs (Citi Bike GBFS, Open-Meteo, NYC 311 Socrata,
+NYC DOT weekly traffic advisory, NYC DOT traffic speeds feed,
 NYC Permitted Event Information)
 and publishes one ContextSignalV1 per NYC taxi zone every CONTEXT_TICK seconds
 on the context-signals-v1 topic.
@@ -10,7 +11,7 @@ Signal fields populated from real data:
 - demand_index   : 1.0 + f(Citi Bike station scarcity) + event_pressure (capped)
 - supply_index   : live courier count (GEOSEARCH around the zone centroid) / scale
 - weather_factor : 1.0 + f(precipitation) + f(wind)      — Open-Meteo NYC
-- traffic_factor : 1.0 + f(precipitation) + f(311 traffic complaints near zone)
+- traffic_factor : 1.0 + f(precipitation) + f(311) + closure_pressure + speed_pressure
 - source         : short tag describing which APIs fed this cycle
 """
 from __future__ import annotations
@@ -18,11 +19,13 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from datetime import datetime, timedelta
+import html
 import hashlib
 import json
 import logging
 import math
 import os
+import re
 import signal
 import time
 from pathlib import Path
@@ -73,6 +76,8 @@ GBFS_POLL_SECONDS = _env_float("GBFS_POLL_SECONDS", 60.0, min_value=5.0)
 WEATHER_POLL_SECONDS = _env_float("WEATHER_POLL_SECONDS", 600.0, min_value=30.0)
 NYC311_POLL_SECONDS = _env_float("NYC311_POLL_SECONDS", 300.0, min_value=30.0)
 EVENTS_POLL_SECONDS = _env_float("EVENTS_POLL_SECONDS", 600.0, min_value=60.0)
+DOT_ADVISORY_POLL_SECONDS = _env_float("DOT_ADVISORY_POLL_SECONDS", 1800.0, min_value=300.0)
+DOT_SPEEDS_POLL_SECONDS = _env_float("DOT_SPEEDS_POLL_SECONDS", 300.0, min_value=60.0)
 CONTEXT_QUALITY_KEY = os.getenv("CONTEXT_QUALITY_KEY", "copilot:context:quality")
 CONTEXT_QUALITY_TTL_SECONDS = _env_int("CONTEXT_QUALITY_TTL_SECONDS", 7200, min_value=300)
 CONTEXT_QUALITY_WINDOW_CYCLES = _env_int("CONTEXT_QUALITY_WINDOW_CYCLES", 10, min_value=2)
@@ -101,6 +106,14 @@ NYC_EVENTS_URL = os.getenv(
     "NYC_EVENTS_URL",
     "https://data.cityofnewyork.us/resource/tvpp-9vvx.json",
 )
+NYC_DOT_WEEKLY_ADVISORY_URL = os.getenv(
+    "NYC_DOT_WEEKLY_ADVISORY_URL",
+    "https://www.nyc.gov/html/dot/html/motorist/weektraf.shtml",
+)
+NYC_DOT_SPEEDS_URL = os.getenv(
+    "NYC_DOT_SPEEDS_URL",
+    "https://linkdata.nyctmc.org/data/LinkSpeedQuery.txt",
+)
 
 HTTP_USER_AGENT = os.getenv("HTTP_USER_AGENT", "FleetStream/1.0 (context-poller; contact=ops@fleetstream.local)")
 
@@ -109,6 +122,17 @@ CENTROIDS_PATH = Path(__file__).parent / "nyc_zone_centroids.json"
 DEMAND_RADIUS_KM = _env_float("DEMAND_RADIUS_KM", 0.8, min_value=0.1)
 SUPPLY_RADIUS_KM = _env_float("SUPPLY_RADIUS_KM", 1.0, min_value=0.1)
 TRAFFIC_RADIUS_KM = _env_float("TRAFFIC_RADIUS_KM", 1.5, min_value=0.1)
+TRAFFIC_CLOSURE_RADIUS_KM = _env_float("TRAFFIC_CLOSURE_RADIUS_KM", 4.5, min_value=0.2)
+TRAFFIC_SPEED_RADIUS_KM = _env_float("TRAFFIC_SPEED_RADIUS_KM", 3.5, min_value=0.2)
+TRAFFIC_CLOSURE_LOOKAHEAD_HOURS = _env_float("TRAFFIC_CLOSURE_LOOKAHEAD_HOURS", 72.0, min_value=1.0)
+TRAFFIC_CLOSURE_POST_WINDOW_MINUTES = _env_float("TRAFFIC_CLOSURE_POST_WINDOW_MINUTES", 240.0, min_value=0.0)
+TRAFFIC_CLOSURE_PRESSURE_SCALE = _env_float("TRAFFIC_CLOSURE_PRESSURE_SCALE", 0.32, min_value=0.0)
+TRAFFIC_CLOSURE_PRESSURE_CAP = _env_float("TRAFFIC_CLOSURE_PRESSURE_CAP", 0.55, min_value=0.0)
+TRAFFIC_SPEED_BASELINE_KMH = _env_float("TRAFFIC_SPEED_BASELINE_KMH", 38.0, min_value=5.0)
+TRAFFIC_SPEED_PRESSURE_SCALE = _env_float("TRAFFIC_SPEED_PRESSURE_SCALE", 0.55, min_value=0.0)
+TRAFFIC_SPEED_PRESSURE_CAP = _env_float("TRAFFIC_SPEED_PRESSURE_CAP", 0.45, min_value=0.0)
+TRAFFIC_FACTOR_CAP = _env_float("TRAFFIC_FACTOR_CAP", 2.4, min_value=1.0)
+TRAFFIC_SPEED_INPUT_UNIT = str(os.getenv("TRAFFIC_SPEED_INPUT_UNIT", "mph")).strip().lower()
 EVENT_RADIUS_KM = _env_float("EVENT_RADIUS_KM", 4.5, min_value=0.2)
 EVENT_LOOKAHEAD_HOURS = _env_float("EVENT_LOOKAHEAD_HOURS", 6.0, min_value=0.25)
 EVENT_POST_WINDOW_MINUTES = _env_float("EVENT_POST_WINDOW_MINUTES", 60.0, min_value=0.0)
@@ -190,6 +214,358 @@ def _event_borough_centroid(value: object) -> tuple[float, float] | None:
         return None
     return BOROUGH_CENTROIDS.get(borough)
 
+
+def _infer_borough_from_text(value: object) -> str | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    normalized = text.replace("/", " ").replace("-", " ").replace("_", " ")
+    for token, borough in (
+        ("staten island", "staten_island"),
+        ("manhattan", "manhattan"),
+        ("new york", "manhattan"),
+        ("brooklyn", "brooklyn"),
+        ("queens", "queens"),
+        ("bronx", "bronx"),
+    ):
+        if token in normalized:
+            return borough
+    return None
+
+
+def _value_from(row: dict[str, object], keys: tuple[str, ...]) -> object | None:
+    for key in keys:
+        if key in row and row.get(key) not in (None, ""):
+            return row.get(key)
+    return None
+
+
+def _is_nyc_lat_lon(lat: float, lon: float) -> bool:
+    return 40.3 <= lat <= 41.2 and -74.6 <= lon <= -73.2
+
+
+def _coerce_lat_lon(pair_a: float, pair_b: float) -> tuple[float, float] | None:
+    candidates = ((pair_a, pair_b), (pair_b, pair_a))
+    for lat, lon in candidates:
+        if _is_nyc_lat_lon(lat, lon):
+            return lat, lon
+    if abs(pair_a) <= 90.0 and abs(pair_b) <= 180.0:
+        return pair_a, pair_b
+    if abs(pair_b) <= 90.0 and abs(pair_a) <= 180.0:
+        return pair_b, pair_a
+    return None
+
+
+def _extract_lat_lon_from_row(row: dict[str, object]) -> tuple[float, float] | None:
+    lat_raw = _value_from(row, ("latitude", "lat", "point_latitude", "from_latitude", "start_latitude"))
+    lon_raw = _value_from(row, ("longitude", "lon", "lng", "point_longitude", "from_longitude", "start_longitude"))
+    lat = _coerce_float(lat_raw)
+    lon = _coerce_float(lon_raw)
+    if lat is not None and lon is not None:
+        out = _coerce_lat_lon(lat, lon)
+        if out is not None:
+            return out
+
+    # Socrata location object: {"latitude": "...", "longitude": "..."}
+    for loc_key in ("location", "the_geom"):
+        loc_val = row.get(loc_key)
+        if isinstance(loc_val, dict):
+            lat2 = _coerce_float(loc_val.get("latitude"))
+            lon2 = _coerce_float(loc_val.get("longitude"))
+            if lat2 is not None and lon2 is not None:
+                out = _coerce_lat_lon(lat2, lon2)
+                if out is not None:
+                    return out
+            coords = loc_val.get("coordinates")
+            if isinstance(coords, (list, tuple)) and len(coords) >= 2:
+                a = _coerce_float(coords[0])
+                b = _coerce_float(coords[1])
+                if a is not None and b is not None:
+                    out = _coerce_lat_lon(a, b)
+                    if out is not None:
+                        return out
+    return None
+
+
+def _parse_weekly_advisory_window(html_text: str, *, now_ts: float) -> tuple[float, float]:
+    default_start = now_ts - (2.0 * 3600.0)
+    default_end = now_ts + (7.0 * 24.0 * 3600.0)
+    if not html_text:
+        return default_start, default_end
+
+    month_map = {
+        "january": 1,
+        "february": 2,
+        "march": 3,
+        "april": 4,
+        "may": 5,
+        "june": 6,
+        "july": 7,
+        "august": 8,
+        "september": 9,
+        "october": 10,
+        "november": 11,
+        "december": 12,
+    }
+    pattern = re.compile(
+        r"Weekly Traffic Advisory for [A-Za-z]+\s+([A-Za-z]+)\s+(\d{1,2}),\s+(\d{4}),\s+to\s+[A-Za-z]+\s+([A-Za-z]+)\s+(\d{1,2}),\s+(\d{4})",
+        flags=re.IGNORECASE,
+    )
+    match = pattern.search(html_text)
+    if not match:
+        return default_start, default_end
+
+    start_month = month_map.get(match.group(1).strip().lower())
+    start_day = int(match.group(2))
+    start_year = int(match.group(3))
+    end_month = month_map.get(match.group(4).strip().lower())
+    end_day = int(match.group(5))
+    end_year = int(match.group(6))
+    if start_month is None or end_month is None:
+        return default_start, default_end
+
+    try:
+        start_dt = datetime(start_year, start_month, start_day, 0, 0, tzinfo=NYC_TZ)
+        end_dt = datetime(end_year, end_month, end_day, 23, 59, tzinfo=NYC_TZ)
+    except ValueError:
+        return default_start, default_end
+    return start_dt.astimezone(UTC_TZ).timestamp(), end_dt.astimezone(UTC_TZ).timestamp()
+
+
+def _strip_html_to_lines(raw_html: str) -> list[str]:
+    if not raw_html:
+        return []
+    text = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", raw_html)
+    text = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", text)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</(?:p|div|li|h1|h2|h3|h4|tr|td|th)>", "\n", text)
+    text = re.sub(r"(?is)<[^>]+>", " ", text)
+    text = html.unescape(text)
+    lines = []
+    for raw in text.splitlines():
+        line = re.sub(r"\s+", " ", raw).strip()
+        if line:
+            lines.append(line)
+    return lines
+
+
+def _closure_severity(text: str) -> float:
+    body = text.lower()
+    severity = 0.25
+    if "full" in body and "close" in body:
+        severity += 0.65
+    if "double-lane" in body or "two out of" in body or "2 out of" in body:
+        severity += 0.32
+    elif "single-lane" in body or "single lane" in body:
+        severity += 0.2
+    if "bridge" in body or "tunnel" in body:
+        severity += 0.1
+    if "rolling closure" in body:
+        severity += 0.12
+    return max(0.1, min(1.35, severity))
+
+
+def _extract_closure_records_from_weekly_advisory(raw_html: str, *, now_ts: float) -> list[dict[str, object]]:
+    lines = _strip_html_to_lines(raw_html)
+    if not lines:
+        return []
+
+    start_ts, end_ts = _parse_weekly_advisory_window(raw_html, now_ts=now_ts)
+    closure_keywords = (" close", "closure", "closed", "lane", "detour", "bridge", "tunnel", "parkway")
+    ignored_prefixes = ("weekly traffic advisory", "note:", "location:", "route:", "formation:", "dispersal:")
+    records: list[dict[str, object]] = []
+    active_borough: str | None = None
+    seen: set[str] = set()
+
+    for line in lines:
+        lower = line.lower()
+        borough_guess = _normalize_borough(line) or _infer_borough_from_text(line)
+        if borough_guess and len(lower) <= 32 and not any(token in lower for token in closure_keywords):
+            active_borough = borough_guess
+            continue
+
+        if any(lower.startswith(prefix) for prefix in ignored_prefixes):
+            continue
+        if len(line) < 24:
+            continue
+        if not any(token in lower for token in closure_keywords):
+            continue
+
+        merged_borough = active_borough or _normalize_borough(line) or _infer_borough_from_text(line)
+        coords = BOROUGH_CENTROIDS.get(merged_borough) if merged_borough else None
+        if coords is None:
+            continue
+
+        dedupe_key = f"{merged_borough}|{line}"
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        records.append(
+            {
+                "lat": coords[0],
+                "lon": coords[1],
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "severity": _closure_severity(line),
+            }
+        )
+    return records
+
+
+def _speed_severity(speed_kmh: float, *, baseline_kmh: float = TRAFFIC_SPEED_BASELINE_KMH) -> float:
+    baseline = max(5.0, baseline_kmh)
+    speed = max(0.0, speed_kmh)
+    if speed >= baseline:
+        return 0.0
+    deficit = (baseline - speed) / baseline
+    if speed < 12.0:
+        deficit += 0.2
+    return max(0.0, min(1.25, deficit))
+
+
+def _normalize_speed_to_kmh(
+    speed: float,
+    *,
+    speed_key: str = "",
+    default_unit: str = TRAFFIC_SPEED_INPUT_UNIT,
+) -> float:
+    key = str(speed_key or "").lower()
+    unit = str(default_unit or "mph").strip().lower()
+    if "kmh" in key or "kph" in key:
+        return float(speed)
+    if "mph" in key:
+        return float(speed) * 1.60934
+    if unit in {"kmh", "kph"}:
+        return float(speed)
+    if unit == "mph":
+        return float(speed) * 1.60934
+    # auto fallback for unknown configs
+    return float(speed) * 1.60934 if float(speed) <= 30.0 else float(speed)
+
+
+def _extract_midpoint_from_link_points(raw: object) -> tuple[float, float] | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    matches = re.findall(r"(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)", text)
+    if not matches:
+        return None
+    coords: list[tuple[float, float]] = []
+    for first, second in matches:
+        a = _coerce_float(first)
+        b = _coerce_float(second)
+        if a is None or b is None:
+            continue
+        out = _coerce_lat_lon(a, b)
+        if out is not None:
+            coords.append(out)
+    if not coords:
+        return None
+    lat = sum(item[0] for item in coords) / len(coords)
+    lon = sum(item[1] for item in coords) / len(coords)
+    return round(lat, 6), round(lon, 6)
+
+
+def _build_speed_sample_from_row(row: dict[str, object]) -> dict[str, object] | None:
+    if not isinstance(row, dict):
+        return None
+
+    coords = _extract_lat_lon_from_row(row)
+    if coords is None:
+        coords = _extract_midpoint_from_link_points(_value_from(row, ("link_points", "segment", "geometry")))
+    if coords is None:
+        coords = _event_borough_centroid(
+            _value_from(row, ("borough", "event_borough", "boro", "borough_name", "bname"))
+        )
+    if coords is None:
+        return None
+
+    speed_raw = _value_from(row, ("speed", "speed_kmh", "avg_speed", "speed_average", "travel_speed"))
+    speed = _coerce_float(speed_raw)
+    if speed is None:
+        return None
+    speed_key = ""
+    for candidate in ("speed", "speed_kmh", "avg_speed", "speed_average", "travel_speed"):
+        if candidate in row and row.get(candidate) not in (None, ""):
+            speed_key = candidate
+            break
+
+    speed_kmh = _normalize_speed_to_kmh(float(speed), speed_key=speed_key)
+
+    if speed_kmh <= 0.1:
+        return None
+
+    return {
+        "lat": coords[0],
+        "lon": coords[1],
+        "speed_kmh": round(speed_kmh, 3),
+        "severity": _speed_severity(speed_kmh),
+    }
+
+
+def _sample_from_text_parts(parts: list[str]) -> dict[str, object] | None:
+    if len(parts) < 3:
+        return None
+
+    # Fast path: first 3 columns are lat, lon, speed (or lon, lat, speed)
+    first = _coerce_float(parts[0])
+    second = _coerce_float(parts[1])
+    speed0 = _coerce_float(parts[2])
+    if first is not None and second is not None and speed0 is not None:
+        lat_lon = _coerce_lat_lon(first, second)
+        if lat_lon is not None and speed0 > 0.0:
+            speed_kmh = _normalize_speed_to_kmh(speed0)
+            return {
+                "lat": lat_lon[0],
+                "lon": lat_lon[1],
+                "speed_kmh": round(max(0.0, speed_kmh), 3),
+                "severity": _speed_severity(max(0.0, speed_kmh)),
+            }
+
+    # Robust path: locate first plausible coordinate pair, then next numeric as speed.
+    numeric: list[tuple[int, float]] = []
+    for idx, token in enumerate(parts):
+        value = _coerce_float(token)
+        if value is not None:
+            numeric.append((idx, value))
+    if len(numeric) < 3:
+        return None
+
+    for i in range(len(numeric) - 1):
+        idx_a, val_a = numeric[i]
+        idx_b, val_b = numeric[i + 1]
+        lat_lon = _coerce_lat_lon(val_a, val_b)
+        if lat_lon is None:
+            continue
+        speed_val: float | None = None
+        for idx_c, val_c in numeric:
+            if idx_c > idx_b and val_c > 0.0:
+                speed_val = val_c
+                break
+        if speed_val is None:
+            continue
+        speed_kmh = _normalize_speed_to_kmh(speed_val)
+        return {
+            "lat": lat_lon[0],
+            "lon": lat_lon[1],
+            "speed_kmh": round(max(0.0, speed_kmh), 3),
+            "severity": _speed_severity(max(0.0, speed_kmh)),
+        }
+    return None
+
+
+def _extract_speed_samples_from_text(raw_text: str) -> list[dict[str, object]]:
+    if not raw_text:
+        return []
+    rows: list[dict[str, object]] = []
+    for line in raw_text.splitlines():
+        if "," not in line:
+            continue
+        parts = [part.strip() for part in line.split(",")]
+        sample = _sample_from_text_parts(parts)
+        if sample:
+            rows.append(sample)
+    return rows
 
 def _parse_event_datetime(raw: object) -> datetime | None:
     text = str(raw or "").strip()
@@ -354,6 +730,14 @@ class ContextState:
         self.weather_last_updated: float = 0.0
         self.nyc311_incidents: list[tuple[float, float]] = []  # (lat, lon)
         self.nyc311_last_updated: float = 0.0
+        self.dot_closure_records: list[dict[str, object]] = []
+        self.dot_closure_last_updated: float = 0.0
+        self.dot_closure_status: str = "idle"
+        self.dot_closure_rows: int = 0
+        self.dot_speed_samples: list[dict[str, object]] = []
+        self.dot_speeds_last_updated: float = 0.0
+        self.dot_speeds_status: str = "idle"
+        self.dot_speeds_rows: int = 0
         self.events: list[dict[str, object]] = []
         self.events_last_updated: float = 0.0
         self.events_source_status: str = "idle"
@@ -460,6 +844,82 @@ async def poll_nyc311(state: ContextState, stop: asyncio.Event) -> None:
                 log.warning("nyc311 poll failed: %s", exc)
             try:
                 await asyncio.wait_for(stop.wait(), timeout=NYC311_POLL_SECONDS)
+            except asyncio.TimeoutError:
+                pass
+
+
+async def poll_nyc_dot_weekly_advisory(state: ContextState, stop: asyncio.Event) -> None:
+    async with httpx.AsyncClient(timeout=35, headers={"User-Agent": HTTP_USER_AGENT}) as client:
+        while not stop.is_set():
+            try:
+                resp = await client.get(NYC_DOT_WEEKLY_ADVISORY_URL)
+                resp.raise_for_status()
+                html_text = str(resp.text or "")
+                closures = _extract_closure_records_from_weekly_advisory(html_text, now_ts=time.time())
+
+                state.dot_closure_records = closures
+                state.dot_closure_rows = len(closures)
+                state.dot_closure_last_updated = time.time()
+                state.dot_closure_status = "ok"
+                state.sources_active.add("nyc-dot-advisory")
+                log.info(
+                    "nyc dot weekly advisory refreshed: rows=%d source=%s",
+                    len(closures),
+                    NYC_DOT_WEEKLY_ADVISORY_URL,
+                )
+            except Exception as exc:
+                state.dot_closure_records = []
+                state.dot_closure_rows = 0
+                state.dot_closure_status = "degraded"
+                state.sources_active.discard("nyc-dot-advisory")
+                log.warning("nyc dot weekly advisory poll failed: %s", exc)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=DOT_ADVISORY_POLL_SECONDS)
+            except asyncio.TimeoutError:
+                pass
+
+
+async def poll_nyc_dot_speeds(state: ContextState, stop: asyncio.Event) -> None:
+    async with httpx.AsyncClient(timeout=35, headers={"User-Agent": HTTP_USER_AGENT}) as client:
+        while not stop.is_set():
+            try:
+                resp = await client.get(NYC_DOT_SPEEDS_URL)
+                resp.raise_for_status()
+                raw_body = str(resp.text or "")
+                samples: list[dict[str, object]] = []
+
+                content_type = str(resp.headers.get("content-type") or "").lower()
+                body_trimmed = raw_body.strip()
+                if "application/json" in content_type or body_trimmed.startswith("[") or body_trimmed.startswith("{"):
+                    parsed = resp.json()
+                    rows = parsed if isinstance(parsed, list) else []
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        sample = _build_speed_sample_from_row(row)
+                        if sample:
+                            samples.append(sample)
+                else:
+                    samples = _extract_speed_samples_from_text(raw_body)
+
+                state.dot_speed_samples = samples
+                state.dot_speeds_rows = len(samples)
+                state.dot_speeds_last_updated = time.time()
+                state.dot_speeds_status = "ok"
+                state.sources_active.add("nyc-dot-speeds")
+                log.info(
+                    "nyc dot speeds refreshed: rows=%d source=%s",
+                    len(samples),
+                    NYC_DOT_SPEEDS_URL,
+                )
+            except Exception as exc:
+                state.dot_speed_samples = []
+                state.dot_speeds_rows = 0
+                state.dot_speeds_status = "degraded"
+                state.sources_active.discard("nyc-dot-speeds")
+                log.warning("nyc dot speeds poll failed: %s", exc)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=DOT_SPEEDS_POLL_SECONDS)
             except asyncio.TimeoutError:
                 pass
 
@@ -612,11 +1072,130 @@ def _rush_hour_factor(now_ts: float | None = None) -> float:
     return 0.0
 
 
-def _compute_traffic_factor(state: ContextState, lat: float, lon: float, now_ts: float | None = None) -> float:
+def _compute_closure_pressure(
+    closures: list[dict[str, object]],
+    *,
+    lat: float,
+    lon: float,
+    now_ts: float,
+    radius_km: float = TRAFFIC_CLOSURE_RADIUS_KM,
+    lookahead_hours: float = TRAFFIC_CLOSURE_LOOKAHEAD_HOURS,
+    post_window_minutes: float = TRAFFIC_CLOSURE_POST_WINDOW_MINUTES,
+    scale: float = TRAFFIC_CLOSURE_PRESSURE_SCALE,
+    cap: float = TRAFFIC_CLOSURE_PRESSURE_CAP,
+) -> float:
+    if not closures:
+        return 0.0
+
+    score = 0.0
+    effective_radius = max(0.2, radius_km)
+    for row in closures:
+        row_lat = _coerce_float(row.get("lat"))
+        row_lon = _coerce_float(row.get("lon"))
+        row_start = _coerce_float(row.get("start_ts"))
+        row_end = _coerce_float(row.get("end_ts"))
+        severity = _coerce_float(row.get("severity")) or 0.3
+        if row_lat is None or row_lon is None or row_start is None or row_end is None:
+            continue
+
+        time_w = _event_time_weight(
+            now_ts=now_ts,
+            start_ts=row_start,
+            end_ts=row_end,
+            lookahead_hours=lookahead_hours,
+            post_window_minutes=post_window_minutes,
+        )
+        if time_w <= 0.0:
+            continue
+        distance_km = haversine_km(lat, lon, row_lat, row_lon)
+        if distance_km > effective_radius:
+            continue
+        distance_w = max(0.0, 1.0 - (distance_km / effective_radius)) ** 2
+        score += max(0.05, severity) * time_w * distance_w
+
+    return round(max(0.0, min(float(cap), float(scale) * score)), 4)
+
+
+def _compute_speed_pressure(
+    speeds: list[dict[str, object]],
+    *,
+    lat: float,
+    lon: float,
+    radius_km: float = TRAFFIC_SPEED_RADIUS_KM,
+    scale: float = TRAFFIC_SPEED_PRESSURE_SCALE,
+    cap: float = TRAFFIC_SPEED_PRESSURE_CAP,
+) -> float:
+    if not speeds:
+        return 0.0
+
+    effective_radius = max(0.2, radius_km)
+    weighted_score = 0.0
+    weighted_total = 0.0
+    for row in speeds:
+        row_lat = _coerce_float(row.get("lat"))
+        row_lon = _coerce_float(row.get("lon"))
+        severity = _coerce_float(row.get("severity"))
+        if row_lat is None or row_lon is None:
+            continue
+        if severity is None:
+            speed_kmh = _coerce_float(row.get("speed_kmh"))
+            severity = _speed_severity(speed_kmh) if speed_kmh is not None else None
+        if severity is None or severity <= 0.0:
+            continue
+
+        distance_km = haversine_km(lat, lon, row_lat, row_lon)
+        if distance_km > effective_radius:
+            continue
+        weight = max(0.0, 1.0 - (distance_km / effective_radius))
+        weighted_score += severity * weight
+        weighted_total += weight
+
+    if weighted_total <= 0.0:
+        return 0.0
+    normalized = weighted_score / weighted_total
+    return round(max(0.0, min(float(cap), float(scale) * normalized)), 4)
+
+
+def _compute_traffic_factor(
+    state: ContextState,
+    lat: float,
+    lon: float,
+    now_ts: float | None = None,
+    *,
+    closure_pressure: float | None = None,
+    speed_pressure: float | None = None,
+) -> float:
     local = _count_within(state.nyc311_incidents, lat, lon, TRAFFIC_RADIUS_KM)
     precip = state.weather_precip_mm
-    f = 1.0 + min(0.45, local / 12.0) + min(0.2, precip / 6.0) + _rush_hour_factor(now_ts)
-    return round(min(2.2, f), 3)
+    now_ref = float(now_ts or time.time())
+    closure_component = (
+        float(closure_pressure)
+        if closure_pressure is not None
+        else _compute_closure_pressure(
+            state.dot_closure_records,
+            lat=lat,
+            lon=lon,
+            now_ts=now_ref,
+        )
+    )
+    speed_component = (
+        float(speed_pressure)
+        if speed_pressure is not None
+        else _compute_speed_pressure(
+            state.dot_speed_samples,
+            lat=lat,
+            lon=lon,
+        )
+    )
+    f = (
+        1.0
+        + min(0.45, local / 12.0)
+        + min(0.2, precip / 6.0)
+        + _rush_hour_factor(now_ts)
+        + max(0.0, closure_component)
+        + max(0.0, speed_component)
+    )
+    return round(min(TRAFFIC_FACTOR_CAP, f), 3)
 
 
 def _supply_index_from_member_count(member_count: int) -> float:
@@ -645,12 +1224,18 @@ async def _publish_quality_snapshot(
     supply_values: list[float],
     traffic_values: list[float],
     event_pressures: list[float],
+    closure_pressures: list[float],
+    speed_pressures: list[float],
     supply_mean_history: deque[float],
     sent_cycles: int,
     source_tag: str,
     events_source_active: bool,
     events_rows: int,
     events_status: str,
+    dot_advisory_status: str,
+    dot_advisory_rows: int,
+    dot_speeds_status: str,
+    dot_speeds_rows: int,
 ) -> None:
     if not supply_values:
         return
@@ -676,6 +1261,10 @@ async def _publish_quality_snapshot(
         "events_source_active": "1" if events_source_active else "0",
         "events_rows": str(max(0, int(events_rows))),
         "events_status": events_status,
+        "dot_advisory_status": dot_advisory_status,
+        "dot_advisory_rows": str(max(0, int(dot_advisory_rows))),
+        "dot_speeds_status": dot_speeds_status,
+        "dot_speeds_rows": str(max(0, int(dot_speeds_rows))),
         "supply_key": COURIER_GEO_KEY,
         "zones_count": str(len(supply_values)),
         "supply_min": f"{min(supply_values):.3f}",
@@ -698,6 +1287,14 @@ async def _publish_quality_snapshot(
             if event_pressures
             else "0.0000"
         ),
+        "closure_pressure_mean": (
+            f"{(sum(closure_pressures) / len(closure_pressures)):.4f}" if closure_pressures else "0.0000"
+        ),
+        "closure_pressure_max": f"{(max(closure_pressures) if closure_pressures else 0.0):.4f}",
+        "speed_pressure_mean": (
+            f"{(sum(speed_pressures) / len(speed_pressures)):.4f}" if speed_pressures else "0.0000"
+        ),
+        "speed_pressure_max": f"{(max(speed_pressures) if speed_pressures else 0.0):.4f}",
     }
     await redis_client.hset(CONTEXT_QUALITY_KEY, mapping=payload)
     await redis_client.expire(CONTEXT_QUALITY_KEY, CONTEXT_QUALITY_TTL_SECONDS)
@@ -740,6 +1337,8 @@ async def publisher_loop(
         supply_values: list[float] = []
         traffic_values: list[float] = []
         event_pressures: list[float] = []
+        closure_pressures: list[float] = []
+        speed_pressures: list[float] = []
 
         for loc_id, (lat, lon) in centroids.items():
             zone_id = f"nyc_{loc_id}"
@@ -750,11 +1349,31 @@ async def publisher_loop(
                 now_ts=tick_started,
             )
             demand = _compute_zone_demand(state, lat, lon, event_pressure=event_pressure)
-            traffic = _compute_traffic_factor(state, lat, lon, now_ts=tick_started)
+            closure_pressure = _compute_closure_pressure(
+                state.dot_closure_records,
+                lat=lat,
+                lon=lon,
+                now_ts=tick_started,
+            )
+            speed_pressure = _compute_speed_pressure(
+                state.dot_speed_samples,
+                lat=lat,
+                lon=lon,
+            )
+            traffic = _compute_traffic_factor(
+                state,
+                lat,
+                lon,
+                now_ts=tick_started,
+                closure_pressure=closure_pressure,
+                speed_pressure=speed_pressure,
+            )
             supply = await _zone_supply_index(redis_client, lat, lon)
             supply_values.append(supply)
             traffic_values.append(traffic)
             event_pressures.append(event_pressure)
+            closure_pressures.append(closure_pressure)
+            speed_pressures.append(speed_pressure)
             source_value = (
                 f"{sources_tag};event_pressure={event_pressure:.4f}"
                 if "nyc-events" in state.sources_active
@@ -785,17 +1404,24 @@ async def publisher_loop(
                 supply_values=supply_values,
                 traffic_values=traffic_values,
                 event_pressures=event_pressures,
+                closure_pressures=closure_pressures,
+                speed_pressures=speed_pressures,
                 supply_mean_history=supply_mean_history,
                 sent_cycles=sent_cycles,
                 source_tag=sources_tag,
                 events_source_active=("nyc-events" in state.sources_active),
                 events_rows=state.events_rows,
                 events_status=state.events_source_status,
+                dot_advisory_status=state.dot_closure_status,
+                dot_advisory_rows=state.dot_closure_rows,
+                dot_speeds_status=state.dot_speeds_status,
+                dot_speeds_rows=state.dot_speeds_rows,
             )
             if sent_cycles % 5 == 1:
                 log.info(
                     "published cycle=%d zones=%d sources=%s weather=%.2f supply_mean=%.2f "
-                    "traffic_nonzero=%.2f event_pressure_mean=%.4f took=%.2fs",
+                    "traffic_nonzero=%.2f closure_pressure_mean=%.4f speed_pressure_mean=%.4f "
+                    "event_pressure_mean=%.4f took=%.2fs",
                     sent_cycles,
                     len(centroids),
                     sources_tag,
@@ -806,6 +1432,8 @@ async def publisher_loop(
                         if traffic_values
                         else 0.0
                     ),
+                    (sum(closure_pressures) / len(closure_pressures)) if closure_pressures else 0.0,
+                    (sum(speed_pressures) / len(speed_pressures)) if speed_pressures else 0.0,
                     (sum(event_pressures) / len(event_pressures)) if event_pressures else 0.0,
                     elapsed,
                 )
@@ -857,6 +1485,8 @@ async def main() -> None:
         asyncio.create_task(poll_gbfs(state, stop), name="gbfs"),
         asyncio.create_task(poll_weather(state, stop), name="weather"),
         asyncio.create_task(poll_nyc311(state, stop), name="nyc311"),
+        asyncio.create_task(poll_nyc_dot_weekly_advisory(state, stop), name="nyc-dot-advisory"),
+        asyncio.create_task(poll_nyc_dot_speeds(state, stop), name="nyc-dot-speeds"),
         asyncio.create_task(poll_nyc_events(state, redis_client, stop), name="nyc-events"),
         asyncio.create_task(publisher_loop(state, centroids, producer, redis_client, stop), name="publisher"),
     ]
