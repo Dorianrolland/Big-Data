@@ -66,30 +66,90 @@ def _safe_float(value: object, default: float = 0.0) -> float:
     return float(out)
 
 
-def _parse_source_event_pressure(source: str) -> tuple[str, float]:
+def _safe_bool(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _parse_source_metadata(source: str) -> tuple[str, dict[str, str]]:
     raw = str(source or "").strip()
     if not raw:
-        return "", 0.0
+        return "", {}
     if ";" not in raw:
-        return raw, 0.0
+        return raw, {}
 
     base, *metadata = raw.split(";")
     source_tag = base.strip()
-    pressure = 0.0
+    parsed: dict[str, str] = {}
     for item in metadata:
         key, sep, value = item.strip().partition("=")
         if not sep:
             continue
-        if key.strip().lower() != "event_pressure":
+        k = key.strip().lower()
+        if not k:
             continue
-        try:
-            pressure = float(value.strip())
-        except (TypeError, ValueError):
-            pressure = 0.0
-        if not math.isfinite(pressure):
-            pressure = 0.0
-        break
-    pressure = max(0.0, min(2.0, pressure))
+        parsed[k] = value.strip()
+    return source_tag, parsed
+
+
+def _metadata_float(
+    metadata: dict[str, str],
+    key: str,
+    *,
+    default: float = 0.0,
+    min_value: float | None = None,
+    max_value: float | None = None,
+) -> float:
+    raw = metadata.get(key.strip().lower())
+    try:
+        out = float(raw) if raw is not None else float(default)
+    except (TypeError, ValueError):
+        out = float(default)
+    if not math.isfinite(out):
+        out = float(default)
+    if min_value is not None:
+        out = max(float(min_value), out)
+    if max_value is not None:
+        out = min(float(max_value), out)
+    return float(out)
+
+
+def _metadata_int(
+    metadata: dict[str, str],
+    key: str,
+    *,
+    default: int = 0,
+    min_value: int | None = None,
+    max_value: int | None = None,
+) -> int:
+    raw = metadata.get(key.strip().lower())
+    try:
+        out = int(raw) if raw is not None else int(default)
+    except (TypeError, ValueError):
+        out = int(default)
+    if min_value is not None:
+        out = max(int(min_value), out)
+    if max_value is not None:
+        out = min(int(max_value), out)
+    return int(out)
+
+
+def _metadata_bool(metadata: dict[str, str], key: str, *, default: bool = False) -> bool:
+    raw = metadata.get(key.strip().lower())
+    if raw is None:
+        return bool(default)
+    return _safe_bool(raw, default=default)
+
+
+def _parse_source_event_pressure(source: str) -> tuple[str, float]:
+    source_tag, metadata = _parse_source_metadata(source)
+    pressure = _metadata_float(metadata, "event_pressure", default=0.0, min_value=0.0, max_value=2.0)
     return source_tag, pressure
 
 
@@ -111,6 +171,26 @@ async def enrich_offer(redis_client: aioredis.Redis, offer: OrderOfferV1) -> dic
     weather_factor = _safe_float(zone_state.get("weather_factor"), float(offer.weather_factor or 1.0))
     traffic_factor = max(_safe_float(zone_state.get("traffic_factor"), float(offer.traffic_factor or 1.0)), 0.2)
     event_pressure = max(0.0, _safe_float(zone_state.get("event_pressure"), 0.0))
+    event_count_nearby = max(0, int(_safe_float(zone_state.get("event_count_nearby"), 0.0)))
+    weather_precip_mm = max(0.0, _safe_float(zone_state.get("weather_precip_mm"), 0.0))
+    weather_wind_kmh = max(0.0, _safe_float(zone_state.get("weather_wind_kmh"), 0.0))
+    weather_intensity = max(0.0, min(_safe_float(zone_state.get("weather_intensity"), 0.0), 1.0))
+    temporal_hour_local = _safe_float(zone_state.get("temporal_hour_local"), -1.0)
+    is_peak_hour = 1 if _safe_bool(zone_state.get("is_peak_hour"), False) else 0
+    is_weekend = 1 if _safe_bool(zone_state.get("is_weekend"), False) else 0
+    is_holiday = 1 if _safe_bool(zone_state.get("is_holiday"), False) else 0
+    temporal_pressure = max(0.0, _safe_float(zone_state.get("temporal_pressure"), 0.0))
+    context_fallback_applied = 1 if _safe_bool(zone_state.get("context_fallback_applied"), False) else 0
+    context_stale_sources = max(0, int(_safe_float(zone_state.get("context_stale_sources"), 0.0)))
+    freshness_policy = str(zone_state.get("freshness_policy") or "")
+    age_gbfs_s = _safe_float(zone_state.get("age_gbfs_s"), -1.0)
+    age_weather_s = _safe_float(zone_state.get("age_weather_s"), -1.0)
+    age_nyc311_s = _safe_float(zone_state.get("age_nyc311_s"), -1.0)
+    age_events_s = _safe_float(zone_state.get("age_events_s"), -1.0)
+    age_dot_closure_s = _safe_float(zone_state.get("age_dot_closure_s"), -1.0)
+    age_dot_speeds_s = _safe_float(zone_state.get("age_dot_speeds_s"), -1.0)
+    stale_weather = 1 if _safe_bool(zone_state.get("stale_weather"), False) else 0
+    stale_events = 1 if _safe_bool(zone_state.get("stale_events"), False) else 0
 
     # Enrich with GBFS demand boost (Citi Bike station availability as taxi demand proxy)
     gbfs_demand_boost = max(0.0, _safe_float(zone_state.get("gbfs_demand_boost"), 0.0))
@@ -169,6 +249,26 @@ async def enrich_offer(redis_client: aioredis.Redis, offer: OrderOfferV1) -> dic
         "weather_factor": round(weather_factor, 3),
         "traffic_factor": round(traffic_factor, 3),
         "event_pressure": round(event_pressure, 4),
+        "event_count_nearby": int(event_count_nearby),
+        "weather_precip_mm": round(weather_precip_mm, 3),
+        "weather_wind_kmh": round(weather_wind_kmh, 3),
+        "weather_intensity": round(weather_intensity, 4),
+        "temporal_hour_local": round(temporal_hour_local, 3) if temporal_hour_local >= 0.0 else -1.0,
+        "is_peak_hour": int(is_peak_hour),
+        "is_weekend": int(is_weekend),
+        "is_holiday": int(is_holiday),
+        "temporal_pressure": round(temporal_pressure, 4),
+        "context_fallback_applied": int(context_fallback_applied),
+        "context_stale_sources": int(context_stale_sources),
+        "freshness_policy": freshness_policy,
+        "age_gbfs_s": round(age_gbfs_s, 3),
+        "age_weather_s": round(age_weather_s, 3),
+        "age_nyc311_s": round(age_nyc311_s, 3),
+        "age_events_s": round(age_events_s, 3),
+        "age_dot_closure_s": round(age_dot_closure_s, 3),
+        "age_dot_speeds_s": round(age_dot_speeds_s, 3),
+        "stale_weather": int(stale_weather),
+        "stale_events": int(stale_events),
         "pressure_ratio": round(pressure_ratio, 3),
         "eur_per_hour_net": round(eur_per_hour_net, 3),
         "accept_score_heuristic": round(accept_score, 4),
@@ -196,7 +296,34 @@ async def store_offer(redis_client: aioredis.Redis, feature_map: dict) -> None:
 
 async def upsert_context(redis_client: aioredis.Redis, signal_msg: ContextSignalV1) -> None:
     key = f"{ZONE_CONTEXT_PREFIX}{signal_msg.zone_id}"
-    source_tag, event_pressure = _parse_source_event_pressure(signal_msg.source)
+    source_tag, metadata = _parse_source_metadata(signal_msg.source)
+    event_pressure = _metadata_float(metadata, "event_pressure", default=0.0, min_value=0.0, max_value=2.0)
+    event_count_nearby = _metadata_int(metadata, "event_count_nearby", default=0, min_value=0, max_value=5000)
+    weather_precip_mm = _metadata_float(metadata, "weather_precip_mm", default=0.0, min_value=0.0, max_value=200.0)
+    weather_wind_kmh = _metadata_float(metadata, "weather_wind_kmh", default=0.0, min_value=0.0, max_value=250.0)
+    weather_intensity = _metadata_float(metadata, "weather_intensity", default=0.0, min_value=0.0, max_value=1.0)
+    temporal_hour_local = _metadata_float(
+        metadata, "temporal_hour_local", default=-1.0, min_value=-1.0, max_value=24.0
+    )
+    is_peak_hour = 1 if _metadata_bool(metadata, "temporal_is_peak", default=False) else 0
+    is_weekend = 1 if _metadata_bool(metadata, "temporal_is_weekend", default=False) else 0
+    is_holiday = 1 if _metadata_bool(metadata, "temporal_is_holiday", default=False) else 0
+    temporal_pressure = _metadata_float(metadata, "temporal_pressure", default=0.0, min_value=0.0, max_value=2.0)
+    context_fallback_applied = 1 if _metadata_bool(metadata, "freshness_fallback_applied", default=False) else 0
+    context_stale_sources = _metadata_int(metadata, "freshness_stale_sources", default=0, min_value=0, max_value=12)
+    freshness_policy = str(metadata.get("freshness_policy") or "").strip()
+    age_gbfs_s = _metadata_float(metadata, "age_gbfs_s", default=-1.0)
+    age_weather_s = _metadata_float(metadata, "age_weather_s", default=-1.0)
+    age_nyc311_s = _metadata_float(metadata, "age_nyc311_s", default=-1.0)
+    age_events_s = _metadata_float(metadata, "age_events_s", default=-1.0)
+    age_dot_closure_s = _metadata_float(metadata, "age_dot_closure_s", default=-1.0)
+    age_dot_speeds_s = _metadata_float(metadata, "age_dot_speeds_s", default=-1.0)
+    stale_gbfs = 1 if _metadata_bool(metadata, "stale_gbfs", default=False) else 0
+    stale_weather = 1 if _metadata_bool(metadata, "stale_weather", default=False) else 0
+    stale_nyc311 = 1 if _metadata_bool(metadata, "stale_nyc311", default=False) else 0
+    stale_events = 1 if _metadata_bool(metadata, "stale_events", default=False) else 0
+    stale_dot_closure = 1 if _metadata_bool(metadata, "stale_dot_closure", default=False) else 0
+    stale_dot_speeds = 1 if _metadata_bool(metadata, "stale_dot_speeds", default=False) else 0
     prev_demand_raw, prev_trend_ema_raw, prev_updated_raw = await redis_client.hmget(
         key, ["demand_index", "demand_trend_ema", "updated_at"]
     )
@@ -236,6 +363,30 @@ async def upsert_context(redis_client: aioredis.Redis, signal_msg: ContextSignal
             "forecast_demand_index_15m": round(float(forecast_demand_15m), 3),
             "context_tick_s": context_tick_s if context_tick_s is not None else "",
             "event_pressure": round(float(event_pressure), 4),
+            "event_count_nearby": int(event_count_nearby),
+            "weather_precip_mm": round(float(weather_precip_mm), 3),
+            "weather_wind_kmh": round(float(weather_wind_kmh), 3),
+            "weather_intensity": round(float(weather_intensity), 4),
+            "temporal_hour_local": round(float(temporal_hour_local), 3),
+            "is_peak_hour": int(is_peak_hour),
+            "is_weekend": int(is_weekend),
+            "is_holiday": int(is_holiday),
+            "temporal_pressure": round(float(temporal_pressure), 4),
+            "context_fallback_applied": int(context_fallback_applied),
+            "context_stale_sources": int(context_stale_sources),
+            "freshness_policy": freshness_policy,
+            "age_gbfs_s": round(float(age_gbfs_s), 3),
+            "age_weather_s": round(float(age_weather_s), 3),
+            "age_nyc311_s": round(float(age_nyc311_s), 3),
+            "age_events_s": round(float(age_events_s), 3),
+            "age_dot_closure_s": round(float(age_dot_closure_s), 3),
+            "age_dot_speeds_s": round(float(age_dot_speeds_s), 3),
+            "stale_gbfs": int(stale_gbfs),
+            "stale_weather": int(stale_weather),
+            "stale_nyc311": int(stale_nyc311),
+            "stale_events": int(stale_events),
+            "stale_dot_closure": int(stale_dot_closure),
+            "stale_dot_speeds": int(stale_dot_speeds),
             "source": source_tag or signal_msg.source,
             "updated_at": str(now_s),
         },

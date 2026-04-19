@@ -12,6 +12,18 @@ FEATURE_COLUMNS = [
     "supply_index",
     "weather_factor",
     "traffic_factor",
+    "event_pressure",
+    "event_count_nearby",
+    "weather_precip_mm",
+    "weather_wind_kmh",
+    "weather_intensity",
+    "temporal_hour_local",
+    "is_peak_hour",
+    "is_weekend",
+    "is_holiday",
+    "temporal_pressure",
+    "context_fallback_applied",
+    "context_stale_sources",
     "pressure_ratio",
     "estimated_net_eur_h",
 ]
@@ -57,6 +69,12 @@ def normalize_score_weights(raw_weights: Mapping[str, float] | None = None) -> d
     return {k: float(v / total) for k, v in weights.items()}
 
 
+def _context_freshness_penalty(*, stale_sources: float, fallback_applied: float) -> float:
+    stale_component = clamp(stale_sources / 4.0, 0.0, 1.0) * 0.22
+    fallback_component = clamp(fallback_applied, 0.0, 1.0) * 0.12
+    return stale_component + fallback_component
+
+
 def score_components(features: dict[str, float]) -> dict[str, float]:
     net_hourly = float(features.get("estimated_net_eur_h", 0.0))
     net_trip = float(features.get("estimated_net_eur", 0.0))
@@ -64,6 +82,15 @@ def score_components(features: dict[str, float]) -> dict[str, float]:
     pressure_ratio = max(float(features.get("pressure_ratio", 1.0)), 0.0)
     weather_factor = max(float(features.get("weather_factor", 1.0)), 0.0)
     traffic_factor = max(float(features.get("traffic_factor", 1.0)), 0.0)
+    event_pressure = max(float(features.get("event_pressure", 0.0)), 0.0)
+    event_count_nearby = max(float(features.get("event_count_nearby", 0.0)), 0.0)
+    weather_intensity = clamp(float(features.get("weather_intensity", 0.0)), 0.0, 1.0)
+    temporal_pressure = max(float(features.get("temporal_pressure", 0.0)), 0.0)
+    is_peak_hour = 1.0 if float(features.get("is_peak_hour", 0.0)) >= 0.5 else 0.0
+    is_weekend = 1.0 if float(features.get("is_weekend", 0.0)) >= 0.5 else 0.0
+    is_holiday = 1.0 if float(features.get("is_holiday", 0.0)) >= 0.5 else 0.0
+    context_fallback_applied = 1.0 if float(features.get("context_fallback_applied", 0.0)) >= 0.5 else 0.0
+    context_stale_sources = max(float(features.get("context_stale_sources", 0.0)), 0.0)
     estimated_fare = max(float(features.get("estimated_fare_eur", 0.0)), 0.0)
     fuel_cost = max(float(features.get("fuel_cost_eur", 0.0)), 0.0)
 
@@ -71,17 +98,31 @@ def score_components(features: dict[str, float]) -> dict[str, float]:
     pressure_component = clamp((pressure_ratio - 0.75) / 1.0, 0.0, 1.0)
     weather_component = clamp((weather_factor - 0.85) / 0.35, 0.0, 1.0)
     traffic_component = 1.0 - clamp((traffic_factor - 0.9) / 0.7, 0.0, 1.0)
+    event_component = clamp((event_pressure / 0.8) * 0.72 + (min(event_count_nearby, 5.0) / 5.0) * 0.28, 0.0, 1.0)
+    temporal_component = clamp(
+        (temporal_pressure / 0.35) * 0.7 + ((is_peak_hour * 0.55) + (is_weekend * 0.25) + (is_holiday * 0.20)),
+        0.0,
+        1.0,
+    )
+    freshness_penalty = _context_freshness_penalty(
+        stale_sources=context_stale_sources,
+        fallback_applied=context_fallback_applied,
+    )
+    base_context = (
+        (pressure_component * 0.47)
+        + (weather_component * 0.18)
+        + (traffic_component * 0.17)
+        + (event_component * 0.10)
+        + (temporal_component * 0.08)
+        + (weather_intensity * 0.06)
+    )
 
     return {
         "net_hourly": clamp((net_hourly + 5.0) / 35.0, 0.0, 1.0),
         "net_trip": clamp((net_trip + 1.5) / 18.0, 0.0, 1.0),
         "fuel_efficiency": 1.0 - clamp((fuel_share - 0.06) / 0.25, 0.0, 1.0),
         "time_efficiency": 1.0 - clamp((total_duration_min - 14.0) / 32.0, 0.0, 1.0),
-        "context": clamp(
-            (pressure_component * 0.55) + (weather_component * 0.25) + (traffic_component * 0.20),
-            0.0,
-            1.0,
-        ),
+        "context": clamp(base_context - freshness_penalty, 0.0, 1.0),
     }
 
 
@@ -110,6 +151,25 @@ def build_feature_map(raw: dict[str, Any]) -> dict[str, float]:
     supply_index = max(as_float(raw.get("supply_index"), 1.0), 0.2)
     weather_factor = as_float(raw.get("weather_factor"), 1.0)
     traffic_factor = as_float(raw.get("traffic_factor"), 1.0)
+    event_pressure = max(as_float(raw.get("event_pressure"), 0.0), 0.0)
+    event_count_nearby = max(as_float(raw.get("event_count_nearby"), 0.0), 0.0)
+    weather_precip_mm = max(as_float(raw.get("weather_precip_mm"), 0.0), 0.0)
+    weather_wind_kmh = max(as_float(raw.get("weather_wind_kmh"), 0.0), 0.0)
+    weather_intensity_derived = clamp((weather_precip_mm / 6.0) * 0.65 + (weather_wind_kmh / 50.0) * 0.35, 0.0, 1.0)
+    weather_intensity = clamp(as_float(raw.get("weather_intensity"), weather_intensity_derived), 0.0, 1.0)
+    temporal_hour_local = clamp(as_float(raw.get("temporal_hour_local"), -1.0), -1.0, 24.0)
+    is_peak_hour = 1.0 if as_float(raw.get("is_peak_hour"), 0.0) >= 0.5 else 0.0
+    is_weekend = 1.0 if as_float(raw.get("is_weekend"), 0.0) >= 0.5 else 0.0
+    is_holiday = 1.0 if as_float(raw.get("is_holiday"), 0.0) >= 0.5 else 0.0
+    temporal_pressure_derived = (
+        (0.14 if is_peak_hour >= 0.5 else 0.0)
+        + (0.05 if (temporal_hour_local >= 11.0 and temporal_hour_local < 14.0 and is_peak_hour < 0.5) else 0.0)
+        + (0.08 if is_weekend >= 0.5 else 0.0)
+        + (0.12 if is_holiday >= 0.5 else 0.0)
+    )
+    temporal_pressure = max(as_float(raw.get("temporal_pressure"), temporal_pressure_derived), 0.0)
+    context_fallback_applied = 1.0 if as_float(raw.get("context_fallback_applied"), 0.0) >= 0.5 else 0.0
+    context_stale_sources = max(as_float(raw.get("context_stale_sources"), 0.0), 0.0)
     fuel_price_eur_l = max(as_float(raw.get("fuel_price_eur_l"), 1.85), 0.5)
     vehicle_consumption_l_100km = max(as_float(raw.get("vehicle_consumption_l_100km"), 7.5), 2.0)
     platform_fee_pct = min(max(as_float(raw.get("platform_fee_pct"), 25.0), 0.0), 60.0)
@@ -137,6 +197,18 @@ def build_feature_map(raw: dict[str, Any]) -> dict[str, float]:
         "supply_index": supply_index,
         "weather_factor": weather_factor,
         "traffic_factor": traffic_factor,
+        "event_pressure": event_pressure,
+        "event_count_nearby": event_count_nearby,
+        "weather_precip_mm": weather_precip_mm,
+        "weather_wind_kmh": weather_wind_kmh,
+        "weather_intensity": weather_intensity,
+        "temporal_hour_local": temporal_hour_local,
+        "is_peak_hour": is_peak_hour,
+        "is_weekend": is_weekend,
+        "is_holiday": is_holiday,
+        "temporal_pressure": temporal_pressure,
+        "context_fallback_applied": context_fallback_applied,
+        "context_stale_sources": context_stale_sources,
         "fuel_price_eur_l": fuel_price_eur_l,
         "vehicle_consumption_l_100km": vehicle_consumption_l_100km,
         "platform_fee_pct": platform_fee_pct,
@@ -164,6 +236,9 @@ def heuristic_score(
     supply_index = max(features["supply_index"], 0.2)
     weather_factor = features["weather_factor"]
     traffic_factor = features["traffic_factor"]
+    event_pressure = max(features.get("event_pressure", 0.0), 0.0)
+    temporal_pressure = max(features.get("temporal_pressure", 0.0), 0.0)
+    context_fallback_applied = 1.0 if float(features.get("context_fallback_applied", 0.0)) >= 0.5 else 0.0
     platform_fee_pct = max(features.get("platform_fee_pct", 0.0), 0.0)
     fuel_cost_eur = max(features.get("fuel_cost_eur", 0.0), 0.0)
     target_gap_eur_h = features.get("target_gap_eur_h", 0.0)
@@ -192,6 +267,12 @@ def heuristic_score(
         reasons.append("weather_downside")
     if traffic_factor > 1.2:
         reasons.append("traffic_penalty")
+    if event_pressure >= 0.12:
+        reasons.append("event_demand_uplift")
+    if temporal_pressure >= 0.1:
+        reasons.append("temporal_demand_uplift")
+    if context_fallback_applied >= 0.5:
+        reasons.append("context_fallback_mode")
     if total_duration_min >= 35.0:
         reasons.append("long_offer_duration")
     elif total_duration_min <= 15.0 and eur_per_hour_net >= 18.0:
@@ -334,6 +415,11 @@ def explanation_details(
     target_gap = float(features.get("target_gap_eur_h", 0.0))
     pressure_ratio = max(float(features.get("pressure_ratio", 1.0)), 0.0)
     traffic_factor = max(float(features.get("traffic_factor", 1.0)), 0.0)
+    event_pressure = max(float(features.get("event_pressure", 0.0)), 0.0)
+    temporal_pressure = max(float(features.get("temporal_pressure", 0.0)), 0.0)
+    weather_intensity = clamp(float(features.get("weather_intensity", 0.0)), 0.0, 1.0)
+    context_fallback_applied = 1.0 if float(features.get("context_fallback_applied", 0.0)) >= 0.5 else 0.0
+    context_stale_sources = max(float(features.get("context_stale_sources", 0.0)), 0.0)
     estimated_fare = max(float(features.get("estimated_fare_eur", 0.0)), 0.0)
     fuel_cost = max(float(features.get("fuel_cost_eur", 0.0)), 0.0)
     fuel_share_pct = (fuel_cost / max(estimated_fare, 0.01)) * 100.0
@@ -393,6 +479,46 @@ def explanation_details(
             "impact": "negative" if traffic_factor >= 1.2 else "neutral" if traffic_factor >= 1.05 else "positive",
             "value": round(traffic_factor, 3),
             "unit": "factor",
+            "source": "context",
+        },
+        {
+            "code": "event_pressure",
+            "label": "Local event pressure",
+            "impact": "positive" if event_pressure >= 0.18 else "neutral" if event_pressure >= 0.05 else "negative",
+            "value": round(event_pressure, 4),
+            "unit": "factor",
+            "source": "context",
+        },
+        {
+            "code": "temporal_pressure",
+            "label": "Temporal demand pressure",
+            "impact": "positive" if temporal_pressure >= 0.14 else "neutral" if temporal_pressure >= 0.06 else "negative",
+            "value": round(temporal_pressure, 4),
+            "unit": "factor",
+            "source": "context",
+        },
+        {
+            "code": "weather_intensity",
+            "label": "Weather intensity",
+            "impact": "positive" if weather_intensity >= 0.22 else "neutral" if weather_intensity >= 0.08 else "negative",
+            "value": round(weather_intensity, 4),
+            "unit": "normalized",
+            "source": "context",
+        },
+        {
+            "code": "context_fallback",
+            "label": "Context fallback mode",
+            "impact": "negative" if context_fallback_applied >= 0.5 else "neutral",
+            "value": round(context_fallback_applied, 3),
+            "unit": "flag",
+            "source": "context",
+        },
+        {
+            "code": "context_stale_sources",
+            "label": "Stale context sources",
+            "impact": "negative" if context_stale_sources >= 2.0 else "neutral",
+            "value": round(context_stale_sources, 3),
+            "unit": "count",
             "source": "context",
         },
         {

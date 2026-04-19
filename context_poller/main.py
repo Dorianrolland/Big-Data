@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import html
 import hashlib
 import json
@@ -28,6 +28,7 @@ import os
 import re
 import signal
 import time
+from functools import lru_cache
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -139,6 +140,42 @@ EVENT_POST_WINDOW_MINUTES = _env_float("EVENT_POST_WINDOW_MINUTES", 60.0, min_va
 EVENT_PRESSURE_SCALE = _env_float("EVENT_PRESSURE_SCALE", 0.55, min_value=0.0)
 EVENT_PRESSURE_CAP = _env_float("EVENT_PRESSURE_CAP", 0.75, min_value=0.0)
 DEMAND_INDEX_CAP = _env_float("DEMAND_INDEX_CAP", 3.2, min_value=1.0)
+CONTEXT_FRESHNESS_POLICY = str(os.getenv("CONTEXT_FRESHNESS_POLICY", "stale_neutral_v1")).strip() or "stale_neutral_v1"
+CONTEXT_FRESH_GBFS_MAX_AGE_S = _env_float(
+    "CONTEXT_FRESH_GBFS_MAX_AGE_S",
+    max(180.0, GBFS_POLL_SECONDS * 3.0),
+    min_value=30.0,
+)
+CONTEXT_FRESH_WEATHER_MAX_AGE_S = _env_float(
+    "CONTEXT_FRESH_WEATHER_MAX_AGE_S",
+    max(300.0, WEATHER_POLL_SECONDS * 2.5),
+    min_value=60.0,
+)
+CONTEXT_FRESH_NYC311_MAX_AGE_S = _env_float(
+    "CONTEXT_FRESH_NYC311_MAX_AGE_S",
+    max(240.0, NYC311_POLL_SECONDS * 2.5),
+    min_value=60.0,
+)
+CONTEXT_FRESH_EVENTS_MAX_AGE_S = _env_float(
+    "CONTEXT_FRESH_EVENTS_MAX_AGE_S",
+    max(420.0, EVENTS_POLL_SECONDS * 2.5),
+    min_value=120.0,
+)
+CONTEXT_FRESH_DOT_ADVISORY_MAX_AGE_S = _env_float(
+    "CONTEXT_FRESH_DOT_ADVISORY_MAX_AGE_S",
+    max(900.0, DOT_ADVISORY_POLL_SECONDS * 2.0),
+    min_value=300.0,
+)
+CONTEXT_FRESH_DOT_SPEEDS_MAX_AGE_S = _env_float(
+    "CONTEXT_FRESH_DOT_SPEEDS_MAX_AGE_S",
+    max(420.0, DOT_SPEEDS_POLL_SECONDS * 2.5),
+    min_value=120.0,
+)
+TEMPORAL_PEAK_PRESSURE_BOOST = _env_float("TEMPORAL_PEAK_PRESSURE_BOOST", 0.14, min_value=0.0)
+TEMPORAL_MIDDAY_PRESSURE_BOOST = _env_float("TEMPORAL_MIDDAY_PRESSURE_BOOST", 0.05, min_value=0.0)
+TEMPORAL_WEEKEND_PRESSURE_BOOST = _env_float("TEMPORAL_WEEKEND_PRESSURE_BOOST", 0.08, min_value=0.0)
+TEMPORAL_HOLIDAY_PRESSURE_BOOST = _env_float("TEMPORAL_HOLIDAY_PRESSURE_BOOST", 0.12, min_value=0.0)
+TEMPORAL_PRESSURE_CAP = _env_float("TEMPORAL_PRESSURE_CAP", 0.32, min_value=0.0)
 
 EARTH_KM = 6371.0
 NYC_TZ = ZoneInfo("America/New_York")
@@ -180,6 +217,10 @@ def _coerce_float(value: object) -> float | None:
     if not math.isfinite(out):
         return None
     return out
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(value, high))
 
 
 def _normalize_borough(value: object) -> str | None:
@@ -710,6 +751,216 @@ def _build_event_record(row: dict[str, object]) -> dict[str, object] | None:
     }
 
 
+def _weather_intensity_score(precip_mm: float, wind_kmh: float) -> float:
+    precip_component = clamp(max(0.0, precip_mm) / 6.0, 0.0, 1.0)
+    wind_component = clamp(max(0.0, wind_kmh) / 50.0, 0.0, 1.0)
+    score = (precip_component * 0.65) + (wind_component * 0.35)
+    return round(clamp(score, 0.0, 1.0), 4)
+
+
+def _nth_weekday_of_month(year: int, month: int, weekday: int, nth: int) -> date:
+    first = date(year, month, 1)
+    delta = (weekday - first.weekday()) % 7
+    day = 1 + delta + ((max(1, nth) - 1) * 7)
+    return date(year, month, day)
+
+
+def _last_weekday_of_month(year: int, month: int, weekday: int) -> date:
+    if month == 12:
+        cursor = date(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        cursor = date(year, month + 1, 1) - timedelta(days=1)
+    while cursor.weekday() != weekday:
+        cursor -= timedelta(days=1)
+    return cursor
+
+
+def _observed_fixed_holiday(year: int, month: int, day: int) -> date:
+    base = date(year, month, day)
+    if base.weekday() == 5:
+        return base - timedelta(days=1)
+    if base.weekday() == 6:
+        return base + timedelta(days=1)
+    return base
+
+
+@lru_cache(maxsize=16)
+def _us_holidays_ny(year: int) -> set[date]:
+    return {
+        _observed_fixed_holiday(year, 1, 1),   # New Year's Day
+        _nth_weekday_of_month(year, 1, 0, 3),  # MLK Day
+        _nth_weekday_of_month(year, 2, 0, 3),  # Presidents Day
+        _last_weekday_of_month(year, 5, 0),    # Memorial Day
+        _observed_fixed_holiday(year, 6, 19),  # Juneteenth
+        _observed_fixed_holiday(year, 7, 4),   # Independence Day
+        _nth_weekday_of_month(year, 9, 0, 1),  # Labor Day
+        _nth_weekday_of_month(year, 10, 0, 2), # Columbus Day
+        _observed_fixed_holiday(year, 11, 11), # Veterans Day
+        _nth_weekday_of_month(year, 11, 3, 4), # Thanksgiving
+        _observed_fixed_holiday(year, 12, 25), # Christmas
+    }
+
+
+def _is_holiday_local(local_dt: datetime) -> bool:
+    d = local_dt.date()
+    # Include adjacent years to catch observed fixed-date holidays that
+    # can land on Dec 31 / Jan 2 around year boundaries.
+    years = (local_dt.year - 1, local_dt.year, local_dt.year + 1)
+    return any(d in _us_holidays_ny(y) for y in years)
+
+
+def _is_peak_hour(local_dt: datetime) -> bool:
+    hour = local_dt.hour + (local_dt.minute / 60.0)
+    return (7.0 <= hour < 10.0) or (16.0 <= hour < 20.0)
+
+
+def _temporal_pressure(local_dt: datetime) -> float:
+    hour = local_dt.hour + (local_dt.minute / 60.0)
+    pressure = 0.0
+    if _is_peak_hour(local_dt):
+        pressure += TEMPORAL_PEAK_PRESSURE_BOOST
+    elif 11.0 <= hour < 14.0:
+        pressure += TEMPORAL_MIDDAY_PRESSURE_BOOST
+    if local_dt.weekday() >= 5:
+        pressure += TEMPORAL_WEEKEND_PRESSURE_BOOST
+    if _is_holiday_local(local_dt):
+        pressure += TEMPORAL_HOLIDAY_PRESSURE_BOOST
+    return round(clamp(pressure, 0.0, TEMPORAL_PRESSURE_CAP), 4)
+
+
+def _temporal_context(now_ts: float) -> dict[str, object]:
+    local_dt = datetime.fromtimestamp(now_ts, tz=NYC_TZ)
+    hour_local = local_dt.hour + (local_dt.minute / 60.0)
+    is_peak = _is_peak_hour(local_dt)
+    is_weekend = local_dt.weekday() >= 5
+    is_holiday = _is_holiday_local(local_dt)
+    return {
+        "hour_local": round(hour_local, 3),
+        "is_peak_hour": is_peak,
+        "is_weekend": is_weekend,
+        "is_holiday": is_holiday,
+        "temporal_pressure": _temporal_pressure(local_dt),
+    }
+
+
+def _source_age_s(last_updated: float, *, now_ts: float) -> float:
+    if last_updated <= 0.0:
+        return -1.0
+    return max(0.0, now_ts - last_updated)
+
+
+def _is_source_stale(last_updated: float, *, now_ts: float, max_age_s: float) -> bool:
+    age_s = _source_age_s(last_updated, now_ts=now_ts)
+    return age_s < 0.0 or age_s > max(1.0, max_age_s)
+
+
+def _freshness_snapshot(state: "ContextState", *, now_ts: float) -> dict[str, object]:
+    stale_gbfs = _is_source_stale(state.gbfs_last_updated, now_ts=now_ts, max_age_s=CONTEXT_FRESH_GBFS_MAX_AGE_S)
+    stale_weather = _is_source_stale(
+        state.weather_last_updated, now_ts=now_ts, max_age_s=CONTEXT_FRESH_WEATHER_MAX_AGE_S
+    )
+    stale_nyc311 = _is_source_stale(state.nyc311_last_updated, now_ts=now_ts, max_age_s=CONTEXT_FRESH_NYC311_MAX_AGE_S)
+    stale_events = _is_source_stale(state.events_last_updated, now_ts=now_ts, max_age_s=CONTEXT_FRESH_EVENTS_MAX_AGE_S)
+    stale_dot_closure = _is_source_stale(
+        state.dot_closure_last_updated,
+        now_ts=now_ts,
+        max_age_s=CONTEXT_FRESH_DOT_ADVISORY_MAX_AGE_S,
+    )
+    stale_dot_speeds = _is_source_stale(
+        state.dot_speeds_last_updated,
+        now_ts=now_ts,
+        max_age_s=CONTEXT_FRESH_DOT_SPEEDS_MAX_AGE_S,
+    )
+    stale_count = sum(
+        1
+        for flag in (
+            stale_gbfs,
+            stale_weather,
+            stale_nyc311,
+            stale_events,
+            stale_dot_closure,
+            stale_dot_speeds,
+        )
+        if flag
+    )
+    return {
+        "policy": CONTEXT_FRESHNESS_POLICY,
+        "ages": {
+            "gbfs_s": _source_age_s(state.gbfs_last_updated, now_ts=now_ts),
+            "weather_s": _source_age_s(state.weather_last_updated, now_ts=now_ts),
+            "nyc311_s": _source_age_s(state.nyc311_last_updated, now_ts=now_ts),
+            "events_s": _source_age_s(state.events_last_updated, now_ts=now_ts),
+            "dot_closure_s": _source_age_s(state.dot_closure_last_updated, now_ts=now_ts),
+            "dot_speeds_s": _source_age_s(state.dot_speeds_last_updated, now_ts=now_ts),
+        },
+        "stale": {
+            "gbfs": stale_gbfs,
+            "weather": stale_weather,
+            "nyc311": stale_nyc311,
+            "events": stale_events,
+            "dot_closure": stale_dot_closure,
+            "dot_speeds": stale_dot_speeds,
+        },
+        "stale_count": int(stale_count),
+        "fallback_applied": stale_count > 0,
+    }
+
+
+def _format_metadata_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return f"{value:.4f}".rstrip("0").rstrip(".")
+    return str(value).strip()
+
+
+def _build_source_value(base_tag: str, metadata: dict[str, object]) -> str:
+    parts = [str(base_tag or "").strip() or "none"]
+    for key in sorted(metadata):
+        value = metadata.get(key)
+        if value is None:
+            continue
+        val = _format_metadata_value(value)
+        if val == "":
+            continue
+        parts.append(f"{key}={val}")
+    return ";".join(parts)
+
+
+def _count_nearby_events(
+    events: list[dict[str, object]],
+    *,
+    lat: float,
+    lon: float,
+    now_ts: float,
+    radius_km: float = EVENT_RADIUS_KM,
+) -> int:
+    if not events:
+        return 0
+    effective_radius = max(0.2, radius_km)
+    count = 0
+    for evt in events:
+        evt_lat = _coerce_float(evt.get("lat"))
+        evt_lon = _coerce_float(evt.get("lon"))
+        evt_start = _coerce_float(evt.get("start_ts"))
+        evt_end = _coerce_float(evt.get("end_ts"))
+        if evt_lat is None or evt_lon is None or evt_start is None or evt_end is None:
+            continue
+        if _event_time_weight(
+            now_ts=now_ts,
+            start_ts=evt_start,
+            end_ts=evt_end,
+            lookahead_hours=EVENT_LOOKAHEAD_HOURS,
+            post_window_minutes=EVENT_POST_WINDOW_MINUTES,
+        ) <= 0.0:
+            continue
+        if haversine_km(lat, lon, evt_lat, evt_lon) <= effective_radius:
+            count += 1
+    return count
+
+
 def load_centroids() -> dict[int, tuple[float, float]]:
     if not CENTROIDS_PATH.exists():
         raise FileNotFoundError(f"missing centroids: {CENTROIDS_PATH}")
@@ -1030,32 +1281,41 @@ def _compute_zone_demand(
     lon: float,
     *,
     event_pressure: float = 0.0,
+    temporal_pressure: float = 0.0,
+    stations_override: list[dict] | None = None,
 ) -> float:
     """Demand proxy: how many Citi Bike stations near the centroid are empty/low.
 
     More empty stations -> more unmet micro-mobility demand -> taxi demand bump.
     """
-    if not state.gbfs_stations:
-        return round(min(DEMAND_INDEX_CAP, 1.0 + max(0.0, float(event_pressure))), 3)
+    stations = state.gbfs_stations if stations_override is None else stations_override
+    contextual_boost = max(0.0, float(event_pressure)) + max(0.0, float(temporal_pressure))
+    if not stations:
+        return round(min(DEMAND_INDEX_CAP, 1.0 + contextual_boost), 3)
     stations_nearby = [
         (s["lat"], s["lon"], s["bikes"])
-        for s in state.gbfs_stations
+        for s in stations
         if abs(s["lat"] - lat) < 0.02 and abs(s["lon"] - lon) < 0.025
     ]
     if not stations_nearby:
-        return round(min(DEMAND_INDEX_CAP, 1.0 + max(0.0, float(event_pressure))), 3)
+        return round(min(DEMAND_INDEX_CAP, 1.0 + contextual_boost), 3)
     low = 0
     for slat, slon, bikes in stations_nearby:
         if haversine_km(lat, lon, slat, slon) <= DEMAND_RADIUS_KM and bikes < 3:
             low += 1
     base = 1.0 + min(1.5, low / 5.0)
-    adjusted = min(DEMAND_INDEX_CAP, base + max(0.0, float(event_pressure)))
+    adjusted = min(DEMAND_INDEX_CAP, base + contextual_boost)
     return round(adjusted, 3)
 
 
-def _compute_weather_factor(state: ContextState) -> float:
-    wind = state.weather_wind_kmh
-    precip = state.weather_precip_mm
+def _compute_weather_factor(
+    state: ContextState,
+    *,
+    precip_mm: float | None = None,
+    wind_kmh: float | None = None,
+) -> float:
+    wind = max(0.0, float(wind_kmh) if wind_kmh is not None else state.weather_wind_kmh)
+    precip = max(0.0, float(precip_mm) if precip_mm is not None else state.weather_precip_mm)
     f = 1.0 + min(0.5, precip / 4.0) + min(0.25, wind / 45.0)
     return round(f, 3)
 
@@ -1164,9 +1424,12 @@ def _compute_traffic_factor(
     *,
     closure_pressure: float | None = None,
     speed_pressure: float | None = None,
+    precip_mm: float | None = None,
+    incidents: list[tuple[float, float]] | None = None,
 ) -> float:
-    local = _count_within(state.nyc311_incidents, lat, lon, TRAFFIC_RADIUS_KM)
-    precip = state.weather_precip_mm
+    incident_points = state.nyc311_incidents if incidents is None else incidents
+    local = _count_within(incident_points, lat, lon, TRAFFIC_RADIUS_KM)
+    precip = max(0.0, float(precip_mm) if precip_mm is not None else state.weather_precip_mm)
     now_ref = float(now_ts or time.time())
     closure_component = (
         float(closure_pressure)
@@ -1236,6 +1499,7 @@ async def _publish_quality_snapshot(
     dot_advisory_rows: int,
     dot_speeds_status: str,
     dot_speeds_rows: int,
+    freshness_snapshot: dict[str, object] | None = None,
 ) -> None:
     if not supply_values:
         return
@@ -1253,6 +1517,16 @@ async def _publish_quality_snapshot(
     traffic_nonzero_rate = (
         sum(1 for value in traffic_values if value > 1.01) / len(traffic_values) if traffic_values else 0.0
     )
+
+    freshness = freshness_snapshot or {}
+    freshness_ages = freshness.get("ages", {}) if isinstance(freshness, dict) else {}
+    freshness_stale = freshness.get("stale", {}) if isinstance(freshness, dict) else {}
+    age_gbfs_s = _coerce_float(freshness_ages.get("gbfs_s"))
+    age_weather_s = _coerce_float(freshness_ages.get("weather_s"))
+    age_nyc311_s = _coerce_float(freshness_ages.get("nyc311_s"))
+    age_events_s = _coerce_float(freshness_ages.get("events_s"))
+    age_dot_closure_s = _coerce_float(freshness_ages.get("dot_closure_s"))
+    age_dot_speeds_s = _coerce_float(freshness_ages.get("dot_speeds_s"))
 
     payload = {
         "updated_at": utc_now_iso(),
@@ -1295,6 +1569,21 @@ async def _publish_quality_snapshot(
             f"{(sum(speed_pressures) / len(speed_pressures)):.4f}" if speed_pressures else "0.0000"
         ),
         "speed_pressure_max": f"{(max(speed_pressures) if speed_pressures else 0.0):.4f}",
+        "freshness_policy": str(freshness.get("policy") or CONTEXT_FRESHNESS_POLICY),
+        "context_fallback_applied": "1" if bool(freshness.get("fallback_applied")) else "0",
+        "stale_sources_count": str(int(freshness.get("stale_count") or 0)),
+        "age_gbfs_s": f"{(age_gbfs_s if age_gbfs_s is not None else -1.0):.1f}",
+        "age_weather_s": f"{(age_weather_s if age_weather_s is not None else -1.0):.1f}",
+        "age_nyc311_s": f"{(age_nyc311_s if age_nyc311_s is not None else -1.0):.1f}",
+        "age_events_s": f"{(age_events_s if age_events_s is not None else -1.0):.1f}",
+        "age_dot_closure_s": f"{(age_dot_closure_s if age_dot_closure_s is not None else -1.0):.1f}",
+        "age_dot_speeds_s": f"{(age_dot_speeds_s if age_dot_speeds_s is not None else -1.0):.1f}",
+        "stale_gbfs": "1" if bool(freshness_stale.get("gbfs")) else "0",
+        "stale_weather": "1" if bool(freshness_stale.get("weather")) else "0",
+        "stale_nyc311": "1" if bool(freshness_stale.get("nyc311")) else "0",
+        "stale_events": "1" if bool(freshness_stale.get("events")) else "0",
+        "stale_dot_closure": "1" if bool(freshness_stale.get("dot_closure")) else "0",
+        "stale_dot_speeds": "1" if bool(freshness_stale.get("dot_speeds")) else "0",
     }
     await redis_client.hset(CONTEXT_QUALITY_KEY, mapping=payload)
     await redis_client.expire(CONTEXT_QUALITY_KEY, CONTEXT_QUALITY_TTL_SECONDS)
@@ -1330,7 +1619,31 @@ async def publisher_loop(
                 pass
             continue
 
-        weather = _compute_weather_factor(state)
+        freshness = _freshness_snapshot(state, now_ts=tick_started)
+        freshness_ages = freshness.get("ages", {}) if isinstance(freshness, dict) else {}
+        freshness_stale = freshness.get("stale", {}) if isinstance(freshness, dict) else {}
+        age_gbfs_s = _coerce_float(freshness_ages.get("gbfs_s"))
+        age_weather_s = _coerce_float(freshness_ages.get("weather_s"))
+        age_nyc311_s = _coerce_float(freshness_ages.get("nyc311_s"))
+        age_events_s = _coerce_float(freshness_ages.get("events_s"))
+        age_dot_closure_s = _coerce_float(freshness_ages.get("dot_closure_s"))
+        age_dot_speeds_s = _coerce_float(freshness_ages.get("dot_speeds_s"))
+
+        effective_gbfs_stations = state.gbfs_stations if not bool(freshness_stale.get("gbfs")) else []
+        effective_events = state.events if not bool(freshness_stale.get("events")) else []
+        effective_closure_records = state.dot_closure_records if not bool(freshness_stale.get("dot_closure")) else []
+        effective_speed_samples = state.dot_speed_samples if not bool(freshness_stale.get("dot_speeds")) else []
+        effective_nyc311_incidents = state.nyc311_incidents if not bool(freshness_stale.get("nyc311")) else []
+        effective_weather_precip = state.weather_precip_mm if not bool(freshness_stale.get("weather")) else 0.0
+        effective_weather_wind = state.weather_wind_kmh if not bool(freshness_stale.get("weather")) else 0.0
+        weather_intensity = _weather_intensity_score(effective_weather_precip, effective_weather_wind)
+        temporal = _temporal_context(tick_started)
+        temporal_pressure = float(temporal["temporal_pressure"])
+        weather = _compute_weather_factor(
+            state,
+            precip_mm=effective_weather_precip,
+            wind_kmh=effective_weather_wind,
+        )
         sources_tag = "+".join(sorted(state.sources_active)) or "none"
         ts_iso = utc_now_iso()
         sends = []
@@ -1343,20 +1656,33 @@ async def publisher_loop(
         for loc_id, (lat, lon) in centroids.items():
             zone_id = f"nyc_{loc_id}"
             event_pressure = _compute_event_pressure(
-                state.events,
+                effective_events,
                 lat=lat,
                 lon=lon,
                 now_ts=tick_started,
             )
-            demand = _compute_zone_demand(state, lat, lon, event_pressure=event_pressure)
+            event_count_nearby = _count_nearby_events(
+                effective_events,
+                lat=lat,
+                lon=lon,
+                now_ts=tick_started,
+            )
+            demand = _compute_zone_demand(
+                state,
+                lat,
+                lon,
+                event_pressure=event_pressure,
+                temporal_pressure=temporal_pressure,
+                stations_override=effective_gbfs_stations,
+            )
             closure_pressure = _compute_closure_pressure(
-                state.dot_closure_records,
+                effective_closure_records,
                 lat=lat,
                 lon=lon,
                 now_ts=tick_started,
             )
             speed_pressure = _compute_speed_pressure(
-                state.dot_speed_samples,
+                effective_speed_samples,
                 lat=lat,
                 lon=lon,
             )
@@ -1367,6 +1693,8 @@ async def publisher_loop(
                 now_ts=tick_started,
                 closure_pressure=closure_pressure,
                 speed_pressure=speed_pressure,
+                precip_mm=effective_weather_precip,
+                incidents=effective_nyc311_incidents,
             )
             supply = await _zone_supply_index(redis_client, lat, lon)
             supply_values.append(supply)
@@ -1374,10 +1702,35 @@ async def publisher_loop(
             event_pressures.append(event_pressure)
             closure_pressures.append(closure_pressure)
             speed_pressures.append(speed_pressure)
-            source_value = (
-                f"{sources_tag};event_pressure={event_pressure:.4f}"
-                if "nyc-events" in state.sources_active
-                else sources_tag
+            source_value = _build_source_value(
+                sources_tag,
+                {
+                    "event_pressure": event_pressure,
+                    "event_count_nearby": event_count_nearby,
+                    "weather_precip_mm": effective_weather_precip,
+                    "weather_wind_kmh": effective_weather_wind,
+                    "weather_intensity": weather_intensity,
+                    "temporal_hour_local": temporal["hour_local"],
+                    "temporal_is_peak": temporal["is_peak_hour"],
+                    "temporal_is_weekend": temporal["is_weekend"],
+                    "temporal_is_holiday": temporal["is_holiday"],
+                    "temporal_pressure": temporal_pressure,
+                    "freshness_policy": freshness.get("policy"),
+                    "freshness_fallback_applied": bool(freshness.get("fallback_applied")),
+                    "freshness_stale_sources": int(freshness.get("stale_count") or 0),
+                    "age_gbfs_s": (age_gbfs_s if age_gbfs_s is not None else -1.0),
+                    "age_weather_s": (age_weather_s if age_weather_s is not None else -1.0),
+                    "age_nyc311_s": (age_nyc311_s if age_nyc311_s is not None else -1.0),
+                    "age_events_s": (age_events_s if age_events_s is not None else -1.0),
+                    "age_dot_closure_s": (age_dot_closure_s if age_dot_closure_s is not None else -1.0),
+                    "age_dot_speeds_s": (age_dot_speeds_s if age_dot_speeds_s is not None else -1.0),
+                    "stale_gbfs": bool(freshness_stale.get("gbfs")),
+                    "stale_weather": bool(freshness_stale.get("weather")),
+                    "stale_nyc311": bool(freshness_stale.get("nyc311")),
+                    "stale_events": bool(freshness_stale.get("events")),
+                    "stale_dot_closure": bool(freshness_stale.get("dot_closure")),
+                    "stale_dot_speeds": bool(freshness_stale.get("dot_speeds")),
+                },
             )
             sig = ContextSignalV1(
                 event_id=event_id("ctx", f"{zone_id}_{int(tick_started)}"),
@@ -1416,12 +1769,13 @@ async def publisher_loop(
                 dot_advisory_rows=state.dot_closure_rows,
                 dot_speeds_status=state.dot_speeds_status,
                 dot_speeds_rows=state.dot_speeds_rows,
+                freshness_snapshot=freshness,
             )
             if sent_cycles % 5 == 1:
                 log.info(
                     "published cycle=%d zones=%d sources=%s weather=%.2f supply_mean=%.2f "
                     "traffic_nonzero=%.2f closure_pressure_mean=%.4f speed_pressure_mean=%.4f "
-                    "event_pressure_mean=%.4f took=%.2fs",
+                    "event_pressure_mean=%.4f stale_sources=%d took=%.2fs",
                     sent_cycles,
                     len(centroids),
                     sources_tag,
@@ -1435,6 +1789,7 @@ async def publisher_loop(
                     (sum(closure_pressures) / len(closure_pressures)) if closure_pressures else 0.0,
                     (sum(speed_pressures) / len(speed_pressures)) if speed_pressures else 0.0,
                     (sum(event_pressures) / len(event_pressures)) if event_pressures else 0.0,
+                    int(freshness.get("stale_count") or 0),
                     elapsed,
                 )
 

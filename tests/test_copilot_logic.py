@@ -50,6 +50,34 @@ def test_build_feature_map_sanitizes_non_finite_inputs():
     assert features["supply_index"] == 0.2
 
 
+def test_build_feature_map_ingests_context_v2_fields():
+    features = build_feature_map(
+        {
+            "estimated_fare_eur": 15.0,
+            "estimated_distance_km": 3.0,
+            "event_pressure": 0.24,
+            "event_count_nearby": 5,
+            "weather_precip_mm": 2.4,
+            "weather_wind_kmh": 20.0,
+            "weather_intensity": 0.42,
+            "temporal_hour_local": 17.5,
+            "is_peak_hour": 1,
+            "is_weekend": 0,
+            "is_holiday": 0,
+            "temporal_pressure": 0.14,
+            "context_fallback_applied": 1,
+            "context_stale_sources": 2,
+        }
+    )
+    assert features["event_pressure"] == 0.24
+    assert features["event_count_nearby"] == 5.0
+    assert features["weather_intensity"] == 0.42
+    assert features["is_peak_hour"] == 1.0
+    assert features["temporal_pressure"] == 0.14
+    assert features["context_fallback_applied"] == 1.0
+    assert features["context_stale_sources"] == 2.0
+
+
 def test_heuristic_score_range():
     features = build_feature_map(
         {
@@ -105,6 +133,20 @@ def test_heuristic_reasons_include_target_gap():
     _, _, reasons = heuristic_score(features)
     assert "below_target_hourly_goal" in reasons
     assert "high_platform_fee" in reasons
+
+
+def test_heuristic_reasons_include_context_fallback_mode():
+    features = build_feature_map(
+        {
+            "estimated_fare_eur": 13.0,
+            "estimated_distance_km": 3.0,
+            "estimated_duration_min": 16.0,
+            "context_fallback_applied": 1,
+            "context_stale_sources": 2,
+        }
+    )
+    _, _, reasons = heuristic_score(features)
+    assert "context_fallback_mode" in reasons
 
 
 def test_cost_breakdown_shape():
@@ -199,6 +241,48 @@ def test_score_components_are_clamped():
     comps = score_components(features)
     assert set(comps) == {"net_hourly", "net_trip", "fuel_efficiency", "time_efficiency", "context"}
     assert all(0.0 <= v <= 1.0 for v in comps.values())
+
+
+def test_score_components_context_signal_and_fallback_edge_case():
+    rich_context = build_feature_map(
+        {
+            "estimated_fare_eur": 16.0,
+            "estimated_distance_km": 3.2,
+            "estimated_duration_min": 17.0,
+            "demand_index": 1.3,
+            "supply_index": 0.9,
+            "weather_factor": 1.08,
+            "traffic_factor": 1.05,
+            "event_pressure": 0.35,
+            "event_count_nearby": 4,
+            "weather_intensity": 0.3,
+            "is_peak_hour": 1,
+            "temporal_pressure": 0.18,
+            "context_fallback_applied": 0,
+            "context_stale_sources": 0,
+        }
+    )
+    degraded_context = build_feature_map(
+        {
+            "estimated_fare_eur": 16.0,
+            "estimated_distance_km": 3.2,
+            "estimated_duration_min": 17.0,
+            "demand_index": 1.3,
+            "supply_index": 0.9,
+            "weather_factor": 1.08,
+            "traffic_factor": 1.05,
+            "event_pressure": 0.35,
+            "event_count_nearby": 4,
+            "weather_intensity": 0.3,
+            "is_peak_hour": 1,
+            "temporal_pressure": 0.18,
+            "context_fallback_applied": 1,
+            "context_stale_sources": 3,
+        }
+    )
+    rich = score_components(rich_context)
+    degraded = score_components(degraded_context)
+    assert rich["context"] > degraded["context"]
 
 
 def test_weighted_offer_score_short_vs_long_edge_case():
@@ -319,6 +403,7 @@ def test_explanation_details_shape_and_values():
     assert len(details) >= 8
     assert any(d["code"] == "net_hourly" for d in details)
     assert any(d["source"] == "routing" for d in details)
+    assert any(d["code"] == "event_pressure" for d in details)
 
 
 def test_explanation_details_omits_threshold_when_not_provided():

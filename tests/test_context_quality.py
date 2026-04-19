@@ -259,6 +259,83 @@ def test_zone_demand_applies_event_pressure_with_cap():
     assert demand == round(min(ctx.DEMAND_INDEX_CAP, 1.0 + 1.8), 3)
 
 
+def test_zone_demand_applies_temporal_pressure_with_cap():
+    state = ctx.ContextState()
+    state.gbfs_stations = []
+    demand = ctx._compute_zone_demand(
+        state,
+        40.7580,
+        -73.9855,
+        event_pressure=0.3,
+        temporal_pressure=0.14,
+    )
+    assert demand == round(min(ctx.DEMAND_INDEX_CAP, 1.0 + 0.3 + 0.14), 3)
+
+
+def test_weather_intensity_score_increases_with_harsher_weather():
+    mild = ctx._weather_intensity_score(precip_mm=0.0, wind_kmh=5.0)
+    harsh = ctx._weather_intensity_score(precip_mm=5.0, wind_kmh=45.0)
+    assert 0.0 <= mild <= 1.0
+    assert 0.0 <= harsh <= 1.0
+    assert harsh > mild
+
+
+def test_temporal_context_marks_peak_and_holiday():
+    # 2026-07-03 is the observed US federal holiday for Independence Day.
+    ts = datetime(2026, 7, 3, 8, 30, tzinfo=ZoneInfo("America/New_York")).timestamp()
+    temporal = ctx._temporal_context(ts)
+    assert temporal["is_peak_hour"] is True
+    assert temporal["is_holiday"] is True
+    assert float(temporal["temporal_pressure"]) > 0.0
+
+
+def test_is_holiday_local_handles_year_boundary_observed_day():
+    # Jan 1, 2022 was Saturday => observed Friday Dec 31, 2021.
+    dt_local = datetime(2021, 12, 31, 12, 0, tzinfo=ZoneInfo("America/New_York"))
+    assert ctx._is_holiday_local(dt_local) is True
+
+
+def test_freshness_snapshot_marks_missing_sources_stale():
+    state = ctx.ContextState()
+    snap = ctx._freshness_snapshot(state, now_ts=datetime(2026, 4, 19, 10, 0, tzinfo=ZoneInfo("UTC")).timestamp())
+    assert snap["fallback_applied"] is True
+    assert int(snap["stale_count"]) >= 1
+    assert bool(snap["stale"]["weather"]) is True
+
+
+def test_freshness_snapshot_marks_recent_sources_fresh():
+    now_ts = datetime(2026, 4, 19, 10, 0, tzinfo=ZoneInfo("UTC")).timestamp()
+    state = ctx.ContextState()
+    state.gbfs_last_updated = now_ts - 10.0
+    state.weather_last_updated = now_ts - 30.0
+    state.nyc311_last_updated = now_ts - 20.0
+    state.events_last_updated = now_ts - 45.0
+    state.dot_closure_last_updated = now_ts - 60.0
+    state.dot_speeds_last_updated = now_ts - 25.0
+    snap = ctx._freshness_snapshot(state, now_ts=now_ts)
+    assert snap["fallback_applied"] is False
+    assert int(snap["stale_count"]) == 0
+    assert bool(snap["stale"]["weather"]) is False
+    assert bool(snap["stale"]["events"]) is False
+
+
+def test_build_source_value_includes_temporal_and_freshness():
+    source = ctx._build_source_value(
+        "gbfs+open-meteo",
+        {
+            "event_pressure": 0.25,
+            "temporal_is_peak": True,
+            "freshness_policy": "stale_neutral_v1",
+            "freshness_stale_sources": 2,
+        },
+    )
+    assert source.startswith("gbfs+open-meteo;")
+    assert "event_pressure=0.25" in source
+    assert "temporal_is_peak=1" in source
+    assert "freshness_policy=stale_neutral_v1" in source
+    assert "freshness_stale_sources=2" in source
+
+
 def test_build_event_record_uses_borough_centroid_and_parses_times():
     row = {
         "event_id": "ev_1",
