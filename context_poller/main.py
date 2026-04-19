@@ -1,12 +1,13 @@
 """
 context_poller — streams real NYC market-context signals to Kafka.
 
-Periodically hits public APIs (Citi Bike GBFS, Open-Meteo, NYC 311 Socrata)
+Periodically hits public APIs (Citi Bike GBFS, Open-Meteo, NYC 311 Socrata,
+NYC Permitted Event Information)
 and publishes one ContextSignalV1 per NYC taxi zone every CONTEXT_TICK seconds
 on the context-signals-v1 topic.
 
 Signal fields populated from real data:
-- demand_index   : 1.0 + f(Citi Bike station scarcity near the zone centroid)
+- demand_index   : 1.0 + f(Citi Bike station scarcity) + event_pressure (capped)
 - supply_index   : live courier count (GEOSEARCH around the zone centroid) / scale
 - weather_factor : 1.0 + f(precipitation) + f(wind)      — Open-Meteo NYC
 - traffic_factor : 1.0 + f(precipitation) + f(311 traffic complaints near zone)
@@ -16,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
 import json
 import logging
@@ -39,20 +40,46 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("context-poller")
 
+
+def _env_float(name: str, default: float, *, min_value: float | None = None) -> float:
+    try:
+        out = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        out = float(default)
+    if not math.isfinite(out):
+        out = float(default)
+    if min_value is not None:
+        out = max(float(min_value), out)
+    return float(out)
+
+
+def _env_int(name: str, default: int, *, min_value: int | None = None) -> int:
+    try:
+        out = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        out = int(default)
+    if min_value is not None:
+        out = max(int(min_value), out)
+    return int(out)
+
+
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "redpanda:9092")
 CONTEXT_SIGNALS_TOPIC = os.getenv("CONTEXT_SIGNALS_TOPIC", "context-signals-v1")
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 COURIER_GEO_KEY = os.getenv("COURIER_GEO_KEY", "fleet:geo")
 
-CONTEXT_TICK_SECONDS = float(os.getenv("CONTEXT_TICK_SECONDS", "30"))
-GBFS_POLL_SECONDS = float(os.getenv("GBFS_POLL_SECONDS", "60"))
-WEATHER_POLL_SECONDS = float(os.getenv("WEATHER_POLL_SECONDS", "600"))
-NYC311_POLL_SECONDS = float(os.getenv("NYC311_POLL_SECONDS", "300"))
+CONTEXT_TICK_SECONDS = _env_float("CONTEXT_TICK_SECONDS", 30.0, min_value=1.0)
+GBFS_POLL_SECONDS = _env_float("GBFS_POLL_SECONDS", 60.0, min_value=5.0)
+WEATHER_POLL_SECONDS = _env_float("WEATHER_POLL_SECONDS", 600.0, min_value=30.0)
+NYC311_POLL_SECONDS = _env_float("NYC311_POLL_SECONDS", 300.0, min_value=30.0)
+EVENTS_POLL_SECONDS = _env_float("EVENTS_POLL_SECONDS", 600.0, min_value=60.0)
 CONTEXT_QUALITY_KEY = os.getenv("CONTEXT_QUALITY_KEY", "copilot:context:quality")
-CONTEXT_QUALITY_TTL_SECONDS = int(os.getenv("CONTEXT_QUALITY_TTL_SECONDS", "7200"))
-CONTEXT_QUALITY_WINDOW_CYCLES = int(os.getenv("CONTEXT_QUALITY_WINDOW_CYCLES", "10"))
-CONTEXT_SUPPLY_VARIANCE_EPSILON = float(os.getenv("CONTEXT_SUPPLY_VARIANCE_EPSILON", "0.03"))
-CONTEXT_SUPPLY_FLAT_MIN_CYCLES = int(os.getenv("CONTEXT_SUPPLY_FLAT_MIN_CYCLES", "6"))
+CONTEXT_QUALITY_TTL_SECONDS = _env_int("CONTEXT_QUALITY_TTL_SECONDS", 7200, min_value=300)
+CONTEXT_QUALITY_WINDOW_CYCLES = _env_int("CONTEXT_QUALITY_WINDOW_CYCLES", 10, min_value=2)
+CONTEXT_SUPPLY_VARIANCE_EPSILON = _env_float("CONTEXT_SUPPLY_VARIANCE_EPSILON", 0.03, min_value=0.0)
+CONTEXT_SUPPLY_FLAT_MIN_CYCLES = _env_int("CONTEXT_SUPPLY_FLAT_MIN_CYCLES", 6, min_value=2)
+EVENTS_CONTEXT_KEY = os.getenv("EVENTS_CONTEXT_KEY", "copilot:context:events")
+EVENTS_CONTEXT_TTL_SECONDS = _env_int("EVENTS_CONTEXT_TTL_SECONDS", 1800, min_value=300)
 
 GBFS_STATION_INFO_URL = os.getenv(
     "GBFS_STATION_INFO_URL",
@@ -70,17 +97,37 @@ NYC311_URL = os.getenv(
     "NYC311_URL",
     "https://data.cityofnewyork.us/resource/erm2-nwe9.json",
 )
+NYC_EVENTS_URL = os.getenv(
+    "NYC_EVENTS_URL",
+    "https://data.cityofnewyork.us/resource/tvpp-9vvx.json",
+)
 
 HTTP_USER_AGENT = os.getenv("HTTP_USER_AGENT", "FleetStream/1.0 (context-poller; contact=ops@fleetstream.local)")
 
 CENTROIDS_PATH = Path(__file__).parent / "nyc_zone_centroids.json"
 
-DEMAND_RADIUS_KM = float(os.getenv("DEMAND_RADIUS_KM", "0.8"))
-SUPPLY_RADIUS_KM = float(os.getenv("SUPPLY_RADIUS_KM", "1.0"))
-TRAFFIC_RADIUS_KM = float(os.getenv("TRAFFIC_RADIUS_KM", "1.5"))
+DEMAND_RADIUS_KM = _env_float("DEMAND_RADIUS_KM", 0.8, min_value=0.1)
+SUPPLY_RADIUS_KM = _env_float("SUPPLY_RADIUS_KM", 1.0, min_value=0.1)
+TRAFFIC_RADIUS_KM = _env_float("TRAFFIC_RADIUS_KM", 1.5, min_value=0.1)
+EVENT_RADIUS_KM = _env_float("EVENT_RADIUS_KM", 4.5, min_value=0.2)
+EVENT_LOOKAHEAD_HOURS = _env_float("EVENT_LOOKAHEAD_HOURS", 6.0, min_value=0.25)
+EVENT_POST_WINDOW_MINUTES = _env_float("EVENT_POST_WINDOW_MINUTES", 60.0, min_value=0.0)
+EVENT_PRESSURE_SCALE = _env_float("EVENT_PRESSURE_SCALE", 0.55, min_value=0.0)
+EVENT_PRESSURE_CAP = _env_float("EVENT_PRESSURE_CAP", 0.75, min_value=0.0)
+DEMAND_INDEX_CAP = _env_float("DEMAND_INDEX_CAP", 3.2, min_value=1.0)
 
 EARTH_KM = 6371.0
 NYC_TZ = ZoneInfo("America/New_York")
+UTC_TZ = ZoneInfo("UTC")
+BoroughCentroid = tuple[float, float]
+
+BOROUGH_CENTROIDS: dict[str, BoroughCentroid] = {
+    "manhattan": (40.7831, -73.9712),
+    "brooklyn": (40.6782, -73.9442),
+    "queens": (40.7282, -73.7949),
+    "bronx": (40.8448, -73.8648),
+    "staten_island": (40.5795, -74.1502),
+}
 
 
 def utc_now_iso() -> str:
@@ -99,6 +146,192 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
     )
     return EARTH_KM * 2 * math.asin(math.sqrt(a))
+
+
+def _coerce_float(value: object) -> float | None:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(out):
+        return None
+    return out
+
+
+def _normalize_borough(value: object) -> str | None:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return None
+    aliases = {
+        "manhattan": "manhattan",
+        "mn": "manhattan",
+        "m": "manhattan",
+        "new york": "manhattan",
+        "brooklyn": "brooklyn",
+        "bk": "brooklyn",
+        "k": "brooklyn",
+        "queens": "queens",
+        "qn": "queens",
+        "q": "queens",
+        "bronx": "bronx",
+        "bx": "bronx",
+        "x": "bronx",
+        "staten island": "staten_island",
+        "staten_island": "staten_island",
+        "si": "staten_island",
+        "r": "staten_island",
+    }
+    return aliases.get(raw)
+
+
+def _event_borough_centroid(value: object) -> tuple[float, float] | None:
+    borough = _normalize_borough(value)
+    if not borough:
+        return None
+    return BOROUGH_CENTROIDS.get(borough)
+
+
+def _parse_event_datetime(raw: object) -> datetime | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            parsed = datetime.strptime(text, "%Y-%m-%dT%H:%M:%S.%f")
+        except ValueError:
+            try:
+                parsed = datetime.strptime(text, "%Y-%m-%dT%H:%M:%S")
+            except ValueError:
+                return None
+        parsed = parsed.replace(tzinfo=NYC_TZ)
+    else:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=NYC_TZ)
+    return parsed.astimezone(UTC_TZ)
+
+
+def _event_intensity(event_type: object, event_name: object) -> float:
+    text = f"{event_type or ''} {event_name or ''}".lower()
+    if not text.strip():
+        return 1.0
+    if any(token in text for token in ("parade", "festival", "fair", "concert", "marathon", "carnival")):
+        return 1.25
+    if any(token in text for token in ("street", "block party", "community", "cultural")):
+        return 1.1
+    if any(token in text for token in ("sport", "baseball", "soccer", "basketball", "tournament")):
+        return 0.95
+    return 1.0
+
+
+def _event_time_weight(
+    *,
+    now_ts: float,
+    start_ts: float,
+    end_ts: float,
+    lookahead_hours: float,
+    post_window_minutes: float,
+) -> float:
+    lookahead_s = max(900.0, lookahead_hours * 3600.0)
+    post_s = max(0.0, post_window_minutes * 60.0)
+    if end_ts < (now_ts - post_s):
+        return 0.0
+    if start_ts <= now_ts <= end_ts:
+        return 1.0
+    if now_ts < start_ts:
+        lead_s = start_ts - now_ts
+        if lead_s > lookahead_s:
+            return 0.0
+        # Upcoming events increase progressively as we approach start.
+        return 0.25 + (0.75 * (1.0 - (lead_s / lookahead_s)))
+    if post_s <= 0:
+        return 0.0
+    tail_s = now_ts - end_ts
+    if tail_s > post_s:
+        return 0.0
+    return 0.35 * (1.0 - (tail_s / post_s))
+
+
+def _compute_event_pressure(
+    events: list[dict[str, object]],
+    *,
+    lat: float,
+    lon: float,
+    now_ts: float,
+    radius_km: float = EVENT_RADIUS_KM,
+    lookahead_hours: float = EVENT_LOOKAHEAD_HOURS,
+    post_window_minutes: float = EVENT_POST_WINDOW_MINUTES,
+    scale: float = EVENT_PRESSURE_SCALE,
+    cap: float = EVENT_PRESSURE_CAP,
+) -> float:
+    if not events:
+        return 0.0
+
+    score = 0.0
+    effective_radius = max(0.2, radius_km)
+    deg_lat = effective_radius / 111.32
+    deg_lon = effective_radius / max(111.32 * math.cos(math.radians(lat)), 1e-6)
+    lat_lo, lat_hi = lat - deg_lat, lat + deg_lat
+    lon_lo, lon_hi = lon - deg_lon, lon + deg_lon
+    for evt in events:
+        evt_lat = _coerce_float(evt.get("lat"))
+        evt_lon = _coerce_float(evt.get("lon"))
+        evt_start = _coerce_float(evt.get("start_ts"))
+        evt_end = _coerce_float(evt.get("end_ts"))
+        evt_intensity = _coerce_float(evt.get("intensity")) or 1.0
+        if evt_lat is None or evt_lon is None or evt_start is None or evt_end is None:
+            continue
+        if evt_lat < lat_lo or evt_lat > lat_hi or evt_lon < lon_lo or evt_lon > lon_hi:
+            continue
+
+        time_w = _event_time_weight(
+            now_ts=now_ts,
+            start_ts=evt_start,
+            end_ts=evt_end,
+            lookahead_hours=lookahead_hours,
+            post_window_minutes=post_window_minutes,
+        )
+        if time_w <= 0.0:
+            continue
+
+        distance_km = haversine_km(lat, lon, evt_lat, evt_lon)
+        if distance_km > effective_radius:
+            continue
+
+        distance_w = max(0.0, 1.0 - (distance_km / effective_radius)) ** 2
+        score += evt_intensity * time_w * distance_w
+
+    pressure = max(0.0, min(float(cap), float(scale) * score))
+    return round(pressure, 4)
+
+
+def _build_event_record(row: dict[str, object]) -> dict[str, object] | None:
+    start_dt = _parse_event_datetime(row.get("start_date_time"))
+    end_dt = _parse_event_datetime(row.get("end_date_time"))
+    if start_dt is None or end_dt is None:
+        return None
+    if end_dt <= start_dt:
+        return None
+
+    coords = _event_borough_centroid(row.get("event_borough"))
+    if coords is None:
+        return None
+
+    lat, lon = coords
+    return {
+        "event_id": str(row.get("event_id") or "").strip(),
+        "event_name": str(row.get("event_name") or "").strip(),
+        "event_type": str(row.get("event_type") or "").strip(),
+        "event_borough": str(row.get("event_borough") or "").strip(),
+        "event_location": str(row.get("event_location") or "").strip(),
+        "lat": lat,
+        "lon": lon,
+        "start_ts": start_dt.timestamp(),
+        "end_ts": end_dt.timestamp(),
+        "intensity": _event_intensity(row.get("event_type"), row.get("event_name")),
+    }
 
 
 def load_centroids() -> dict[int, tuple[float, float]]:
@@ -121,6 +354,10 @@ class ContextState:
         self.weather_last_updated: float = 0.0
         self.nyc311_incidents: list[tuple[float, float]] = []  # (lat, lon)
         self.nyc311_last_updated: float = 0.0
+        self.events: list[dict[str, object]] = []
+        self.events_last_updated: float = 0.0
+        self.events_source_status: str = "idle"
+        self.events_rows: int = 0
         self.sources_active: set[str] = set()
 
 
@@ -227,6 +464,89 @@ async def poll_nyc311(state: ContextState, stop: asyncio.Event) -> None:
                 pass
 
 
+async def poll_nyc_events(
+    state: ContextState,
+    redis_client: aioredis.Redis,
+    stop: asyncio.Event,
+) -> None:
+    async with httpx.AsyncClient(timeout=30, headers={"User-Agent": HTTP_USER_AGENT}) as client:
+        while not stop.is_set():
+            now_local = datetime.now(tz=NYC_TZ)
+            start_local = now_local - timedelta(minutes=max(15.0, EVENT_POST_WINDOW_MINUTES))
+            end_local = now_local + timedelta(hours=max(1.0, EVENT_LOOKAHEAD_HOURS))
+            params = {
+                "$select": (
+                    "event_id,event_name,event_type,event_borough,event_location,start_date_time,end_date_time"
+                ),
+                "$where": (
+                    f"end_date_time >= '{start_local.strftime('%Y-%m-%dT%H:%M:%S')}' "
+                    f"AND start_date_time <= '{end_local.strftime('%Y-%m-%dT%H:%M:%S')}'"
+                ),
+                "$limit": "5000",
+            }
+            error_type = ""
+            events: list[dict[str, object]] = []
+            try:
+                resp = await client.get(NYC_EVENTS_URL, params=params)
+                resp.raise_for_status()
+                rows = resp.json()
+                if not isinstance(rows, list):
+                    rows = []
+
+                seen_ids: set[str] = set()
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    parsed = _build_event_record(row)
+                    if not parsed:
+                        continue
+                    event_id_raw = str(parsed.get("event_id") or "").strip()
+                    dedupe_key = event_id_raw or (
+                        f"{parsed.get('event_name')}|{parsed.get('start_ts')}|{parsed.get('event_borough')}"
+                    )
+                    if dedupe_key in seen_ids:
+                        continue
+                    seen_ids.add(dedupe_key)
+                    events.append(parsed)
+
+                state.events = events
+                state.events_rows = len(events)
+                state.events_last_updated = time.time()
+                state.events_source_status = "ok"
+                state.sources_active.add("nyc-events")
+                log.info("nyc events refreshed: %d upcoming events", len(events))
+            except Exception as exc:
+                state.events = []
+                state.events_rows = 0
+                state.events_source_status = "degraded"
+                state.sources_active.discard("nyc-events")
+                error_type = type(exc).__name__
+                log.warning("nyc events poll failed: %s", exc)
+
+            now_iso = utc_now_iso()
+            try:
+                await redis_client.hset(
+                    EVENTS_CONTEXT_KEY,
+                    mapping={
+                        "source": "nyc_permitted_event_information_tvpp-9vvx",
+                        "status": state.events_source_status,
+                        "events_upcoming_count": str(state.events_rows),
+                        "events_window_start": start_local.isoformat(),
+                        "events_window_end": end_local.isoformat(),
+                        "error_type": error_type,
+                        "updated_at": now_iso,
+                    },
+                )
+                await redis_client.expire(EVENTS_CONTEXT_KEY, EVENTS_CONTEXT_TTL_SECONDS)
+            except Exception as exc:
+                log.warning("events context redis update failed: %s", exc)
+
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=EVENTS_POLL_SECONDS)
+            except asyncio.TimeoutError:
+                pass
+
+
 def _count_within(points: list[tuple[float, float]], lat: float, lon: float, radius_km: float) -> int:
     if not points:
         return 0
@@ -244,25 +564,33 @@ def _count_within(points: list[tuple[float, float]], lat: float, lon: float, rad
     return c
 
 
-def _compute_zone_demand(state: ContextState, lat: float, lon: float) -> float:
+def _compute_zone_demand(
+    state: ContextState,
+    lat: float,
+    lon: float,
+    *,
+    event_pressure: float = 0.0,
+) -> float:
     """Demand proxy: how many Citi Bike stations near the centroid are empty/low.
 
     More empty stations -> more unmet micro-mobility demand -> taxi demand bump.
     """
     if not state.gbfs_stations:
-        return 1.0
+        return round(min(DEMAND_INDEX_CAP, 1.0 + max(0.0, float(event_pressure))), 3)
     stations_nearby = [
         (s["lat"], s["lon"], s["bikes"])
         for s in state.gbfs_stations
         if abs(s["lat"] - lat) < 0.02 and abs(s["lon"] - lon) < 0.025
     ]
     if not stations_nearby:
-        return 1.0
+        return round(min(DEMAND_INDEX_CAP, 1.0 + max(0.0, float(event_pressure))), 3)
     low = 0
     for slat, slon, bikes in stations_nearby:
         if haversine_km(lat, lon, slat, slon) <= DEMAND_RADIUS_KM and bikes < 3:
             low += 1
-    return round(1.0 + min(1.5, low / 5.0), 3)
+    base = 1.0 + min(1.5, low / 5.0)
+    adjusted = min(DEMAND_INDEX_CAP, base + max(0.0, float(event_pressure)))
+    return round(adjusted, 3)
 
 
 def _compute_weather_factor(state: ContextState) -> float:
@@ -316,9 +644,13 @@ async def _publish_quality_snapshot(
     *,
     supply_values: list[float],
     traffic_values: list[float],
+    event_pressures: list[float],
     supply_mean_history: deque[float],
     sent_cycles: int,
     source_tag: str,
+    events_source_active: bool,
+    events_rows: int,
+    events_status: str,
 ) -> None:
     if not supply_values:
         return
@@ -341,6 +673,9 @@ async def _publish_quality_snapshot(
         "updated_at": utc_now_iso(),
         "cycles_published": str(sent_cycles),
         "sources": source_tag,
+        "events_source_active": "1" if events_source_active else "0",
+        "events_rows": str(max(0, int(events_rows))),
+        "events_status": events_status,
         "supply_key": COURIER_GEO_KEY,
         "zones_count": str(len(supply_values)),
         "supply_min": f"{min(supply_values):.3f}",
@@ -354,6 +689,15 @@ async def _publish_quality_snapshot(
         "supply_flat_threshold": f"{CONTEXT_SUPPLY_VARIANCE_EPSILON:.5f}",
         "traffic_nonzero_rate": f"{traffic_nonzero_rate:.3f}",
         "traffic_mean": f"{(sum(traffic_values) / len(traffic_values)):.3f}" if traffic_values else "1.000",
+        "event_pressure_mean": (
+            f"{(sum(event_pressures) / len(event_pressures)):.4f}" if event_pressures else "0.0000"
+        ),
+        "event_pressure_max": f"{(max(event_pressures) if event_pressures else 0.0):.4f}",
+        "event_pressure_nonzero_rate": (
+            f"{(sum(1 for value in event_pressures if value > 0.001) / len(event_pressures)):.4f}"
+            if event_pressures
+            else "0.0000"
+        ),
     }
     await redis_client.hset(CONTEXT_QUALITY_KEY, mapping=payload)
     await redis_client.expire(CONTEXT_QUALITY_KEY, CONTEXT_QUALITY_TTL_SECONDS)
@@ -395,14 +739,27 @@ async def publisher_loop(
         sends = []
         supply_values: list[float] = []
         traffic_values: list[float] = []
+        event_pressures: list[float] = []
 
         for loc_id, (lat, lon) in centroids.items():
             zone_id = f"nyc_{loc_id}"
-            demand = _compute_zone_demand(state, lat, lon)
+            event_pressure = _compute_event_pressure(
+                state.events,
+                lat=lat,
+                lon=lon,
+                now_ts=tick_started,
+            )
+            demand = _compute_zone_demand(state, lat, lon, event_pressure=event_pressure)
             traffic = _compute_traffic_factor(state, lat, lon, now_ts=tick_started)
             supply = await _zone_supply_index(redis_client, lat, lon)
             supply_values.append(supply)
             traffic_values.append(traffic)
+            event_pressures.append(event_pressure)
+            source_value = (
+                f"{sources_tag};event_pressure={event_pressure:.4f}"
+                if "nyc-events" in state.sources_active
+                else sources_tag
+            )
             sig = ContextSignalV1(
                 event_id=event_id("ctx", f"{zone_id}_{int(tick_started)}"),
                 event_type="context.signal.v1",
@@ -412,7 +769,7 @@ async def publisher_loop(
                 supply_index=supply,
                 weather_factor=weather,
                 traffic_factor=traffic,
-                source=sources_tag,
+                source=source_value,
             )
             sends.append(producer.send(CONTEXT_SIGNALS_TOPIC, key=zone_id.encode(), value=sig.SerializeToString()))
 
@@ -427,14 +784,18 @@ async def publisher_loop(
                 redis_client,
                 supply_values=supply_values,
                 traffic_values=traffic_values,
+                event_pressures=event_pressures,
                 supply_mean_history=supply_mean_history,
                 sent_cycles=sent_cycles,
                 source_tag=sources_tag,
+                events_source_active=("nyc-events" in state.sources_active),
+                events_rows=state.events_rows,
+                events_status=state.events_source_status,
             )
             if sent_cycles % 5 == 1:
                 log.info(
                     "published cycle=%d zones=%d sources=%s weather=%.2f supply_mean=%.2f "
-                    "traffic_nonzero=%.2f took=%.2fs",
+                    "traffic_nonzero=%.2f event_pressure_mean=%.4f took=%.2fs",
                     sent_cycles,
                     len(centroids),
                     sources_tag,
@@ -445,6 +806,7 @@ async def publisher_loop(
                         if traffic_values
                         else 0.0
                     ),
+                    (sum(event_pressures) / len(event_pressures)) if event_pressures else 0.0,
                     elapsed,
                 )
 
@@ -495,6 +857,7 @@ async def main() -> None:
         asyncio.create_task(poll_gbfs(state, stop), name="gbfs"),
         asyncio.create_task(poll_weather(state, stop), name="weather"),
         asyncio.create_task(poll_nyc311(state, stop), name="nyc311"),
+        asyncio.create_task(poll_nyc_events(state, redis_client, stop), name="nyc-events"),
         asyncio.create_task(publisher_loop(state, centroids, producer, redis_client, stop), name="publisher"),
     ]
 

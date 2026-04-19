@@ -179,7 +179,7 @@ FleetStream/
 ├── stress_test.py            # 1k–5k livreurs, benchmark p50/p95/p99
 │
 ├── tlc_replay/               # NYC TLC HVFHV replay → positions + offers + events (100% vraies trips Uber)
-├── context_poller/           # Poll Citi Bike GBFS + Open-Meteo + NYC 311 → context-signals-v1
+├── context_poller/           # Poll Citi Bike + Open-Meteo + NYC 311 + NYC Events → context-signals-v1
 ├── hot_path/                 # Speed Layer → Redis GEOADD (TTL 30s)
 ├── cold_path/                # Batch Layer → Parquet Snappy hive-partitionné
 │
@@ -274,6 +274,10 @@ df = conn.execute("""
 | `TLC_MAX_ACTIVE_TRIPS` | `800` | Plafond dur de courses simultanées |
 | `DRIVER_INGEST_TOKEN` | `dev-insecure-token` | Token du gateway mobile `driver-ingest` |
 | `CONTEXT_TICK_SECONDS` | `30` | Fréquence de publication des signaux de contexte (263 zones) |
+| `EVENTS_POLL_SECONDS` | `600` | Fréquence de polling de la source NYC events (`tvpp-9vvx`) |
+| `EVENT_RADIUS_KM` | `4.5` | Rayon zone/event utilisé pour `event_pressure` |
+| `EVENT_LOOKAHEAD_HOURS` | `6` | Fenêtre de prise en compte des événements à venir |
+| `EVENT_PRESSURE_CAP` | `0.75` | Cap de contribution events dans `demand_index` |
 | `GPS_TTL_SECONDS` | `30` | TTL Redis |
 | `BATCH_INTERVAL_SECONDS` | `60` | Fréquence flush Parquet |
 | `MAX_BATCH_RECORDS` | `50000` | Taille max buffer cold path |
@@ -486,9 +490,11 @@ NYC taxi zones every `CONTEXT_TICK_SECONDS`, using only public API data:
 - **Citi Bike GBFS** (`gbfs.lyft.com/gbfs/2.3/bkn/…`) → `demand_index`
 - **Open-Meteo** (`api.open-meteo.com`) → `weather_factor`
 - **NYC 311 Socrata** (`data.cityofnewyork.us/resource/erm2-nwe9.json`) → `traffic_factor`
-- **Redis GEO** (`fleet:livreurs`, populated by `hot-consumer` from TLC positions) → `supply_index`
+- **NYC Permitted Event Information** (`data.cityofnewyork.us/resource/tvpp-9vvx.json`) → `event_pressure` injecté dans `demand_index` (capé)
+- **Redis GEO** (`fleet:geo`, populated by `hot-consumer` from TLC positions) → `supply_index`
 
 There is no synthetic context anywhere in the platform.
+`GET /copilot/health` expose aussi `events_context` (source, statut, fenêtre, volumétrie) et les KPI de diffusion `event_pressure_*`.
 
 ### Developer checks
 
