@@ -51,6 +51,18 @@ def _env_float(name: str, default: float) -> float:
     return float(out)
 
 
+def _env_int(name: str, default: int, *, min_value: int | None = None, max_value: int | None = None) -> int:
+    try:
+        out = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        out = int(default)
+    if min_value is not None:
+        out = max(int(min_value), out)
+    if max_value is not None:
+        out = min(int(max_value), out)
+    return int(out)
+
+
 EVENTS_PATH = Path(os.getenv("EVENTS_PATH", "/data/parquet_events"))
 MODEL_PATH = Path(os.getenv("MODEL_PATH", "/data/models/copilot_model.joblib"))
 OSRM_URL = os.getenv("OSRM_URL", "http://osrm:5000")
@@ -108,6 +120,9 @@ RANK_REJECT_EUR_H_DEFAULT = max(0.0, _env_float("COPILOT_RANK_REJECT_EUR_H_DEFAU
 RANK_TOP_PICK_MIN_EUR_H = max(0.0, _env_float("COPILOT_RANK_TOP_PICK_MIN_EUR_H", 14.0))
 RANK_TOP_PICK_MIN_EDGE_EUR_H = max(0.0, _env_float("COPILOT_RANK_TOP_PICK_MIN_EDGE_EUR_H", 1.0))
 RANK_BELOW_TARGET_SLACK_EUR_H = max(0.0, _env_float("COPILOT_RANK_BELOW_TARGET_SLACK_EUR_H", 0.75))
+SHIFT_PLAN_TOP_K_DEFAULT = _env_int("COPILOT_SHIFT_PLAN_TOP_K_DEFAULT", 6, min_value=3, max_value=20)
+SHIFT_PLAN_REFERENCE_KM = _env_float("COPILOT_SHIFT_PLAN_REFERENCE_KM", 15.0)
+SHIFT_PLAN_DEFAULT_TARGET_EUR_H = max(0.0, _env_float("COPILOT_SHIFT_PLAN_TARGET_EUR_H", 18.0))
 
 GBFS_STATION_INFO_URL = "https://gbfs.citibikenyc.com/gbfs/en/station_information.json"
 GBFS_STATION_STATUS_URL = "https://gbfs.citibikenyc.com/gbfs/en/station_status.json"
@@ -252,6 +267,50 @@ class RankOffersResponse(BaseModel):
     median_eur_h: float
     hourly_gain_vs_worst_eur_h: float
     items: list[RankedOfferItem]
+
+
+class ShiftPlanZoneItem(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
+    rank: int
+    zone_id: str
+    zone_lat: float | None = None
+    zone_lon: float | None = None
+    shift_score: float
+    confidence: float
+    estimated_net_eur_h: float
+    estimated_gross_eur_h: float
+    net_gain_vs_target_eur_h: float
+    horizon_min: int
+    why_now: str
+    reasons: list[str]
+    demand_index: float
+    supply_index: float
+    weather_factor: float
+    traffic_factor: float
+    event_pressure: float
+    temporal_pressure: float
+    forecast_pressure_ratio: float
+    forecast_volatility: float
+    distance_km: float | None = None
+    eta_min: float | None = None
+    reposition_total_cost_eur: float | None = None
+    context_fallback_applied: bool = False
+    freshness_policy: str | None = None
+
+
+class ShiftPlanResponse(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
+    driver_id: str
+    origin_lat: float | None = None
+    origin_lon: float | None = None
+    horizon_min: Literal[60, 90]
+    generated_at: str
+    target_hourly_net_eur: float
+    source: str
+    count: int
+    items: list[ShiftPlanZoneItem]
 
 
 class FuelContextUpdateRequest(BaseModel):
@@ -2228,23 +2287,7 @@ def _rank_zone_recommendations(
     return enriched
 
 
-@copilot_router.get("/driver/{driver_id}/next-best-zone")
-async def next_best_zone(
-    request: Request,
-    driver_id: str,
-    top_k: int = Query(5, ge=1, le=20),
-    lat: float | None = Query(None, description="Override de la position driver (sinon lue depuis Redis)."),
-    lon: float | None = Query(None),
-    home_lat: float | None = Query(None, description="Position 'maison' optionnelle pour filtrer homeward."),
-    home_lon: float | None = Query(None),
-    max_distance_km: float | None = Query(None, ge=0.5, le=50.0, description="Filtre dur: zones au-delà ignorées."),
-    distance_weight: float = Query(0.0, ge=0.0, le=1.0, description="Pénalité distance (0=off, 0.3=modéré, 0.6=agressif)."),
-):
-    redis_client: aioredis.Redis = request.app.state.redis
-
-    # Pipeline the per-zone HGETALL: one round-trip instead of N sequential
-    # ones. On a fresh replay with ~260 NYC zones this cuts the endpoint
-    # from ~60 ms to ~8 ms in local benchmarks.
+async def _load_zone_context_payloads(redis_client: aioredis.Redis) -> list[dict[str, Any]]:
     zone_keys: list[str] = []
     async for key in redis_client.scan_iter(match=f"{ZONE_CONTEXT_PREFIX}*"):
         zone_keys.append(key)
@@ -2266,8 +2309,323 @@ async def next_best_zone(
         weather = float(context_payload.get("weather_factor") or 1.0)
         traffic = max(float(context_payload.get("traffic_factor") or 1.0), 0.2)
         opportunity = (demand / supply) * weather / traffic
-        context_payload["opportunity_score"] = round(opportunity, 3)
+        context_payload["opportunity_score"] = round(opportunity, 4)
         zones.append(context_payload)
+    return zones
+
+
+def _rank_shift_plan_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    tied = sorted(items, key=lambda it: str(it.get("zone_id") or ""))
+    return sorted(
+        tied,
+        key=lambda it: (
+            float(it.get("shift_score", 0.0)),
+            float(it.get("estimated_net_eur_h", 0.0)),
+            float(it.get("confidence", 0.0)),
+        ),
+        reverse=True,
+    )
+
+
+def _shift_plan_confidence(
+    *,
+    shift_score: float,
+    forecast_volatility: float,
+    context_fallback_applied: bool,
+    context_stale_sources: int,
+) -> float:
+    score_component = _clamp((float(shift_score) - 0.7) / 1.15, 0.0, 1.0)
+    volatility_component = 1.0 - _clamp(float(forecast_volatility), 0.0, 1.0)
+    stale_penalty = _clamp(float(context_stale_sources) / 5.0, 0.0, 1.0) * 0.12
+    fallback_penalty = 0.08 if bool(context_fallback_applied) else 0.0
+    confidence = 0.35 + (score_component * 0.43) + (volatility_component * 0.24) - stale_penalty - fallback_penalty
+    return round(_clamp(confidence, 0.08, 0.98), 4)
+
+
+def _shift_plan_reasons(
+    *,
+    zone: dict[str, Any],
+    horizon_min: int,
+    eta_min: float,
+    forecast_pressure_ratio: float,
+    event_pressure: float,
+    temporal_pressure: float,
+    demand_trend: float,
+    context_fallback_applied: bool,
+) -> list[str]:
+    reasons: list[str] = []
+    if forecast_pressure_ratio >= 1.25:
+        reasons.append(f"Strong forecast pressure ({forecast_pressure_ratio:.2f}) in next {horizon_min} min.")
+    elif forecast_pressure_ratio >= 1.05:
+        reasons.append(f"Healthy demand/supply outlook ({forecast_pressure_ratio:.2f}) over {horizon_min} min.")
+
+    if event_pressure >= 0.16:
+        reasons.append(f"Nearby events are likely to boost demand now ({event_pressure:.2f}).")
+    if temporal_pressure >= 0.1:
+        reasons.append(f"Favorable time window signal active ({temporal_pressure:.2f}).")
+    if demand_trend >= 0.06:
+        reasons.append(f"Demand trend is rising in this zone ({demand_trend:.2f}).")
+
+    if eta_min <= 10.0:
+        reasons.append(f"Quick reposition ({eta_min:.1f} min) keeps setup friction low.")
+    elif eta_min <= 18.0:
+        reasons.append(f"Reposition ETA is manageable ({eta_min:.1f} min).")
+
+    if bool(context_fallback_applied):
+        reasons.append("Context freshness fallback is active, confidence slightly reduced.")
+
+    if not reasons:
+        zone_id = str(zone.get("zone_id") or "zone")
+        reasons.append(f"Balanced context and reachable position for zone {zone_id}.")
+    return reasons[:4]
+
+
+def _build_shift_plan_item(
+    *,
+    zone: dict[str, Any],
+    horizon_min: int,
+    target_hourly_net_eur: float,
+    route_distance_km: float,
+    eta_min: float,
+    reposition_cost: dict[str, float],
+    forecast: dict[str, float],
+) -> dict[str, Any]:
+    current_opportunity = max(_as_float(zone.get("opportunity_score"), 0.0), 0.0)
+    forecast_opportunity = max(_as_float(forecast.get("forecast_opportunity_score"), 0.0), 0.0)
+    forecast_weight = 0.56 if int(horizon_min) == 60 else 0.64
+    current_weight = 1.0 - forecast_weight
+    shift_score = max((current_opportunity * current_weight) + (forecast_opportunity * forecast_weight), 0.0)
+
+    gross_multiplier = _clamp(0.82 + ((shift_score - 1.0) * 0.48), 0.6, 1.85)
+    estimated_gross_eur_h = max(float(target_hourly_net_eur) * gross_multiplier, 0.0)
+    reposition_penalty_hourly = max(float(reposition_cost.get("reposition_total_cost_eur", 0.0)), 0.0) * (60.0 / horizon_min)
+    estimated_net_eur_h = max(estimated_gross_eur_h - reposition_penalty_hourly, 0.0)
+    net_gain_vs_target = estimated_net_eur_h - float(target_hourly_net_eur)
+
+    event_pressure = max(_as_float(zone.get("event_pressure"), 0.0), 0.0)
+    temporal_pressure = max(_as_float(zone.get("temporal_pressure"), 0.0), 0.0)
+    demand_trend = _as_float(zone.get("demand_trend_ema"), _as_float(zone.get("demand_trend"), 0.0))
+    forecast_pressure_ratio = max(_as_float(forecast.get("forecast_pressure_ratio"), 0.0), 0.0)
+    forecast_volatility = _clamp(_as_float(forecast.get("forecast_volatility"), 0.0), 0.0, 1.0)
+    context_fallback_applied = _as_bool(zone.get("context_fallback_applied"), False)
+    context_stale_sources = int(max(_as_float(zone.get("context_stale_sources"), 0.0), 0.0))
+
+    reasons = _shift_plan_reasons(
+        zone=zone,
+        horizon_min=int(horizon_min),
+        eta_min=float(eta_min),
+        forecast_pressure_ratio=forecast_pressure_ratio,
+        event_pressure=event_pressure,
+        temporal_pressure=temporal_pressure,
+        demand_trend=demand_trend,
+        context_fallback_applied=context_fallback_applied,
+    )
+    confidence = _shift_plan_confidence(
+        shift_score=shift_score,
+        forecast_volatility=forecast_volatility,
+        context_fallback_applied=context_fallback_applied,
+        context_stale_sources=context_stale_sources,
+    )
+
+    why_now = reasons[0] if reasons else "Balanced short-term opportunity."
+    coords = _resolve_zone_coordinates(str(zone.get("zone_id") or ""))
+    zone_lat = float(coords[0]) if coords is not None else None
+    zone_lon = float(coords[1]) if coords is not None else None
+
+    return {
+        "zone_id": str(zone.get("zone_id") or "unknown_zone"),
+        "zone_lat": round(zone_lat, 6) if zone_lat is not None else None,
+        "zone_lon": round(zone_lon, 6) if zone_lon is not None else None,
+        "shift_score": round(float(shift_score), 4),
+        "confidence": float(confidence),
+        "estimated_net_eur_h": round(float(estimated_net_eur_h), 2),
+        "estimated_gross_eur_h": round(float(estimated_gross_eur_h), 2),
+        "net_gain_vs_target_eur_h": round(float(net_gain_vs_target), 2),
+        "horizon_min": int(horizon_min),
+        "why_now": why_now,
+        "reasons": reasons,
+        "demand_index": round(_as_float(zone.get("demand_index"), 1.0), 3),
+        "supply_index": round(max(_as_float(zone.get("supply_index"), 1.0), 0.2), 3),
+        "weather_factor": round(_as_float(zone.get("weather_factor"), 1.0), 3),
+        "traffic_factor": round(max(_as_float(zone.get("traffic_factor"), 1.0), 0.2), 3),
+        "event_pressure": round(event_pressure, 4),
+        "temporal_pressure": round(temporal_pressure, 4),
+        "forecast_pressure_ratio": round(forecast_pressure_ratio, 3),
+        "forecast_volatility": round(forecast_volatility, 3),
+        "distance_km": round(float(route_distance_km), 3),
+        "eta_min": round(float(eta_min), 2),
+        "reposition_total_cost_eur": round(float(reposition_cost.get("reposition_total_cost_eur", 0.0)), 2),
+        "context_fallback_applied": bool(context_fallback_applied),
+        "freshness_policy": zone.get("freshness_policy"),
+    }
+
+
+@copilot_router.get("/driver/{driver_id}/shift-plan", response_model=ShiftPlanResponse)
+async def shift_plan(
+    request: Request,
+    driver_id: str,
+    horizon_min: int = Query(60, ge=60, le=90),
+    top_k: int = Query(SHIFT_PLAN_TOP_K_DEFAULT, ge=3, le=20),
+    lat: float | None = Query(None, ge=-90.0, le=90.0),
+    lon: float | None = Query(None, ge=-180.0, le=180.0),
+    max_distance_km: float | None = Query(None, ge=0.5, le=50.0),
+    distance_weight: float = Query(0.3, ge=0.0, le=1.0),
+    target_hourly_net_eur: float | None = Query(None, ge=0.0, le=150.0),
+    use_osrm: bool = Query(
+        False,
+        description="If true, use OSRM for reposition leg estimation (more precise, slower).",
+    ),
+):
+    if horizon_min not in (60, 90):
+        raise HTTPException(status_code=422, detail="horizon_min must be 60 or 90")
+
+    redis_client: aioredis.Redis = request.app.state.redis
+    driver_lat, driver_lon = await _resolve_driver_origin(redis_client, driver_id, lat, lon)
+
+    zones = await _load_zone_context_payloads(redis_client)
+    if not zones:
+        return {
+            "driver_id": driver_id,
+            "origin_lat": round(float(driver_lat), 6),
+            "origin_lon": round(float(driver_lon), 6),
+            "horizon_min": int(horizon_min),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "target_hourly_net_eur": round(
+                float(target_hourly_net_eur if target_hourly_net_eur is not None else SHIFT_PLAN_DEFAULT_TARGET_EUR_H),
+                2,
+            ),
+            "source": "zone_context_v2",
+            "count": 0,
+            "items": [],
+        }
+
+    fuel_context = await redis_client.hgetall(FUEL_CONTEXT_KEY)
+    fuel_price = _as_float(fuel_context.get("fuel_price_eur_l"), DEFAULT_FUEL_PRICE_EUR_L)
+    consumption = _as_float(fuel_context.get("vehicle_consumption_l_100km"), DEFAULT_CONSUMPTION_L_100KM)
+    target_hourly = float(
+        target_hourly_net_eur if target_hourly_net_eur is not None else SHIFT_PLAN_DEFAULT_TARGET_EUR_H
+    )
+    if target_hourly <= 0:
+        target_hourly = SHIFT_PLAN_DEFAULT_TARGET_EUR_H
+
+    osrm_client: httpx.AsyncClient | None = None
+    items: list[dict[str, Any]] = []
+    try:
+        if use_osrm:
+            osrm_client = httpx.AsyncClient(timeout=OSRM_SCORE_TIMEOUT_S)
+
+        leg_specs: list[tuple[dict[str, Any], tuple[float, float], float]] = []
+        for zone in zones:
+            zone_id = str(zone.get("zone_id") or "")
+            coords = _resolve_zone_coordinates(zone_id)
+            if coords is None:
+                continue
+            traffic = max(_as_float(zone.get("traffic_factor"), 1.0), 0.2)
+            leg_specs.append((zone, coords, traffic))
+
+        leg_results: list[tuple[float, float, str]] = []
+        if leg_specs:
+            leg_results = await asyncio.gather(
+                *[
+                    _estimate_reposition_leg(
+                        origin_lat=float(driver_lat),
+                        origin_lon=float(driver_lon),
+                        dest_lat=coords[0],
+                        dest_lon=coords[1],
+                        traffic_factor=traffic,
+                        use_osrm=use_osrm,
+                        osrm_client=osrm_client,
+                    )
+                    for (_zone, coords, traffic) in leg_specs
+                ]
+            )
+
+        for (zone, _coords, traffic), leg in zip(leg_specs, leg_results):
+            route_distance_km, eta_min, _route_source = leg
+            if max_distance_km is not None and route_distance_km > float(max_distance_km):
+                continue
+
+            demand = _as_float(zone.get("demand_index"), 1.0)
+            supply = max(_as_float(zone.get("supply_index"), 1.0), 0.2)
+            weather = _as_float(zone.get("weather_factor"), 1.0)
+            gbfs_demand_boost = _as_float(zone.get("gbfs_demand_boost"), 0.0)
+            demand_trend = _as_float(zone.get("demand_trend_ema"), _as_float(zone.get("demand_trend"), 0.0))
+
+            forecast = _forecast_zone_metrics(
+                demand_index=demand,
+                supply_index=supply,
+                weather_factor=weather,
+                traffic_factor=traffic,
+                gbfs_demand_boost=gbfs_demand_boost,
+                demand_trend=demand_trend,
+                horizon_minutes=float(horizon_min),
+            )
+            reposition = _reposition_cost_model(
+                route_distance_km=route_distance_km,
+                eta_min=eta_min,
+                fuel_price_eur_l=fuel_price,
+                vehicle_consumption_l_100km=consumption,
+                target_hourly_net_eur=target_hourly,
+                traffic_factor=traffic,
+                forecast_volatility=forecast["forecast_volatility"],
+            )
+
+            distance_norm = min(route_distance_km / max(SHIFT_PLAN_REFERENCE_KM, 0.5), 1.0)
+            distance_penalty = _clamp(float(distance_weight) * distance_norm, 0.0, 0.9)
+            zone_payload = dict(zone)
+            zone_payload["opportunity_score"] = max(
+                _as_float(zone_payload.get("opportunity_score"), 0.0) * (1.0 - distance_penalty),
+                0.0,
+            )
+
+            item = _build_shift_plan_item(
+                zone=zone_payload,
+                horizon_min=int(horizon_min),
+                target_hourly_net_eur=target_hourly,
+                route_distance_km=route_distance_km,
+                eta_min=eta_min,
+                reposition_cost=reposition,
+                forecast=forecast,
+            )
+            items.append(item)
+    finally:
+        if osrm_client is not None:
+            await osrm_client.aclose()
+
+    ranked = _rank_shift_plan_items(items)
+    effective_top_k = max(3, int(top_k))
+    selected = ranked[:effective_top_k]
+    for idx, item in enumerate(selected, start=1):
+        item["rank"] = idx
+
+    return {
+        "driver_id": driver_id,
+        "origin_lat": round(float(driver_lat), 6),
+        "origin_lon": round(float(driver_lon), 6),
+        "horizon_min": int(horizon_min),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "target_hourly_net_eur": round(float(target_hourly), 2),
+        "source": "zone_context_v2",
+        "count": len(selected),
+        "items": selected,
+    }
+
+
+@copilot_router.get("/driver/{driver_id}/next-best-zone")
+async def next_best_zone(
+    request: Request,
+    driver_id: str,
+    top_k: int = Query(5, ge=1, le=20),
+    lat: float | None = Query(None, description="Override de la position driver (sinon lue depuis Redis)."),
+    lon: float | None = Query(None),
+    home_lat: float | None = Query(None, description="Position 'maison' optionnelle pour filtrer homeward."),
+    home_lon: float | None = Query(None),
+    max_distance_km: float | None = Query(None, ge=0.5, le=50.0, description="Filtre dur: zones au-delà ignorées."),
+    distance_weight: float = Query(0.0, ge=0.0, le=1.0, description="Pénalité distance (0=off, 0.3=modéré, 0.6=agressif)."),
+):
+    redis_client: aioredis.Redis = request.app.state.redis
+
+    zones = await _load_zone_context_payloads(redis_client)
 
     driver_lat: float | None = lat
     driver_lon: float | None = lon

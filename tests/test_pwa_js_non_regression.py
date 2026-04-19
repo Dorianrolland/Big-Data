@@ -293,6 +293,99 @@ async function fetchStub(url, _opts) {{
       }}],
     }});
   }}
+  if (path.endsWith('/shift-plan')) {{
+    return ok({{
+      driver_id: 'drv_demo_001',
+      horizon_min: 60,
+      generated_at: nowTs,
+      target_hourly_net_eur: 18.0,
+      source: 'zone_context_v2',
+      count: 3,
+      items: [
+        {{
+          rank: 1,
+          zone_id: 'midtown',
+          zone_lat: 40.7611,
+          zone_lon: -73.9776,
+          shift_score: 1.24,
+          confidence: 0.82,
+          estimated_net_eur_h: 26.1,
+          estimated_gross_eur_h: 28.7,
+          net_gain_vs_target_eur_h: 8.1,
+          horizon_min: 60,
+          why_now: 'Strong forecast pressure in next 60 min.',
+          reasons: ['Strong forecast pressure', 'Quick reposition'],
+          demand_index: 1.6,
+          supply_index: 0.9,
+          weather_factor: 1.0,
+          traffic_factor: 1.1,
+          event_pressure: 0.18,
+          temporal_pressure: 0.13,
+          forecast_pressure_ratio: 1.33,
+          forecast_volatility: 0.2,
+          distance_km: 2.5,
+          eta_min: 9.6,
+          reposition_total_cost_eur: 2.3,
+          context_fallback_applied: false,
+          freshness_policy: 'stale_neutral_v1',
+        }},
+        {{
+          rank: 2,
+          zone_id: 'chelsea',
+          zone_lat: 40.7465,
+          zone_lon: -74.0014,
+          shift_score: 1.11,
+          confidence: 0.74,
+          estimated_net_eur_h: 23.2,
+          estimated_gross_eur_h: 25.0,
+          net_gain_vs_target_eur_h: 5.2,
+          horizon_min: 60,
+          why_now: 'Healthy demand/supply outlook over 60 min.',
+          reasons: ['Healthy demand/supply outlook'],
+          demand_index: 1.4,
+          supply_index: 0.95,
+          weather_factor: 1.0,
+          traffic_factor: 1.1,
+          event_pressure: 0.1,
+          temporal_pressure: 0.08,
+          forecast_pressure_ratio: 1.2,
+          forecast_volatility: 0.23,
+          distance_km: 3.4,
+          eta_min: 11.2,
+          reposition_total_cost_eur: 2.8,
+          context_fallback_applied: false,
+          freshness_policy: 'stale_neutral_v1',
+        }},
+        {{
+          rank: 3,
+          zone_id: 'soho',
+          zone_lat: 40.7233,
+          zone_lon: -74.0030,
+          shift_score: 1.01,
+          confidence: 0.68,
+          estimated_net_eur_h: 20.4,
+          estimated_gross_eur_h: 22.4,
+          net_gain_vs_target_eur_h: 2.4,
+          horizon_min: 60,
+          why_now: 'Reposition ETA is manageable.',
+          reasons: ['Reposition ETA is manageable'],
+          demand_index: 1.25,
+          supply_index: 1.0,
+          weather_factor: 1.0,
+          traffic_factor: 1.15,
+          event_pressure: 0.06,
+          temporal_pressure: 0.05,
+          forecast_pressure_ratio: 1.1,
+          forecast_volatility: 0.24,
+          distance_km: 4.1,
+          eta_min: 13.8,
+          reposition_total_cost_eur: 3.4,
+          context_fallback_applied: false,
+          freshness_policy: 'stale_neutral_v1',
+        }},
+      ],
+    }});
+  }}
   if (path === '/copilot/score-offer') {{
     return ok({{
       offer_id: 'off_demo_001',
@@ -357,7 +450,7 @@ vm.createContext(context);
 vm.runInContext(source, context, {{ filename: 'app.js' }});
 
 async function main() {{
-  await new Promise((resolve) => setTimeout(resolve, 30));
+  await new Promise((resolve) => setTimeout(resolve, 80));
   if (typeof context.selectOfferByKey === 'function') {{
     context.selectOfferByKey('offer:off_demo_001');
   }}
@@ -367,7 +460,7 @@ async function main() {{
   if (typeof context.runSelectedActionRoute === 'function') {{
     context.runSelectedActionRoute();
   }}
-  await new Promise((resolve) => setTimeout(resolve, 30));
+  await new Promise((resolve) => setTimeout(resolve, 80));
 
   const scoreDecisionText = String(getNode('scoreDecision').textContent || '').trim();
   if (scoreDecisionText !== 'ACCEPT') {{
@@ -409,6 +502,16 @@ async function main() {{
   }}
   if (!missionHtml.includes('&lt;script') || !missionHtml.includes('&lt;img')) {{
     realConsole.error('expected escaped mission markers in HTML, got', missionHtml);
+    process.exit(1);
+  }}
+  const shiftSummary = String(getNode('shiftPlanSummary').textContent || '');
+  if (!shiftSummary.toLowerCase().includes('top')) {{
+    realConsole.error('expected shift plan summary to be rendered, got', shiftSummary);
+    process.exit(1);
+  }}
+  const shiftRows = getNode('shiftPlanList').children || [];
+  if (!shiftRows.length) {{
+    realConsole.error('expected shift plan rows to be rendered');
     process.exit(1);
   }}
 
@@ -456,7 +559,17 @@ def test_pwa_index_contains_decision_flow_region() -> None:
     assert 'id="decisionQuickScoreBtn"' in content
     assert 'id="decisionScoreBtn"' in content
     assert 'id="decisionActionBtn"' in content
+    assert 'id="shiftPlanHorizon"' in content
+    assert 'id="shiftPlanTopK"' in content
+    assert 'id="refreshShiftPlanBtn"' in content
+    assert 'id="shiftPlanSummary"' in content
+    assert 'id="shiftPlanList"' in content
     assert 'aria-live="polite"' in content
+
+
+def test_pwa_app_binds_shift_plan_action_delegation() -> None:
+    content = APP_JS_PATH.read_text(encoding="utf-8")
+    assert "bindOfferActionDelegation(shiftPlanEl);" in content
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required for syntax validation")

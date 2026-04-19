@@ -8,7 +8,12 @@ _API_DIR = Path(__file__).resolve().parent.parent / "api"
 if str(_API_DIR) not in sys.path:
     sys.path.insert(0, str(_API_DIR))
 
-from api.copilot_router import RankedOfferItem, ScoreOfferResponse  # noqa: E402
+from copilot_router import (  # noqa: E402
+    RankedOfferItem,
+    ScoreOfferResponse,
+    ShiftPlanResponse,
+    ShiftPlanZoneItem,
+)
 
 
 def test_score_offer_response_backward_compatible_without_explanation_details():
@@ -108,3 +113,89 @@ def test_ranked_offer_item_backward_compatible_with_optional_details():
     assert dumped["recommendation"] == "top_pick"
     assert dumped["explanation_details"][0]["source"] == "target"
     assert dumped["decision_threshold"] == 0.5
+
+
+def test_shift_plan_zone_item_contract_fields():
+    item = ShiftPlanZoneItem(
+        rank=1,
+        zone_id="40.7580_-73.9855",
+        zone_lat=40.7580,
+        zone_lon=-73.9855,
+        shift_score=1.214,
+        confidence=0.78,
+        estimated_net_eur_h=25.4,
+        estimated_gross_eur_h=28.2,
+        net_gain_vs_target_eur_h=7.4,
+        horizon_min=60,
+        why_now="Strong forecast pressure in next 60 min.",
+        reasons=["Strong forecast pressure", "Quick reposition"],
+        demand_index=1.62,
+        supply_index=0.91,
+        weather_factor=1.03,
+        traffic_factor=1.08,
+        event_pressure=0.17,
+        temporal_pressure=0.12,
+        forecast_pressure_ratio=1.34,
+        forecast_volatility=0.18,
+        distance_km=2.5,
+        eta_min=9.4,
+        reposition_total_cost_eur=2.1,
+        context_fallback_applied=False,
+        freshness_policy="stale_neutral_v1",
+    )
+    dumped = item.model_dump()
+    assert dumped["rank"] == 1
+    assert dumped["why_now"]
+    assert dumped["horizon_min"] == 60
+    assert dumped["confidence"] == 0.78
+    assert dumped["demand_index"] == 1.62
+
+
+def test_shift_plan_response_contract_is_backward_safe():
+    payload = ShiftPlanResponse(
+        driver_id="drv_demo_001",
+        origin_lat=40.758,
+        origin_lon=-73.9855,
+        horizon_min=90,
+        generated_at="2026-04-19T09:12:00+00:00",
+        target_hourly_net_eur=18.0,
+        source="zone_context_v2",
+        count=1,
+        items=[
+            ShiftPlanZoneItem(
+                rank=1,
+                zone_id="40.7611_-73.9776",
+                zone_lat=40.7611,
+                zone_lon=-73.9776,
+                shift_score=1.02,
+                confidence=0.64,
+                estimated_net_eur_h=21.8,
+                estimated_gross_eur_h=24.2,
+                net_gain_vs_target_eur_h=3.8,
+                horizon_min=90,
+                why_now="Healthy demand/supply outlook over 90 min.",
+                reasons=["Healthy demand/supply outlook"],
+                demand_index=1.4,
+                supply_index=0.95,
+                weather_factor=1.0,
+                traffic_factor=1.12,
+                event_pressure=0.09,
+                temporal_pressure=0.07,
+                forecast_pressure_ratio=1.18,
+                forecast_volatility=0.22,
+                distance_km=3.2,
+                eta_min=11.6,
+                reposition_total_cost_eur=2.8,
+                context_fallback_applied=False,
+                freshness_policy="stale_neutral_v1",
+            )
+        ],
+    )
+    out = payload.model_dump()
+    assert out["driver_id"] == "drv_demo_001"
+    assert out["origin_lat"] == 40.758
+    assert out["origin_lon"] == -73.9855
+    assert out["horizon_min"] == 90
+    assert out["count"] == 1
+    assert isinstance(out["items"], list)
+    assert out["items"][0]["zone_id"] == "40.7611_-73.9776"
