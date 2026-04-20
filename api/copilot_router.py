@@ -35,6 +35,8 @@ from copilot_logic import (
     reposition_cost_model,
     ranking_objective_score,
     recommendation_score,
+    score_decomposition,
+    standardized_reason_codes,
     validate_model_payload,
 )
 
@@ -210,6 +212,24 @@ class ExplanationDetail(BaseModel):
     source: Literal["cost", "time", "fuel", "target", "context", "routing"]
 
 
+class ScoreBreakdownDimension(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
+    label: str
+    score: float
+    weight: float
+    contribution: float
+    impact: Literal["positive", "negative", "neutral"]
+
+
+class ScoreBreakdown(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
+    version: str = "v2"
+    total_score: float
+    dimensions: dict[str, ScoreBreakdownDimension]
+
+
 class ScoreOfferResponse(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
@@ -230,6 +250,8 @@ class ScoreOfferResponse(BaseModel):
     model_used: str
     explanation: list[str]
     explanation_details: list[ExplanationDetail] | None = None
+    score_breakdown: ScoreBreakdown | None = None
+    reason_codes: list[str] | None = None
 
 
 class RankOffersRequest(BaseModel):
@@ -276,6 +298,8 @@ class RankedOfferItem(BaseModel):
     model_used: str
     explanation: list[str]
     explanation_details: list[ExplanationDetail] | None = None
+    score_breakdown: ScoreBreakdown | None = None
+    reason_codes: list[str] | None = None
 
 
 class RankOffersResponse(BaseModel):
@@ -671,6 +695,45 @@ def _build_explanation_details(
     )
 
 
+def _build_score_breakdown(
+    *,
+    features: dict[str, float],
+    accept_prob: float,
+) -> dict[str, Any]:
+    return score_decomposition(features, float(accept_prob))
+
+
+def _build_reason_codes(
+    *,
+    features: dict[str, float],
+    accept_prob: float,
+    decision_threshold: float,
+    score_breakdown: dict[str, Any],
+) -> list[str]:
+    return standardized_reason_codes(
+        features,
+        float(accept_prob),
+        decision_threshold=float(decision_threshold),
+        decomposition=score_breakdown,
+    )
+
+
+def _build_explainability_bundle(
+    *,
+    features: dict[str, float],
+    accept_prob: float,
+    decision_threshold: float,
+) -> tuple[dict[str, Any], list[str]]:
+    score_breakdown = _build_score_breakdown(features=features, accept_prob=float(accept_prob))
+    reason_codes = _build_reason_codes(
+        features=features,
+        accept_prob=float(accept_prob),
+        decision_threshold=decision_threshold,
+        score_breakdown=score_breakdown,
+    )
+    return score_breakdown, reason_codes
+
+
 def _build_scored_offer_snapshot(
     *,
     payload: dict[str, Any],
@@ -684,6 +747,8 @@ def _build_scored_offer_snapshot(
     model_used: str,
     reasons: list[str],
     details: list[dict[str, Any]],
+    score_breakdown: dict[str, Any] | None = None,
+    reason_codes: list[str] | None = None,
     extras: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     record = {
@@ -708,6 +773,8 @@ def _build_scored_offer_snapshot(
         "model_used": model_used,
         "explanation": reasons,
         "explanation_details": details,
+        "score_breakdown": score_breakdown,
+        "reason_codes": list(reason_codes or []),
     }
     if extras:
         record.update(extras)
@@ -865,6 +932,7 @@ async def _estimate_reposition_leg(
 def _dispatch_offer_summary(offer: dict[str, Any]) -> dict[str, Any]:
     signals = offer.get("recommendation_signals")
     reasons = offer.get("explanation")
+    reason_codes = offer.get("reason_codes")
     return {
         "offer_id": offer.get("offer_id"),
         "zone_id": offer.get("zone_id"),
@@ -877,8 +945,10 @@ def _dispatch_offer_summary(offer: dict[str, Any]) -> dict[str, Any]:
         "distance_to_pickup_km": round(float(offer.get("distance_to_pickup_km", 0.0)), 3),
         "route_duration_min": round(float(offer.get("route_duration_min", 0.0)), 2),
         "route_source": offer.get("route_source"),
+        "score_breakdown": offer.get("score_breakdown"),
         "signals": list(signals) if isinstance(signals, list) else [],
         "reasons": list(reasons) if isinstance(reasons, list) else [],
+        "reason_codes": list(reason_codes) if isinstance(reason_codes, list) else [],
     }
 
 
@@ -1519,6 +1589,11 @@ async def score_offer(request: Request, body: ScoreOfferRequest) -> ScoreOfferRe
         decision_threshold=decision_threshold,
         route_meta=route_meta,
     )
+    score_breakdown, reason_codes = _build_explainability_bundle(
+        features=features,
+        accept_prob=float(accept_prob),
+        decision_threshold=decision_threshold,
+    )
 
     return ScoreOfferResponse(
         offer_id=payload.get("offer_id"),
@@ -1538,6 +1613,8 @@ async def score_offer(request: Request, body: ScoreOfferRequest) -> ScoreOfferRe
         model_used=model_used,
         explanation=reasons,
         explanation_details=details,
+        score_breakdown=score_breakdown,
+        reason_codes=reason_codes,
     )
 
 
@@ -1643,6 +1720,8 @@ def _rank_offer_items(
             model_used=it.get("model_used", "heuristic"),
             explanation=list(it.get("explanation") or []),
             explanation_details=list(it.get("explanation_details") or []),
+            score_breakdown=it.get("score_breakdown"),
+            reason_codes=list(it.get("reason_codes") or []),
         ))
     return items, best_eur_h, worst_eur_h, median_eur_h
 
@@ -1730,6 +1809,11 @@ async def rank_offers(request: Request, body: RankOffersRequest) -> RankOffersRe
                 decision_threshold=decision_threshold,
                 route_meta=route_meta,
             )
+            score_breakdown, reason_codes = _build_explainability_bundle(
+                features=features,
+                accept_prob=float(accept_prob),
+                decision_threshold=decision_threshold,
+            )
             breakdown = cost_breakdown(features)
             objective_score = _compute_objective_score(
                 features=features,
@@ -1749,6 +1833,8 @@ async def rank_offers(request: Request, body: RankOffersRequest) -> RankOffersRe
                     model_used=model_used,
                     reasons=reasons,
                     details=details,
+                    score_breakdown=score_breakdown,
+                    reason_codes=reason_codes,
                     extras={"objective_score": objective_score},
                 )
             )
@@ -2048,6 +2134,11 @@ async def driver_offers(
                 decision_threshold=decision_threshold,
                 route_meta=route_meta,
             )
+            score_breakdown, reason_codes = _build_explainability_bundle(
+                features=features,
+                accept_prob=float(accept_prob),
+                decision_threshold=decision_threshold,
+            )
             breakdown = cost_breakdown(features)
             objective_score = _compute_objective_score(
                 features=features,
@@ -2068,6 +2159,8 @@ async def driver_offers(
                     model_used=model_used,
                     reasons=reasons,
                     details=details,
+                    score_breakdown=score_breakdown,
+                    reason_codes=reason_codes,
                     extras={
                         "zone_id": off.get("zone_id"),
                         "ts": off.get("ts"),
@@ -2207,6 +2300,11 @@ async def best_offers_around(
                 decision_threshold=decision_threshold,
                 route_meta=route_meta,
             )
+            score_breakdown, reason_codes = _build_explainability_bundle(
+                features=features,
+                accept_prob=float(accept_prob),
+                decision_threshold=decision_threshold,
+            )
 
             rec_score, rec_action, rec_signals = recommendation_score(
                 features,
@@ -2232,6 +2330,8 @@ async def best_offers_around(
                     model_used=model_used,
                     reasons=reasons,
                     details=details,
+                    score_breakdown=score_breakdown,
+                    reason_codes=reason_codes,
                     extras={
                         "zone_id": payload.get("zone_id"),
                         "ts": payload.get("ts"),
