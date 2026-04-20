@@ -151,3 +151,49 @@ docker logs -f fleetstream-tlc-replay
 ```
 
 You should see logs like `starting month 2024-01 (1/10)`, then `(2/10)`, etc.
+
+## source_platform — valeurs et conventions
+
+Le champ `source_platform` identifie l'origine de chaque événement tout au long du pipeline.
+
+| Valeur | Producteur | Description |
+|--------|-----------|-------------|
+| `driver_ingest` | `driver_ingest` | Position GPS envoyée par l'application mobile du livreur |
+| `tlc_hvfhv_historical` | `tlc_replay`, `single_driver` | Données historiques TLC (NYC for-hire vehicle) rejouées |
+| `context_poller_public` | `context_poller` | Signaux contextuels (météo, trafic, zones) |
+| `unknown` | cold_path fallback | Proto reçu sans `source_platform` défini |
+
+### Requête DuckDB — analyse par plateforme source
+
+```python
+import duckdb
+
+con = duckdb.connect()
+rows = con.execute("""
+    SELECT
+        source_platform,
+        topic,
+        COUNT(*)                                   AS nb_events,
+        ROUND(AVG(estimated_fare_eur), 2)          AS avg_fare_eur,
+        MIN(ts)                                    AS first_seen,
+        MAX(ts)                                    AS last_seen
+    FROM read_parquet(
+        'data/parquet_events/topic=*/year=*/month=*/day=*/hour=*/*.parquet',
+        hive_partitioning = true
+    )
+    WHERE source_platform IS NOT NULL
+      AND source_platform != ''
+    GROUP BY source_platform, topic
+    ORDER BY nb_events DESC
+""").fetchall()
+
+for row in rows:
+    print(row)
+```
+
+### Vérifier la traçabilité via l'API
+
+```bash
+curl -s "http://localhost:8001/copilot/replay?from=2026-04-01T00:00:00Z&to=2026-04-02T00:00:00Z&limit=5" \
+  | python3 -c "import sys,json; [print(e['source_platform'], e['topic']) for e in json.load(sys.stdin)['events']]"
+```

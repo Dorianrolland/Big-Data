@@ -24,6 +24,9 @@ const source = fs.readFileSync(appPath, 'utf8');
 const consoleErrors = [];
 const unhandledErrors = [];
 const openedUrls = [];
+let lastProfilePutBody = null;
+let lastOffersQuery = '';
+let lastBestAroundQuery = '';
 
 process.on('unhandledRejection', (err) => {{
   unhandledErrors.push(String(err && err.message ? err.message : err));
@@ -178,6 +181,7 @@ const offerBase = {{
 async function fetchStub(url, _opts) {{
   const parsed = new URL(String(url), 'http://localhost');
   const path = parsed.pathname;
+  const method = String(_opts?.method || 'GET').toUpperCase();
 
   if (path === '/copilot/health') {{
     return ok({{
@@ -211,7 +215,35 @@ async function fetchStub(url, _opts) {{
       }},
     }});
   }}
+  if (path.endsWith('/profile')) {{
+    if (method === 'PUT') {{
+      try {{
+        lastProfilePutBody = _opts && _opts.body ? JSON.parse(String(_opts.body)) : null;
+      }} catch (_) {{
+        lastProfilePutBody = null;
+      }}
+      return ok({{
+        driver_id: 'drv_demo_001',
+        target_eur_h: Number(lastProfilePutBody?.target_eur_h ?? 19.5),
+        consommation_l_100: Number(lastProfilePutBody?.consommation_l_100 ?? 7.1),
+        aversion_risque: Number(lastProfilePutBody?.aversion_risque ?? 0.42),
+        max_eta: Number(lastProfilePutBody?.max_eta ?? 18.0),
+        source: 'manual',
+        updated_at: nowTs,
+      }});
+    }}
+    return ok({{
+      driver_id: 'drv_demo_001',
+      target_eur_h: 18.0,
+      consommation_l_100: 7.5,
+      aversion_risque: 0.5,
+      max_eta: 20.0,
+      source: 'stored',
+      updated_at: nowTs,
+    }});
+  }}
   if (path.endsWith('/offers')) {{
+    lastOffersQuery = parsed.searchParams.toString();
     return ok({{
       driver_id: 'drv_demo_001',
       count: 2,
@@ -221,6 +253,7 @@ async function fetchStub(url, _opts) {{
     }});
   }}
   if (path.endsWith('/best-offers-around')) {{
+    lastBestAroundQuery = parsed.searchParams.toString();
     return ok({{
       driver_id: 'drv_demo_001',
       count: 1,
@@ -460,6 +493,22 @@ async function main() {{
   if (typeof context.runSelectedActionRoute === 'function') {{
     context.runSelectedActionRoute();
   }}
+  getNode('profileTargetEurH').value = '999';
+  getNode('profileConsumption').value = 'abc';
+  getNode('profileRiskAversion').value = '-1';
+  getNode('profileMaxEta').value = '1000';
+  if (typeof context.saveDriverProfile === 'function') {{
+    await context.saveDriverProfile();
+  }}
+  getNode('objWeightGain').value = '100';
+  getNode('objWeightTime').value = '0';
+  getNode('objWeightFuel').value = '0';
+  if (typeof context.handleObjectiveWeightChange === 'function') {{
+    context.handleObjectiveWeightChange();
+  }}
+  if (typeof context.refreshDriverData === 'function') {{
+    await context.refreshDriverData();
+  }}
   await new Promise((resolve) => setTimeout(resolve, 80));
 
   const scoreDecisionText = String(getNode('scoreDecision').textContent || '').trim();
@@ -502,6 +551,27 @@ async function main() {{
   }}
   if (!missionHtml.includes('&lt;script') || !missionHtml.includes('&lt;img')) {{
     realConsole.error('expected escaped mission markers in HTML, got', missionHtml);
+    process.exit(1);
+  }}
+  const profileStatus = String(getNode('profileStatus').textContent || '');
+  if (!profileStatus.toLowerCase().includes('profile')) {{
+    realConsole.error('expected profile status to be rendered, got', profileStatus);
+    process.exit(1);
+  }}
+  if (!lastProfilePutBody) {{
+    realConsole.error('expected profile update payload to be captured');
+    process.exit(1);
+  }}
+  if (lastProfilePutBody.target_eur_h !== 150 || lastProfilePutBody.consommation_l_100 !== 7.5 || lastProfilePutBody.aversion_risque !== 0 || lastProfilePutBody.max_eta !== 60) {{
+    realConsole.error('expected normalized profile payload, got', JSON.stringify(lastProfilePutBody));
+    process.exit(1);
+  }}
+  if (!String(lastOffersQuery).includes('sort_by=objective') || !String(lastOffersQuery).includes('w_gain=')) {{
+    realConsole.error('expected weighted objective query for /offers, got', lastOffersQuery);
+    process.exit(1);
+  }}
+  if (!String(lastBestAroundQuery).includes('rank_by=objective') || !String(lastBestAroundQuery).includes('w_fuel=')) {{
+    realConsole.error('expected weighted objective query for /best-offers-around, got', lastBestAroundQuery);
     process.exit(1);
   }}
   const shiftSummary = String(getNode('shiftPlanSummary').textContent || '');
@@ -564,6 +634,16 @@ def test_pwa_index_contains_decision_flow_region() -> None:
     assert 'id="refreshShiftPlanBtn"' in content
     assert 'id="shiftPlanSummary"' in content
     assert 'id="shiftPlanList"' in content
+    assert 'id="profileTargetEurH"' in content
+    assert 'id="profileConsumption"' in content
+    assert 'id="profileRiskAversion"' in content
+    assert 'id="profileMaxEta"' in content
+    assert 'id="profileSaveBtn"' in content
+    assert 'id="profileStatus"' in content
+    assert 'id="objWeightGain"' in content
+    assert 'id="objWeightTime"' in content
+    assert 'id="objWeightFuel"' in content
+    assert 'id="objectiveWeightStatus"' in content
     assert 'aria-live="polite"' in content
 
 

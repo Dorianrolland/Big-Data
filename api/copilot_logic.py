@@ -55,6 +55,12 @@ DEFAULT_SCORE_WEIGHTS = {
     "context": 0.08,
 }
 
+DEFAULT_OBJECTIVE_WEIGHTS = {
+    "w_gain": 0.62,
+    "w_time": 0.23,
+    "w_fuel": 0.15,
+}
+
 
 def normalize_score_weights(raw_weights: Mapping[str, float] | None = None) -> dict[str, float]:
     weights = {k: float(v) for k, v in DEFAULT_SCORE_WEIGHTS.items()}
@@ -66,6 +72,29 @@ def normalize_score_weights(raw_weights: Mapping[str, float] | None = None) -> d
     total = sum(weights.values())
     if total <= 0.0:
         return {k: float(v) for k, v in DEFAULT_SCORE_WEIGHTS.items()}
+    return {k: float(v / total) for k, v in weights.items()}
+
+
+def normalize_objective_weights(
+    raw_weights: Mapping[str, float] | None = None,
+    *,
+    defaults: Mapping[str, float] | None = None,
+) -> dict[str, float]:
+    base = defaults or DEFAULT_OBJECTIVE_WEIGHTS
+    weights = {
+        key: max(0.0, as_float(base.get(key), DEFAULT_OBJECTIVE_WEIGHTS[key]))
+        for key in DEFAULT_OBJECTIVE_WEIGHTS
+    }
+    if raw_weights:
+        for key in DEFAULT_OBJECTIVE_WEIGHTS:
+            if key in raw_weights:
+                weights[key] = max(0.0, as_float(raw_weights.get(key), weights[key]))
+
+    total = sum(weights.values())
+    if total <= 0.0:
+        fallback = {k: float(v) for k, v in DEFAULT_OBJECTIVE_WEIGHTS.items()}
+        fallback_total = sum(fallback.values())
+        return {k: float(v / fallback_total) for k, v in fallback.items()}
     return {k: float(v / total) for k, v in weights.items()}
 
 
@@ -305,23 +334,59 @@ def cost_breakdown(features: dict[str, float]) -> dict[str, float]:
     }
 
 
-def recommendation_score(features: dict[str, float], accept_score: float) -> tuple[float, str, list[str]]:
+def ranking_objective_components(features: dict[str, float], accept_score: float) -> dict[str, float]:
     pressure_ratio = max(float(features.get("pressure_ratio", 1.0)), 0.0)
     distance_to_pickup = max(float(features.get("distance_to_pickup_km", 0.0)), 0.0)
+    total_duration_min = max(float(features.get("total_duration_min", 1.0)), 1.0)
     target_gap = float(features.get("target_gap_eur_h", 0.0))
+    estimated_fare = max(float(features.get("estimated_fare_eur", 0.0)), 0.0)
+    fuel_cost = max(float(features.get("fuel_cost_eur", 0.0)), 0.0)
+    fuel_share = fuel_cost / max(estimated_fare, 0.01)
 
     accept_component = max(0.0, min(float(accept_score), 1.0))
     target_component = max(0.0, min((target_gap + 8.0) / 16.0, 1.0))
     pressure_component = max(0.0, min((pressure_ratio - 0.8) / 1.2, 1.0))
     pickup_component = max(0.0, min(1.0 - (distance_to_pickup / 5.0), 1.0))
+    duration_component = max(0.0, min(1.0 - ((total_duration_min - 14.0) / 32.0), 1.0))
 
-    score = (
-        0.55 * accept_component
-        + 0.25 * target_component
-        + 0.12 * pressure_component
-        + 0.08 * pickup_component
+    gain_component = max(0.0, min((accept_component * 0.62) + (target_component * 0.23) + (pressure_component * 0.15), 1.0))
+    time_component = max(0.0, min((pickup_component * 0.58) + (duration_component * 0.42), 1.0))
+    fuel_component = 1.0 - max(0.0, min((fuel_share - 0.06) / 0.25, 1.0))
+    return {
+        "w_gain": gain_component,
+        "w_time": time_component,
+        "w_fuel": fuel_component,
+    }
+
+
+def ranking_objective_score(
+    features: dict[str, float],
+    accept_score: float,
+    *,
+    objective_weights: Mapping[str, float] | None = None,
+) -> tuple[float, dict[str, float], dict[str, float]]:
+    components = ranking_objective_components(features, accept_score)
+    weights = normalize_objective_weights(objective_weights)
+    score = sum(float(weights[key] * components[key]) for key in DEFAULT_OBJECTIVE_WEIGHTS)
+    return clamp(float(score), 0.0, 1.0), components, weights
+
+
+def recommendation_score(
+    features: dict[str, float],
+    accept_score: float,
+    *,
+    objective_weights: Mapping[str, float] | None = None,
+) -> tuple[float, str, list[str]]:
+    pressure_ratio = max(float(features.get("pressure_ratio", 1.0)), 0.0)
+    distance_to_pickup = max(float(features.get("distance_to_pickup_km", 0.0)), 0.0)
+    target_gap = float(features.get("target_gap_eur_h", 0.0))
+
+    score, components, _ = ranking_objective_score(
+        features,
+        accept_score,
+        objective_weights=objective_weights,
     )
-    score = round(max(0.0, min(score, 1.0)), 4)
+    score = round(float(score), 4)
 
     action = "accept" if score >= 0.68 else "consider" if score >= 0.45 else "skip"
 
@@ -340,6 +405,10 @@ def recommendation_score(features: dict[str, float], accept_score: float) -> tup
         signals.append("pickup_far")
     elif distance_to_pickup <= 1.0:
         signals.append("pickup_near")
+    if components["w_time"] <= 0.35:
+        signals.append("time_efficiency_low")
+    if components["w_fuel"] <= 0.35:
+        signals.append("fuel_efficiency_low")
 
     return score, action, signals
 
