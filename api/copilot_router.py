@@ -2733,7 +2733,8 @@ async def replay(
             estimated_fare_eur,
             actual_fare_eur,
             demand_index,
-            supply_index
+            supply_index,
+            source_platform
         FROM read_parquet({glob_list_sql}, hive_partitioning = true)
         WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
           AND (? IS NULL OR courier_id = ?)
@@ -2763,6 +2764,7 @@ async def replay(
                 "actual_fare_eur": r[10],
                 "demand_index": r[11],
                 "supply_index": r[12],
+                "source_platform": r[13],
             }
             for r in rows
         ],

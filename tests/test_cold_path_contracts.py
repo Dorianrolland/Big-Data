@@ -25,6 +25,7 @@ def test_parse_offer_event_contract():
         demand_index=1.2,
         weather_factor=1.0,
         traffic_factor=1.1,
+        source_platform="uber_eats",
     )
     rec = cold.parse_offer(msg.SerializeToString(), "order-offers-v1")
 
@@ -32,6 +33,7 @@ def test_parse_offer_event_contract():
     assert rec["event_type"] == "order.offer.v1"
     assert rec["offer_id"] == "ofr_1"
     assert rec["status"] == "offered"
+    assert rec["source_platform"] == "uber_eats"
 
 
 def test_parse_order_event_contract():
@@ -47,6 +49,7 @@ def test_parse_order_event_contract():
         actual_fare_eur=10.5,
         actual_distance_km=2.9,
         actual_duration_min=16,
+        source_platform="tlc_hvfhv_historical",
     )
     rec = cold.parse_order_event(msg.SerializeToString(), "order-events-v1")
 
@@ -54,6 +57,7 @@ def test_parse_order_event_contract():
     assert rec["event_type"] == "order.event.v1"
     assert rec["order_id"] == "ord_1"
     assert rec["status"] == "accepted"
+    assert rec["source_platform"] == "tlc_hvfhv_historical"
 
 
 def test_parse_context_signal_contract():
