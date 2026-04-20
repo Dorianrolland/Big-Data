@@ -272,6 +272,10 @@ df = conn.execute("""
 | `TLC_SPEED_FACTOR` | `1` | 1 = temps réel NYC, 6 = 6× accéléré |
 | `TLC_TRIP_SAMPLE_RATE` | `0.15` | Fraction de trips Uber rejouées (→ nb courses concurrentes) |
 | `TLC_MAX_ACTIVE_TRIPS` | `800` | Plafond dur de courses simultanées |
+| `TLC_ROUTE_MODE` | `osrm` | Mode trajectoire pour le replay TLC: `osrm` (route-aware) ou `linear` (fallback legacy) |
+| `TLC_ROUTE_OSRM_URL` | `http://osrm:5000` | Endpoint OSRM utilisé par le replay TLC pour router pickup→dropoff |
+| `TLC_ROUTE_OSRM_TIMEOUT_S` | `4.0` | Timeout HTTP OSRM (secondes) |
+| `TLC_ROUTE_CACHE_MAX` | `4096` | Taille max du cache de routes TLC (clé `pickup_zone + dropoff_zone`) |
 | `DRIVER_INGEST_TOKEN` | `dev-insecure-token` | Token du gateway mobile `driver-ingest` |
 | `CONTEXT_TICK_SECONDS` | `30` | Fréquence de publication des signaux de contexte (263 zones) |
 | `EVENTS_POLL_SECONDS` | `600` | Fréquence de polling de la source NYC events (`tvpp-9vvx`) |
@@ -437,8 +441,14 @@ If the gate fails, the API falls back to heuristic scoring automatically.
 
 - `OrderOfferV1` at `request_datetime`
 - `OrderEventV1(accepted)` right after the offer
-- `CourierPositionV1` at pickup, interpolated between pickup/dropoff centroids, and at dropoff
+- `CourierPositionV1` at pickup, then along an OSRM route geometry when available
+  (automatic fallback to legacy linear interpolation if OSRM is unavailable)
 - `OrderEventV1(dropped_off)` at `dropoff_datetime`
+
+Replay status metrics now expose route mode and routing counters (`trajectory_mode`,
+`route_osrm_success`, `route_linear_fallback`, `route_cache_hits`, etc.).
+For replay-generated events, `source_platform` is tagged with `|route=osrm|linear`
+to expose the mode used per trip.
 
 Replay long history (PowerShell examples):
 
@@ -455,6 +465,18 @@ If you want exact custom months instead of a range:
 ```powershell
 $env:TLC_MONTHS="2024-01,2024-02,2024-03,2024-04"; docker compose up -d --force-recreate tlc-replay
 ```
+
+Quick visual before/after for COP-013 trajectory fix:
+
+```powershell
+# Legacy baseline (straight line)
+$env:TLC_ROUTE_MODE="linear"; docker compose up -d --force-recreate tlc-replay
+
+# Route-aware mode (OSRM)
+$env:TLC_ROUTE_MODE="osrm"; $env:TLC_ROUTE_OSRM_URL="http://osrm:5000"; docker compose up -d --force-recreate tlc-replay
+```
+
+Open `http://localhost:8001/map` and compare trajectory realism on the same pickup/dropoff zones.
 
 Lat/lon come from the 263 NYC taxi zone centroids (pre-computed once with DuckDB
 spatial from the official TLC shapefile and shipped as `tlc_replay/nyc_zone_centroids.json`).
