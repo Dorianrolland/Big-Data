@@ -1,4 +1,4 @@
-.PHONY: up fleet-up down logs build clean restart status train-copilot train-copilot-10m demo-copilot demo-rank demo-next-zone bench-copilot smoke-e2e perf-lot4 proof-lot4 real-mode sim-mode demo-ingest prepare-routing-osrm single-driver-reset single-driver-up single-driver-down single-driver-logs focus-map
+.PHONY: up fleet-up down logs build clean restart status train-copilot train-copilot-10m train-copilot-report demo-copilot demo-rank demo-next-zone bench-copilot smoke-e2e perf-lot4 proof-lot4 real-mode sim-mode demo-ingest prepare-routing-osrm single-driver-reset single-driver-up single-driver-down single-driver-logs focus-map
 
 ## Lance l'intégralité du stack (build + démarrage)
 up:
@@ -79,6 +79,10 @@ train-copilot-10m:
 	    --out ./data/models/copilot_model.joblib \
 	    --train-start $${TLC_MONTH:-2024-01} \
 	    --train-months 10
+
+## Exécute le notebook de rapport ML (COP-014) de bout en bout
+train-copilot-report:
+	jupyter nbconvert --execute --to notebook --inplace ml/notebooks/copilot_training_report.ipynb
 
 ## Prépare les données OSRM pour New York (~1x, nécessite ~15GB disque).
 prepare-routing-osrm:
