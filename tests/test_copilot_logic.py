@@ -7,8 +7,10 @@ from api.copilot_logic import (
     hybrid_accept_decision,
     hybrid_accept_threshold,
     model_score,
+    normalize_objective_weights,
     normalize_score_weights,
     recommendation_score,
+    ranking_objective_score,
     score_components,
     validate_model_payload,
     weighted_offer_score,
@@ -193,6 +195,32 @@ def test_recommendation_score_flags_far_pickup():
     assert "pickup_far" in signals
 
 
+def test_recommendation_score_changes_with_objective_weights():
+    features = build_feature_map(
+        {
+            "estimated_fare_eur": 24.0,
+            "estimated_distance_km": 16.0,
+            "distance_to_pickup_km": 4.0,
+            "estimated_duration_min": 40.0,
+            "eta_to_pickup_min": 7.0,
+            "target_hourly_net_eur": 16.0,
+            "fuel_price_eur_l": 1.9,
+            "vehicle_consumption_l_100km": 10.5,
+        }
+    )
+    gain_first, _, _ = recommendation_score(
+        features,
+        accept_score=0.78,
+        objective_weights={"w_gain": 1.0, "w_time": 0.0, "w_fuel": 0.0},
+    )
+    fuel_first, _, _ = recommendation_score(
+        features,
+        accept_score=0.78,
+        objective_weights={"w_gain": 0.0, "w_time": 0.0, "w_fuel": 1.0},
+    )
+    assert gain_first > fuel_first
+
+
 def test_normalize_score_weights_rescales_and_guards():
     norm = normalize_score_weights(
         {
@@ -222,6 +250,53 @@ def test_normalize_score_weights_falls_back_to_defaults_on_zero_total():
     assert round(norm["net_hourly"], 2) == 0.46
     assert round(norm["net_trip"], 2) == 0.18
     assert round(norm["context"], 2) == 0.08
+
+
+def test_normalize_objective_weights_rescales_and_guards():
+    norm = normalize_objective_weights(
+        {
+            "w_gain": 5.0,
+            "w_time": 0.0,
+            "w_fuel": -2.0,
+        }
+    )
+    assert round(sum(norm.values()), 6) == 1.0
+    assert norm["w_gain"] == 1.0
+    assert norm["w_time"] == 0.0
+    assert norm["w_fuel"] == 0.0
+
+
+def test_normalize_objective_weights_falls_back_on_zero_total():
+    norm = normalize_objective_weights({"w_gain": 0.0, "w_time": 0.0, "w_fuel": 0.0})
+    assert round(sum(norm.values()), 6) == 1.0
+    assert norm["w_gain"] > norm["w_fuel"]
+    assert norm["w_time"] > 0.0
+
+
+def test_ranking_objective_score_extreme_weights_change_result():
+    features = build_feature_map(
+        {
+            "estimated_fare_eur": 26.0,
+            "estimated_distance_km": 18.0,
+            "distance_to_pickup_km": 3.5,
+            "estimated_duration_min": 44.0,
+            "eta_to_pickup_min": 8.0,
+            "target_hourly_net_eur": 18.0,
+            "fuel_price_eur_l": 1.9,
+            "vehicle_consumption_l_100km": 11.5,
+        }
+    )
+    gain_score, _, _ = ranking_objective_score(
+        features,
+        0.82,
+        objective_weights={"w_gain": 1.0, "w_time": 0.0, "w_fuel": 0.0},
+    )
+    fuel_score, _, _ = ranking_objective_score(
+        features,
+        0.82,
+        objective_weights={"w_gain": 0.0, "w_time": 0.0, "w_fuel": 1.0},
+    )
+    assert gain_score > fuel_score
 
 
 def test_score_components_are_clamped():

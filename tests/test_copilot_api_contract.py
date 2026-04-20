@@ -9,6 +9,8 @@ if str(_API_DIR) not in sys.path:
     sys.path.insert(0, str(_API_DIR))
 
 from copilot_router import (  # noqa: E402
+    DriverProfileResponse,
+    RankOffersResponse,
     RankedOfferItem,
     ScoreOfferResponse,
     ShiftPlanResponse,
@@ -115,6 +117,71 @@ def test_ranked_offer_item_backward_compatible_with_optional_details():
     assert dumped["decision_threshold"] == 0.5
 
 
+def test_ranked_offer_item_accepts_optional_objective_score():
+    item = RankedOfferItem(
+        rank=2,
+        top_pick=False,
+        recommendation="viable",
+        offer_id="R2",
+        courier_id="C9",
+        accept_score=0.66,
+        decision="accept",
+        decision_threshold=0.52,
+        objective_score=0.73,
+        eur_per_hour_net=19.2,
+        estimated_net_eur=6.4,
+        delta_vs_top_eur_h=-4.8,
+        delta_vs_median_eur_h=-1.2,
+        costs={"estimated_net_eur_h": 19.2},
+        route_source="estimated",
+        route_distance_km=3.0,
+        route_duration_min=20.0,
+        model_used="heuristic",
+        explanation=["balanced_offer_profile"],
+    )
+    dumped = item.model_dump()
+    assert dumped["objective_score"] == 0.73
+
+
+def test_rank_offers_response_accepts_optional_objective_weights():
+    payload = RankOffersResponse(
+        count=1,
+        ranked_by="objective_score",
+        top_pick_offer_id="R1",
+        best_eur_h=24.0,
+        worst_eur_h=24.0,
+        median_eur_h=24.0,
+        hourly_gain_vs_worst_eur_h=0.0,
+        objective_weights={"w_gain": 0.62, "w_time": 0.23, "w_fuel": 0.15},
+        items=[
+            RankedOfferItem(
+                rank=1,
+                top_pick=True,
+                recommendation="top_pick",
+                offer_id="R1",
+                courier_id="C1",
+                accept_score=0.8,
+                decision="accept",
+                decision_threshold=0.5,
+                objective_score=0.82,
+                eur_per_hour_net=24.0,
+                estimated_net_eur=8.4,
+                delta_vs_top_eur_h=0.0,
+                delta_vs_median_eur_h=0.0,
+                costs={"estimated_net_eur_h": 24.0},
+                route_source="estimated",
+                route_distance_km=2.6,
+                route_duration_min=15.0,
+                model_used="heuristic",
+                explanation=["high_estimated_net_revenue"],
+            )
+        ],
+    )
+    dumped = payload.model_dump()
+    assert dumped["ranked_by"] == "objective_score"
+    assert dumped["objective_weights"]["w_gain"] == 0.62
+
+
 def test_shift_plan_zone_item_contract_fields():
     item = ShiftPlanZoneItem(
         rank=1,
@@ -199,3 +266,22 @@ def test_shift_plan_response_contract_is_backward_safe():
     assert out["count"] == 1
     assert isinstance(out["items"], list)
     assert out["items"][0]["zone_id"] == "40.7611_-73.9776"
+
+
+def test_driver_profile_response_contract():
+    payload = DriverProfileResponse(
+        driver_id="drv_demo_001",
+        target_eur_h=19.5,
+        consommation_l_100=7.2,
+        aversion_risque=0.45,
+        max_eta=18.0,
+        source="manual",
+        updated_at="2026-04-20T10:00:00+00:00",
+    )
+    out = payload.model_dump()
+    assert out["driver_id"] == "drv_demo_001"
+    assert out["target_eur_h"] == 19.5
+    assert out["consommation_l_100"] == 7.2
+    assert out["aversion_risque"] == 0.45
+    assert out["max_eta"] == 18.0
+    assert out["source"] == "manual"
