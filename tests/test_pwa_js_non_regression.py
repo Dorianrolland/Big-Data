@@ -165,6 +165,17 @@ const offerBase = {{
   distance_to_pickup_km: 1.1,
   model_used: 'ml',
   explanation: ['high_estimated_net_revenue', 'above_target_hourly_goal'],
+  reason_codes: ['GAIN_STRONG', 'TIME_EFFICIENT', 'DECISION_CONFIDENT'],
+  score_breakdown: {{
+    version: 'v2',
+    total_score: 0.842,
+    dimensions: {{
+      gain: {{ label: 'Gain quality', score: 0.91, weight: 0.42, contribution: 0.3822, impact: 'positive' }},
+      time: {{ label: 'Time efficiency', score: 0.78, weight: 0.2, contribution: 0.156, impact: 'positive' }},
+      fuel: {{ label: 'Fuel efficiency', score: 0.72, weight: 0.18, contribution: 0.1296, impact: 'positive' }},
+      risk: {{ label: 'Risk resilience', score: 0.87, weight: 0.2, contribution: 0.174, impact: 'positive' }},
+    }},
+  }},
   explanation_details: [
     {{ code: 'net_hourly', label: 'net hourly', impact: 'positive', value: 24.5, unit: 'eur_per_hour', source: 'target' }},
   ],
@@ -427,6 +438,17 @@ async function fetchStub(url, _opts) {{
       eur_per_hour_net: 25.1,
       model_used: 'ml',
       explanation: ['high_estimated_net_revenue', 'above_target_hourly_goal'],
+      reason_codes: ['GAIN_STRONG', 'TIME_EFFICIENT', 'DECISION_CONFIDENT'],
+      score_breakdown: {{
+        version: 'v2',
+        total_score: 0.851,
+        dimensions: {{
+          gain: {{ label: 'Gain quality', score: 0.92, weight: 0.42, contribution: 0.3864, impact: 'positive' }},
+          time: {{ label: 'Time efficiency', score: 0.79, weight: 0.2, contribution: 0.158, impact: 'positive' }},
+          fuel: {{ label: 'Fuel efficiency', score: 0.74, weight: 0.18, contribution: 0.1332, impact: 'positive' }},
+          risk: {{ label: 'Risk resilience', score: 0.87, weight: 0.2, contribution: 0.174, impact: 'positive' }},
+        }},
+      }},
       explanation_details: [],
       route_source: 'estimated',
       route_distance_km: 4.0,
@@ -523,6 +545,16 @@ async function main() {{
   const decisionStatusText = String(getNode('decisionStatus').textContent || '');
   if (!decisionStatusText.toLowerCase().includes('action')) {{
     realConsole.error('expected decisionStatus to mention action, got', decisionStatusText);
+    process.exit(1);
+  }}
+  const scoreReasonsText = String(getNode('scoreReasons').textContent || '');
+  if (!scoreReasonsText.includes('Explainability')) {{
+    realConsole.error('expected score reasons to include explainability breakdown, got', scoreReasonsText);
+    process.exit(1);
+  }}
+  const decisionCardHtml = String(getNode('decisionOfferCard').innerHTML || '');
+  if (!decisionCardHtml.includes('Explainability')) {{
+    realConsole.error('expected decision card to include explainability block, got', decisionCardHtml);
     process.exit(1);
   }}
   const replayRows = getNode('replayTimeline').children || [];

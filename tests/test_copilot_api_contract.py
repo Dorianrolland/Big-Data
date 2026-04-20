@@ -12,6 +12,8 @@ from copilot_router import (  # noqa: E402
     DriverProfileResponse,
     RankOffersResponse,
     RankedOfferItem,
+    ScoreBreakdown,
+    ScoreBreakdownDimension,
     ScoreOfferResponse,
     ShiftPlanResponse,
     ShiftPlanZoneItem,
@@ -43,6 +45,8 @@ def test_score_offer_response_backward_compatible_without_explanation_details():
     assert "decision_threshold" in data
     assert "explanation" in data
     assert data.get("explanation_details") is None
+    assert data.get("score_breakdown") is None
+    assert data.get("reason_codes") is None
 
 
 def test_score_offer_response_accepts_optional_explanation_details():
@@ -115,6 +119,130 @@ def test_ranked_offer_item_backward_compatible_with_optional_details():
     assert dumped["recommendation"] == "top_pick"
     assert dumped["explanation_details"][0]["source"] == "target"
     assert dumped["decision_threshold"] == 0.5
+    assert dumped.get("score_breakdown") is None
+    assert dumped.get("reason_codes") is None
+
+
+def test_score_offer_response_accepts_breakdown_and_reason_codes():
+    payload = ScoreOfferResponse(
+        offer_id="A3",
+        courier_id="C3",
+        accept_score=0.81,
+        decision="accept",
+        decision_threshold=0.54,
+        eur_per_hour_net=23.7,
+        estimated_net_eur=8.2,
+        target_hourly_net_eur=18.0,
+        target_gap_eur_h=5.7,
+        costs={"estimated_net_eur_h": 23.7},
+        route_source="estimated",
+        route_distance_km=3.8,
+        route_duration_min=16.0,
+        route_notes=[],
+        model_used="ml",
+        explanation=["high_estimated_net_revenue"],
+        score_breakdown=ScoreBreakdown(
+            version="v2",
+            total_score=0.8123,
+            dimensions={
+                "gain": ScoreBreakdownDimension(
+                    label="Gain quality",
+                    score=0.91,
+                    weight=0.42,
+                    contribution=0.3822,
+                    impact="positive",
+                ),
+                "time": ScoreBreakdownDimension(
+                    label="Time efficiency",
+                    score=0.72,
+                    weight=0.2,
+                    contribution=0.144,
+                    impact="positive",
+                ),
+                "fuel": ScoreBreakdownDimension(
+                    label="Fuel efficiency",
+                    score=0.68,
+                    weight=0.18,
+                    contribution=0.1224,
+                    impact="positive",
+                ),
+                "risk": ScoreBreakdownDimension(
+                    label="Risk resilience",
+                    score=0.82,
+                    weight=0.2,
+                    contribution=0.164,
+                    impact="positive",
+                ),
+            },
+        ),
+        reason_codes=["GAIN_STRONG", "RISK_LOW", "DECISION_CONFIDENT"],
+    )
+    dumped = payload.model_dump()
+    assert dumped["score_breakdown"]["version"] == "v2"
+    assert dumped["score_breakdown"]["dimensions"]["gain"]["label"] == "Gain quality"
+    assert dumped["reason_codes"] == ["GAIN_STRONG", "RISK_LOW", "DECISION_CONFIDENT"]
+
+
+def test_ranked_offer_item_accepts_breakdown_and_reason_codes():
+    item = RankedOfferItem(
+        rank=1,
+        top_pick=True,
+        recommendation="top_pick",
+        offer_id="R3",
+        courier_id="C2",
+        accept_score=0.84,
+        decision="accept",
+        decision_threshold=0.53,
+        objective_score=0.8,
+        eur_per_hour_net=27.0,
+        estimated_net_eur=9.2,
+        delta_vs_top_eur_h=0.0,
+        delta_vs_median_eur_h=4.6,
+        costs={"estimated_net_eur_h": 27.0},
+        route_source="estimated",
+        route_distance_km=2.2,
+        route_duration_min=13.0,
+        model_used="ml",
+        explanation=["high_estimated_net_revenue"],
+        score_breakdown={
+            "version": "v2",
+            "total_score": 0.84,
+            "dimensions": {
+                "gain": {
+                    "label": "Gain quality",
+                    "score": 0.93,
+                    "weight": 0.42,
+                    "contribution": 0.3906,
+                    "impact": "positive",
+                },
+                "time": {
+                    "label": "Time efficiency",
+                    "score": 0.78,
+                    "weight": 0.2,
+                    "contribution": 0.156,
+                    "impact": "positive",
+                },
+                "fuel": {
+                    "label": "Fuel efficiency",
+                    "score": 0.73,
+                    "weight": 0.18,
+                    "contribution": 0.1314,
+                    "impact": "positive",
+                },
+                "risk": {
+                    "label": "Risk resilience",
+                    "score": 0.81,
+                    "weight": 0.2,
+                    "contribution": 0.162,
+                    "impact": "positive",
+                },
+            },
+        },
+        reason_codes=["GAIN_STRONG", "TIME_EFFICIENT", "DECISION_CONFIDENT"],
+    )
+    dumped = item.model_dump()
+    assert dumped["score_breakdown"]["dimensions"]["risk"]["impact"] == "positive"
+    assert dumped["reason_codes"][0] == "GAIN_STRONG"
 
 
 def test_ranked_offer_item_accepts_optional_objective_score():

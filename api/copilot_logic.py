@@ -61,6 +61,13 @@ DEFAULT_OBJECTIVE_WEIGHTS = {
     "w_fuel": 0.15,
 }
 
+DEFAULT_EXPLAINABILITY_WEIGHTS = {
+    "gain": 0.42,
+    "time": 0.2,
+    "fuel": 0.18,
+    "risk": 0.2,
+}
+
 
 def normalize_score_weights(raw_weights: Mapping[str, float] | None = None) -> dict[str, float]:
     weights = {k: float(v) for k, v in DEFAULT_SCORE_WEIGHTS.items()}
@@ -93,6 +100,28 @@ def normalize_objective_weights(
     total = sum(weights.values())
     if total <= 0.0:
         fallback = {k: float(v) for k, v in DEFAULT_OBJECTIVE_WEIGHTS.items()}
+        fallback_total = sum(fallback.values())
+        return {k: float(v / fallback_total) for k, v in fallback.items()}
+    return {k: float(v / total) for k, v in weights.items()}
+
+
+def normalize_explainability_weights(
+    raw_weights: Mapping[str, float] | None = None,
+    *,
+    defaults: Mapping[str, float] | None = None,
+) -> dict[str, float]:
+    base = defaults or DEFAULT_EXPLAINABILITY_WEIGHTS
+    weights = {
+        key: max(0.0, as_float(base.get(key), DEFAULT_EXPLAINABILITY_WEIGHTS[key]))
+        for key in DEFAULT_EXPLAINABILITY_WEIGHTS
+    }
+    if raw_weights:
+        for key in DEFAULT_EXPLAINABILITY_WEIGHTS:
+            if key in raw_weights:
+                weights[key] = max(0.0, as_float(raw_weights.get(key), weights[key]))
+    total = sum(weights.values())
+    if total <= 0.0:
+        fallback = {k: float(v) for k, v in DEFAULT_EXPLAINABILITY_WEIGHTS.items()}
         fallback_total = sum(fallback.values())
         return {k: float(v / fallback_total) for k, v in fallback.items()}
     return {k: float(v / total) for k, v in weights.items()}
@@ -369,6 +398,141 @@ def ranking_objective_score(
     weights = normalize_objective_weights(objective_weights)
     score = sum(float(weights[key] * components[key]) for key in DEFAULT_OBJECTIVE_WEIGHTS)
     return clamp(float(score), 0.0, 1.0), components, weights
+
+
+def _risk_component(features: dict[str, float], accept_score: float) -> float:
+    target_gap = float(features.get("target_gap_eur_h", 0.0))
+    traffic_factor = max(float(features.get("traffic_factor", 1.0)), 0.0)
+    weather_intensity = clamp(float(features.get("weather_intensity", 0.0)), 0.0, 1.0)
+    context_fallback_applied = 1.0 if float(features.get("context_fallback_applied", 0.0)) >= 0.5 else 0.0
+    context_stale_sources = max(float(features.get("context_stale_sources", 0.0)), 0.0)
+
+    traffic_penalty = clamp((traffic_factor - 1.0) / 0.8, 0.0, 1.0)
+    weather_penalty = clamp(weather_intensity, 0.0, 1.0)
+    context_penalty = clamp((context_stale_sources / 4.0) * 0.65 + context_fallback_applied * 0.35, 0.0, 1.0)
+    target_penalty = clamp(max(-target_gap, 0.0) / 12.0, 0.0, 1.0)
+    confidence_penalty = clamp(1.0 - float(accept_score), 0.0, 1.0)
+
+    total_penalty = (
+        (traffic_penalty * 0.28)
+        + (weather_penalty * 0.22)
+        + (context_penalty * 0.2)
+        + (target_penalty * 0.18)
+        + (confidence_penalty * 0.12)
+    )
+    return clamp(1.0 - total_penalty, 0.0, 1.0)
+
+
+def score_decomposition(
+    features: dict[str, float],
+    accept_score: float,
+    *,
+    weights: Mapping[str, float] | None = None,
+) -> dict[str, Any]:
+    objective_components = ranking_objective_components(features, accept_score)
+    axis_scores = {
+        "gain": clamp(objective_components["w_gain"], 0.0, 1.0),
+        "time": clamp(objective_components["w_time"], 0.0, 1.0),
+        "fuel": clamp(objective_components["w_fuel"], 0.0, 1.0),
+        "risk": _risk_component(features, accept_score),
+    }
+    normalized_weights = normalize_explainability_weights(weights)
+    labels = {
+        "gain": "Gain quality",
+        "time": "Time efficiency",
+        "fuel": "Fuel efficiency",
+        "risk": "Risk resilience",
+    }
+    dimensions: dict[str, dict[str, Any]] = {}
+    total_score = 0.0
+    for axis in ("gain", "time", "fuel", "risk"):
+        score = axis_scores[axis]
+        weight = normalized_weights[axis]
+        contribution = score * weight
+        total_score += contribution
+        if score >= 0.62:
+            impact = "positive"
+        elif score <= 0.42:
+            impact = "negative"
+        else:
+            impact = "neutral"
+        dimensions[axis] = {
+            "label": labels[axis],
+            "score": round(float(score), 4),
+            "weight": round(float(weight), 4),
+            "contribution": round(float(contribution), 4),
+            "impact": impact,
+        }
+    return {
+        "version": "v2",
+        "total_score": round(float(clamp(total_score, 0.0, 1.0)), 4),
+        "dimensions": dimensions,
+    }
+
+
+def standardized_reason_codes(
+    features: dict[str, float],
+    accept_score: float,
+    *,
+    decision_threshold: float | None = None,
+    decomposition: Mapping[str, Any] | None = None,
+) -> list[str]:
+    breakdown = decomposition or score_decomposition(features, accept_score)
+    dimensions = breakdown.get("dimensions") if isinstance(breakdown, Mapping) else None
+    if not isinstance(dimensions, Mapping):
+        dimensions = {}
+    get_score = lambda axis: clamp(as_float((dimensions.get(axis) or {}).get("score"), 0.0), 0.0, 1.0)
+
+    gain = get_score("gain")
+    time = get_score("time")
+    fuel = get_score("fuel")
+    risk = get_score("risk")
+    target_gap = float(features.get("target_gap_eur_h", 0.0))
+    context_fallback_applied = 1.0 if float(features.get("context_fallback_applied", 0.0)) >= 0.5 else 0.0
+    context_stale_sources = max(float(features.get("context_stale_sources", 0.0)), 0.0)
+
+    codes: list[str] = []
+    if gain >= 0.65:
+        codes.append("GAIN_STRONG")
+    elif gain <= 0.4:
+        codes.append("GAIN_WEAK")
+
+    if time >= 0.65:
+        codes.append("TIME_EFFICIENT")
+    elif time <= 0.4:
+        codes.append("TIME_HEAVY")
+
+    if fuel >= 0.65:
+        codes.append("FUEL_EFFICIENT")
+    elif fuel <= 0.4:
+        codes.append("FUEL_HEAVY")
+
+    if risk >= 0.65:
+        codes.append("RISK_LOW")
+    elif risk <= 0.4:
+        codes.append("RISK_HIGH")
+
+    if target_gap >= 2.0:
+        codes.append("TARGET_ABOVE")
+    elif target_gap <= -2.0:
+        codes.append("TARGET_BELOW")
+
+    if context_fallback_applied >= 0.5:
+        codes.append("CONTEXT_FALLBACK")
+    if context_stale_sources >= 2.0:
+        codes.append("CONTEXT_STALE")
+
+    if decision_threshold is not None:
+        if float(accept_score) >= (float(decision_threshold) + 0.1):
+            codes.append("DECISION_CONFIDENT")
+        elif float(accept_score) >= float(decision_threshold):
+            codes.append("DECISION_BORDERLINE")
+        else:
+            codes.append("DECISION_BELOW_THRESHOLD")
+
+    if not codes:
+        codes.append("PROFILE_BALANCED")
+    return codes
 
 
 def recommendation_score(

@@ -45,6 +45,41 @@ def _mk(
         "route_duration_min": 10.0,
         "model_used": "heuristic",
         "explanation": [],
+        "score_breakdown": {
+            "version": "v2",
+            "total_score": 0.5,
+            "dimensions": {
+                "gain": {
+                    "label": "Gain quality",
+                    "score": 0.5,
+                    "weight": 0.42,
+                    "contribution": 0.21,
+                    "impact": "neutral",
+                },
+                "time": {
+                    "label": "Time efficiency",
+                    "score": 0.5,
+                    "weight": 0.2,
+                    "contribution": 0.1,
+                    "impact": "neutral",
+                },
+                "fuel": {
+                    "label": "Fuel efficiency",
+                    "score": 0.5,
+                    "weight": 0.18,
+                    "contribution": 0.09,
+                    "impact": "neutral",
+                },
+                "risk": {
+                    "label": "Risk resilience",
+                    "score": 0.5,
+                    "weight": 0.2,
+                    "contribution": 0.1,
+                    "impact": "neutral",
+                },
+            },
+        },
+        "reason_codes": ["PROFILE_BALANCED"],
         "explanation_details": [
             {
                 "code": "net_hourly",
@@ -264,3 +299,46 @@ def test_decision_threshold_is_propagated():
     scored[0]["decision_threshold"] = 0.57
     items, _, _, _ = _rank_offer_items(scored, "eur_per_hour_net", None)
     assert items[0].decision_threshold == 0.57
+
+
+def test_explainability_fields_are_propagated():
+    scored = [_mk("only", 22.0, 8.0)]
+    scored[0]["reason_codes"] = ["GAIN_STRONG", "DECISION_CONFIDENT"]
+    scored[0]["score_breakdown"] = {
+        "version": "v2",
+        "total_score": 0.8123,
+        "dimensions": {
+            "gain": {
+                "label": "Gain quality",
+                "score": 0.91,
+                "weight": 0.42,
+                "contribution": 0.3822,
+                "impact": "positive",
+            },
+            "time": {
+                "label": "Time efficiency",
+                "score": 0.72,
+                "weight": 0.2,
+                "contribution": 0.144,
+                "impact": "positive",
+            },
+            "fuel": {
+                "label": "Fuel efficiency",
+                "score": 0.68,
+                "weight": 0.18,
+                "contribution": 0.1224,
+                "impact": "positive",
+            },
+            "risk": {
+                "label": "Risk resilience",
+                "score": 0.82,
+                "weight": 0.2,
+                "contribution": 0.164,
+                "impact": "positive",
+            },
+        },
+    }
+    items, _, _, _ = _rank_offer_items(scored, "eur_per_hour_net", None)
+    assert items[0].reason_codes == ["GAIN_STRONG", "DECISION_CONFIDENT"]
+    assert items[0].score_breakdown is not None
+    assert items[0].score_breakdown.dimensions["gain"].impact == "positive"

@@ -354,6 +354,22 @@ function humanizeReason(reason) {
     below_hourly_target_reposition_can_help: 'below hourly target: reposition can help',
     local_offer_weak_reposition_has_positive_edge: 'local offer weak, reposition has edge',
     zone_coordinates_unavailable: 'zone coordinates unavailable',
+    GAIN_STRONG: 'strong gain quality',
+    GAIN_WEAK: 'weak gain quality',
+    TIME_EFFICIENT: 'time efficient',
+    TIME_HEAVY: 'time heavy',
+    FUEL_EFFICIENT: 'fuel efficient',
+    FUEL_HEAVY: 'fuel heavy',
+    RISK_LOW: 'low operational risk',
+    RISK_HIGH: 'high operational risk',
+    TARGET_ABOVE: 'above target',
+    TARGET_BELOW: 'below target',
+    CONTEXT_FALLBACK: 'context fallback active',
+    CONTEXT_STALE: 'context freshness degraded',
+    DECISION_CONFIDENT: 'decision confident',
+    DECISION_BORDERLINE: 'decision borderline',
+    DECISION_BELOW_THRESHOLD: 'decision below threshold',
+    PROFILE_BALANCED: 'balanced scoring profile',
   };
   return mapping[reason] || String(reason || '').replaceAll('_', ' ');
 }
@@ -384,6 +400,54 @@ function explanationDetailChips(details, limit = 2) {
   return rows
     .map((d) => `<span>${formatExplanationDetail(d)}</span>`)
     .join('');
+}
+
+function listToChips(values, limit = 8) {
+  const rows = Array.isArray(values) ? values : [];
+  const seen = new Set();
+  const chips = [];
+  for (const value of rows) {
+    const key = String(value || '').trim();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    chips.push(`<span>${escapeHtml(humanizeReason(key))}</span>`);
+    if (chips.length >= Math.max(0, Number(limit) || 0)) break;
+  }
+  return chips.join('');
+}
+
+function scoreBreakdownText(scoreBreakdown, limit = 4) {
+  if (!scoreBreakdown || typeof scoreBreakdown !== 'object') return '';
+  const dimensions =
+    scoreBreakdown.dimensions && typeof scoreBreakdown.dimensions === 'object'
+      ? scoreBreakdown.dimensions
+      : null;
+  if (!dimensions) return '';
+
+  const preferredAxes = ['gain', 'time', 'fuel', 'risk'];
+  const axisOrder = [...preferredAxes, ...Object.keys(dimensions).filter((axis) => !preferredAxes.includes(axis))];
+  const chunks = [];
+
+  for (const axis of axisOrder) {
+    if (chunks.length >= Math.max(0, Number(limit) || 0)) break;
+    const dim = dimensions[axis];
+    if (!dim || typeof dim !== 'object') continue;
+    const label = String(dim.label || humanizeReason(axis)).trim();
+    const score = Number(dim.score);
+    const contribution = Number(dim.contribution);
+    if (!Number.isFinite(score) || !Number.isFinite(contribution)) continue;
+    chunks.push(`${label} ${fmt(score, 2)} (${fmt(contribution, 2)})`);
+  }
+
+  if (!chunks.length) return '';
+  const totalScore = Number(scoreBreakdown.total_score);
+  const totalLabel = Number.isFinite(totalScore) ? fmt(totalScore, 3) : '-';
+  return `Explainability ${totalLabel}: ${chunks.join(' | ')}`;
+}
+
+function scoreBreakdownHtml(scoreBreakdown, limit = 4) {
+  const text = scoreBreakdownText(scoreBreakdown, limit);
+  return text ? `<div class="muted">${escapeHtml(text)}</div>` : '';
 }
 
 function routeSummary(offer) {
@@ -518,6 +582,8 @@ function renderDecisionFlow() {
 
   const offer = selected.offer;
   const action = String(offer.recommendation_action || offer.decision || 'consider').toUpperCase();
+  const decisionBreakdown = scoreBreakdownHtml(offer.score_breakdown, 4);
+  const decisionReasonChips = listToChips(offer.reason_codes, 4);
   decisionOfferCardEl.className = 'offer selected';
   decisionOfferCardEl.innerHTML = `
     <div class="offer-top">
@@ -530,6 +596,8 @@ function renderDecisionFlow() {
     </div>
     ${offerMetricsHtml(offer)}
     <div class="muted">${escapeHtml(routeSummary(offer))}</div>
+    ${decisionBreakdown}
+    ${decisionReasonChips ? `<div class="chips">${decisionReasonChips}</div>` : ''}
   `;
 
   const canRoute = Boolean(resolveSelectedActionRoute());
@@ -1582,7 +1650,10 @@ function renderOffers() {
     card.setAttribute('aria-label', `Select offer ${String(offer.offer_id || idx + 1)}`);
 
     const reasons = Array.isArray(offer.explanation) ? offer.explanation : [];
+    const reasonCodes = Array.isArray(offer.reason_codes) ? offer.reason_codes : [];
     const detailChips = explanationDetailChips(offer.explanation_details, 2);
+    const breakdown = scoreBreakdownHtml(offer.score_breakdown, 4);
+    const chips = `${listToChips([...reasons, ...reasonCodes], 8)}${detailChips}`;
     const zone = offer.zone_id || 'unknown_zone';
 
     card.innerHTML = `
@@ -1596,7 +1667,8 @@ function renderOffers() {
       </div>
       ${offerMetricsHtml(offer)}
       <div class="muted">${escapeHtml(routeSummary(offer))}</div>
-      <div class="chips">${reasons.map((r) => `<span>${escapeHtml(humanizeReason(r))}</span>`).join('')}${detailChips}</div>
+      ${breakdown}
+      <div class="chips">${chips}</div>
       <div class="offer-actions">
         <button class="ghost" data-action="pick-offer" data-offer-key="${key}">Choose</button>
         <button data-action="pick-score-offer" data-offer-key="${key}">Pick + Score</button>
@@ -1633,13 +1705,13 @@ function renderBestOffers() {
     card.setAttribute('aria-label', `Select best offer ${String(offer.offer_id || idx + 1)}`);
 
     const reasons = Array.isArray(offer.explanation) ? offer.explanation : [];
+    const reasonCodes = Array.isArray(offer.reason_codes) ? offer.reason_codes : [];
     const signals = Array.isArray(offer.recommendation_signals) ? offer.recommendation_signals : [];
     const routeNotes = Array.isArray(offer.route_notes) ? offer.route_notes : [];
     const details = explanationDetailChips(offer.explanation_details, 2);
+    const breakdown = scoreBreakdownHtml(offer.score_breakdown, 4);
 
-    const chips = [...reasons, ...signals, ...routeNotes]
-      .map((r) => `<span>${escapeHtml(humanizeReason(r))}</span>`)
-      .join('') + details;
+    const chips = `${listToChips([...reasons, ...reasonCodes, ...signals, ...routeNotes], 10)}${details}`;
 
     card.innerHTML = `
       <div class="offer-top">
@@ -1655,6 +1727,7 @@ function renderBestOffers() {
         <span>${escapeHtml(routeSummary(offer))}</span>
         <span><strong>${fmt(offer.target_gap_eur_h, 1)}</strong> gap EUR/h</span>
       </div>
+      ${breakdown}
       <div class="chips">${chips}</div>
       <div class="offer-actions">
         <button class="ghost" data-action="pick-offer" data-offer-key="${key}">Choose</button>
@@ -1710,10 +1783,9 @@ function renderDispatch() {
     card.className = 'offer';
     const signals = Array.isArray(stay.signals) ? stay.signals : [];
     const reasonsList = Array.isArray(stay.reasons) ? stay.reasons : [];
-    const chips = [...signals, ...reasonsList]
-      .slice(0, 8)
-      .map((r) => `<span>${escapeHtml(humanizeReason(r))}</span>`)
-      .join('');
+    const reasonCodes = Array.isArray(stay.reason_codes) ? stay.reason_codes : [];
+    const breakdown = scoreBreakdownHtml(stay.score_breakdown, 4);
+    const chips = listToChips([...signals, ...reasonsList, ...reasonCodes], 8);
 
     card.innerHTML = `
       <div class="offer-top">
@@ -1729,6 +1801,7 @@ function renderDispatch() {
         <span>pickup ${fmt(stay.distance_to_pickup_km, 2)} km</span>
         <span>route ${escapeHtml(stay.route_source || 'estimated')} - ${fmt(stay.route_duration_min, 1)} min</span>
       </div>
+      ${breakdown}
       <div class="chips">${chips}</div>
       <div class="offer-actions">
         <button class="ghost" data-action="score-offer" data-offer-id="${escapeHtml(stay.offer_id || '')}" data-courier-id="${escapeHtml(currentDriverId())}">Score</button>
@@ -2556,9 +2629,15 @@ async function scoreManualOffer(payloadOverride = null) {
     const detailSummary = Array.isArray(score.explanation_details)
       ? score.explanation_details.slice(0, 2).map(formatExplanationDetail).filter(Boolean).join(' | ')
       : '';
+    const breakdownSummary = scoreBreakdownText(score.score_breakdown, 4);
+    const reasonCodeSummary = Array.isArray(score.reason_codes)
+      ? score.reason_codes.slice(0, 5).map(humanizeReason).join(' | ')
+      : '';
     const route = score.route_source ? ` | ${routeSummary(score)}` : '';
     const detailsText = detailSummary ? ` | ${detailSummary}` : '';
-    scoreReasons.textContent = `[${score.model_used || 'unknown'}] ${expl}${detailsText}${route}`;
+    const breakdownText = breakdownSummary ? ` | ${breakdownSummary}` : '';
+    const reasonCodeText = reasonCodeSummary ? ` | codes: ${reasonCodeSummary}` : '';
+    scoreReasons.textContent = `[${score.model_used || 'unknown'}] ${expl}${detailsText}${breakdownText}${reasonCodeText}${route}`;
 
     if (payload.offer_id) {
       state.lastScoredOfferId = String(payload.offer_id);

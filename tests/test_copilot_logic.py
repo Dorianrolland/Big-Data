@@ -7,11 +7,14 @@ from api.copilot_logic import (
     hybrid_accept_decision,
     hybrid_accept_threshold,
     model_score,
+    normalize_explainability_weights,
     normalize_objective_weights,
     normalize_score_weights,
     recommendation_score,
     ranking_objective_score,
+    score_decomposition,
     score_components,
+    standardized_reason_codes,
     validate_model_payload,
     weighted_offer_score,
 )
@@ -271,6 +274,83 @@ def test_normalize_objective_weights_falls_back_on_zero_total():
     assert round(sum(norm.values()), 6) == 1.0
     assert norm["w_gain"] > norm["w_fuel"]
     assert norm["w_time"] > 0.0
+
+
+def test_normalize_explainability_weights_rescales_and_fallback():
+    norm = normalize_explainability_weights({"gain": 0.0, "time": 8.0, "fuel": 2.0, "risk": -4.0})
+    assert round(sum(norm.values()), 6) == 1.0
+    assert norm["time"] > norm["fuel"] > norm["gain"]
+    fallback = normalize_explainability_weights({"gain": 0.0, "time": 0.0, "fuel": 0.0, "risk": 0.0})
+    assert round(sum(fallback.values()), 6) == 1.0
+    assert round(fallback["gain"], 2) == 0.42
+    assert round(fallback["risk"], 2) == 0.20
+
+
+def test_score_decomposition_has_expected_axes_and_consistent_totals():
+    features = build_feature_map(
+        {
+            "estimated_fare_eur": 19.0,
+            "estimated_distance_km": 4.5,
+            "distance_to_pickup_km": 0.9,
+            "estimated_duration_min": 20.0,
+            "target_hourly_net_eur": 18.0,
+            "traffic_factor": 1.05,
+            "weather_intensity": 0.12,
+        }
+    )
+    decomposition = score_decomposition(features, 0.77)
+    assert decomposition["version"] == "v2"
+    assert set(decomposition["dimensions"]) == {"gain", "time", "fuel", "risk"}
+    dims = decomposition["dimensions"]
+    for axis in ("gain", "time", "fuel", "risk"):
+        assert 0.0 <= float(dims[axis]["score"]) <= 1.0
+        assert 0.0 <= float(dims[axis]["weight"]) <= 1.0
+        assert 0.0 <= float(dims[axis]["contribution"]) <= 1.0
+        assert dims[axis]["impact"] in {"positive", "negative", "neutral"}
+    total_weight = sum(float(dims[axis]["weight"]) for axis in dims)
+    total_contribution = sum(float(dims[axis]["contribution"]) for axis in dims)
+    assert round(total_weight, 4) == 1.0
+    assert abs(float(decomposition["total_score"]) - total_contribution) <= 1e-4
+
+
+def test_standardized_reason_codes_reflect_threshold_and_context():
+    features = build_feature_map(
+        {
+            "estimated_fare_eur": 9.0,
+            "estimated_distance_km": 7.2,
+            "distance_to_pickup_km": 3.4,
+            "estimated_duration_min": 34.0,
+            "target_hourly_net_eur": 26.0,
+            "traffic_factor": 1.55,
+            "weather_intensity": 0.72,
+            "context_fallback_applied": 1.0,
+            "context_stale_sources": 3.0,
+        }
+    )
+    codes = standardized_reason_codes(features, 0.44, decision_threshold=0.58)
+    assert "TARGET_BELOW" in codes
+    assert "CONTEXT_FALLBACK" in codes
+    assert "CONTEXT_STALE" in codes
+    assert "DECISION_BELOW_THRESHOLD" in codes
+    assert "RISK_HIGH" in codes
+
+
+def test_standardized_reason_codes_balanced_profile_fallback():
+    codes = standardized_reason_codes(
+        {"target_gap_eur_h": 0.0, "context_fallback_applied": 0.0, "context_stale_sources": 0.0},
+        0.5,
+        decomposition={
+            "version": "v2",
+            "total_score": 0.5,
+            "dimensions": {
+                "gain": {"score": 0.5},
+                "time": {"score": 0.5},
+                "fuel": {"score": 0.5},
+                "risk": {"score": 0.5},
+            },
+        },
+    )
+    assert codes == ["PROFILE_BALANCED"]
 
 
 def test_ranking_objective_score_extreme_weights_change_result():
