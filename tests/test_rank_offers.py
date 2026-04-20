@@ -19,7 +19,15 @@ if str(_API_DIR) not in sys.path:
 from api.copilot_router import _rank_offer_items  # noqa: E402
 
 
-def _mk(offer_id: str, eur_h: float, net_eur: float, accept: float = 0.5, *, target_h: float = 0.0):
+def _mk(
+    offer_id: str,
+    eur_h: float,
+    net_eur: float,
+    accept: float = 0.5,
+    *,
+    target_h: float = 0.0,
+    objective_score: float | None = None,
+):
     """Minimal scored-offer dict shaped like what the handler produces."""
     return {
         "offer_id": offer_id,
@@ -27,6 +35,7 @@ def _mk(offer_id: str, eur_h: float, net_eur: float, accept: float = 0.5, *, tar
         "accept_score": accept,
         "decision": "accept" if accept >= 0.5 else "reject",
         "decision_threshold": 0.5,
+        "objective_score": objective_score,
         "eur_per_hour_net": eur_h,
         "estimated_net_eur": net_eur,
         "target_hourly_net_eur": target_h,
@@ -211,6 +220,17 @@ def test_rank_by_invalid_value_falls_back_to_hourly():
     ]
     items, _, _, _ = _rank_offer_items(scored, "unexpected_metric", None)
     assert items[0].offer_id == "high"
+
+
+def test_rank_by_objective_score_uses_custom_metric():
+    scored = [
+        _mk("gain_first", 30.0, 10.0, accept=0.9, objective_score=0.31),
+        _mk("fuel_time_first", 22.0, 8.0, accept=0.72, objective_score=0.88),
+    ]
+    items, _, _, _ = _rank_offer_items(scored, "objective_score", None)
+    assert items[0].offer_id == "fuel_time_first"
+    assert items[0].objective_score == 0.88
+    assert items[1].objective_score == 0.31
 
 
 def test_non_finite_reject_floor_falls_back_to_default():
