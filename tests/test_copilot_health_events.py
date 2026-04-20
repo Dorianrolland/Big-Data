@@ -85,3 +85,74 @@ def test_health_exposes_events_source_status():
     assert payload["data_quality"]["stale_sources_count"] == 2
     assert payload["data_quality"]["age_weather_s"] == 52.0
     assert payload["data_quality"]["stale_weather"] is True
+
+
+def test_health_exposes_supply_flat_alert():
+    redis_payloads = {
+        router.WEATHER_KEY: {},
+        router.GBFS_KEY: {},
+        router.IRVE_KEY: {},
+        router.EVENTS_CONTEXT_KEY: {},
+        router.FUEL_CONTEXT_KEY: {},
+        router.CONTEXT_QUALITY_KEY: {
+            "supply_variance": "0.0001",
+            "supply_flat_alert": "1",
+            "traffic_nonzero_rate": "0.15",
+        },
+        router.TLC_REPLAY_KEY: {},
+        router.SINGLE_REPLAY_STATUS_KEY: {},
+    }
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                redis=_FakeRedis(redis_payloads),
+                copilot_model=None,
+                copilot_model_quality_gate={},
+            )
+        )
+    )
+    payload = asyncio.run(router.copilot_health(request))
+    assert payload["data_quality"]["supply_flat_alert"] is True
+    assert payload["data_quality"]["supply_variance"] < router.QUALITY_ALERT_THRESHOLDS["supply_variance_min"]
+    assert payload["data_quality"]["traffic_nonzero_rate"] < router.QUALITY_ALERT_THRESHOLDS["traffic_nonzero_rate_min"]
+    assert "quality_alert_thresholds" in payload
+    assert payload["quality_alert_thresholds"]["routing_success_rate_min"] == 0.80
+
+
+def test_health_exposes_routing_quality_metrics():
+    redis_payloads = {
+        router.WEATHER_KEY: {},
+        router.GBFS_KEY: {},
+        router.IRVE_KEY: {},
+        router.EVENTS_CONTEXT_KEY: {},
+        router.FUEL_CONTEXT_KEY: {},
+        router.CONTEXT_QUALITY_KEY: {},
+        router.TLC_REPLAY_KEY: {},
+        router.SINGLE_REPLAY_STATUS_KEY: {
+            "route_requests": "100",
+            "route_successes": "72",
+            "hold_ticks": "40",
+            "positions": "100",
+            "routing_degraded": "1",
+            "routing_last_error": "connection refused",
+            "driver_id": "drv_demo_001",
+            "state": "moving",
+        },
+    }
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                redis=_FakeRedis(redis_payloads),
+                copilot_model=None,
+                copilot_model_quality_gate={},
+            )
+        )
+    )
+    payload = asyncio.run(router.copilot_health(request))
+    rq = payload["routing_quality"]
+    assert rq["routing_degraded"] is True
+    assert rq["routing_last_error"] == "connection refused"
+    assert rq["routing_success_rate"] == round(72 / 100, 4)
+    assert rq["hold_rate"] == round(40 / 100, 4)
+    assert rq["routing_success_rate"] < router.QUALITY_ALERT_THRESHOLDS["routing_success_rate_min"]
+    assert rq["hold_rate"] > router.QUALITY_ALERT_THRESHOLDS["hold_rate_max"]

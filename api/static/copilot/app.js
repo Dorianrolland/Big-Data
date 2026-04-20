@@ -1453,19 +1453,48 @@ function renderHealth() {
 
   const metrics = health.model_metrics || {};
   const fuel = health.fuel_context || {};
+  const dq = health.data_quality || {};
+  const rq = health.routing_quality || {};
+  const thr = health.quality_alert_thresholds || {};
+
   const items = [];
-  if (Number.isFinite(Number(metrics.roc_auc))) items.push(`AUC ${fmt(metrics.roc_auc, 3)}`);
-  if (Number.isFinite(Number(metrics.average_precision))) items.push(`AP ${fmt(metrics.average_precision, 3)}`);
-  if (Number.isFinite(Number(metrics.brier_score))) items.push(`Brier ${fmt(metrics.brier_score, 3)}`);
-  if (Number.isFinite(Number(gate.trained_rows))) items.push(`rows ${gate.trained_rows}`);
-  if (Number.isFinite(Number(fuel.fuel_price_eur_l))) items.push(`fuel ${fmt(fuel.fuel_price_eur_l, 3)} EUR/L`);
-  if (fuel.source) items.push(`fuel src ${fuel.source}`);
-  if (fuel.fuel_sync_status) items.push(`fuel sync ${fuel.fuel_sync_status}`);
+  if (Number.isFinite(Number(metrics.roc_auc))) items.push({ txt: `AUC ${fmt(metrics.roc_auc, 3)}`, cls: 'chip' });
+  if (Number.isFinite(Number(metrics.average_precision))) items.push({ txt: `AP ${fmt(metrics.average_precision, 3)}`, cls: 'chip' });
+  if (Number.isFinite(Number(metrics.brier_score))) items.push({ txt: `Brier ${fmt(metrics.brier_score, 3)}`, cls: 'chip' });
+  if (Number.isFinite(Number(gate.trained_rows))) items.push({ txt: `rows ${gate.trained_rows}`, cls: 'chip' });
+  if (Number.isFinite(Number(fuel.fuel_price_eur_l))) items.push({ txt: `fuel ${fmt(fuel.fuel_price_eur_l, 3)} EUR/L`, cls: 'chip' });
+  if (fuel.source) items.push({ txt: `fuel src ${fuel.source}`, cls: 'chip' });
+  if (fuel.fuel_sync_status) items.push({ txt: `fuel sync ${fuel.fuel_sync_status}`, cls: 'chip' });
+
+  // Data quality chips
+  if (dq.supply_flat_alert) {
+    items.push({ txt: 'supply FLAT', cls: 'chip bad' });
+  } else if (Number.isFinite(Number(dq.supply_variance))) {
+    const ok = dq.supply_variance >= (thr.supply_variance_min ?? 0.002);
+    items.push({ txt: `supply var ${fmt(dq.supply_variance, 4)}`, cls: ok ? 'chip good' : 'chip warn' });
+  }
+  if (Number.isFinite(Number(dq.traffic_nonzero_rate))) {
+    const ok = dq.traffic_nonzero_rate >= (thr.traffic_nonzero_rate_min ?? 0.30);
+    items.push({ txt: `traffic nz ${fmt(dq.traffic_nonzero_rate, 2)}`, cls: ok ? 'chip good' : 'chip warn' });
+  }
+  if (dq.context_fallback_applied) items.push({ txt: `fallback (${dq.stale_sources_count ?? 0} stale)`, cls: 'chip warn' });
+
+  // Routing quality chips
+  if (rq.routing_degraded) {
+    items.push({ txt: 'routing DEGRADED', cls: 'chip bad' });
+  } else if (Number.isFinite(Number(rq.routing_success_rate))) {
+    const ok = rq.routing_success_rate >= (thr.routing_success_rate_min ?? 0.80);
+    items.push({ txt: `routing ok ${fmt(rq.routing_success_rate * 100, 1)}%`, cls: ok ? 'chip good' : 'chip warn' });
+  }
+  if (Number.isFinite(Number(rq.hold_rate))) {
+    const bad = rq.hold_rate > (thr.hold_rate_max ?? 0.30);
+    items.push({ txt: `hold ${fmt(rq.hold_rate * 100, 1)}%`, cls: bad ? 'chip warn' : 'chip good' });
+  }
 
   healthMetrics.innerHTML = '';
-  items.forEach((txt) => {
+  items.forEach(({ txt, cls }) => {
     const node = document.createElement('span');
-    node.className = 'chip';
+    node.className = cls;
     node.textContent = txt;
     healthMetrics.appendChild(node);
   });
