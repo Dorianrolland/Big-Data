@@ -186,6 +186,72 @@ def test_rank_offers_changes_with_driver_profile_consumption():
     assert low_top != high_top
 
 
+def test_rank_offers_objective_weights_change_top_pick():
+    app = FastAPI()
+    app.include_router(router.copilot_router)
+    app.state.redis = _FakeRedis()
+    app.state.copilot_model = None
+
+    offers = [
+        {
+            "offer_id": "gain_heavy",
+            "courier_id": "drv_obj_001",
+            "estimated_fare_eur": 38.0,
+            "estimated_distance_km": 20.0,
+            "estimated_duration_min": 35.0,
+            "distance_to_pickup_km": 3.5,
+            "eta_to_pickup_min": 5.0,
+            "demand_index": 1.5,
+            "supply_index": 0.9,
+            "fuel_price_eur_l": 1.9,
+            "vehicle_consumption_l_100km": 11.0,
+            "target_hourly_net_eur": 16.0,
+        },
+        {
+            "offer_id": "efficient",
+            "courier_id": "drv_obj_001",
+            "estimated_fare_eur": 16.0,
+            "estimated_distance_km": 4.5,
+            "estimated_duration_min": 23.0,
+            "distance_to_pickup_km": 0.5,
+            "eta_to_pickup_min": 2.0,
+            "demand_index": 1.2,
+            "supply_index": 1.0,
+            "fuel_price_eur_l": 1.9,
+            "vehicle_consumption_l_100km": 7.5,
+            "target_hourly_net_eur": 16.0,
+        },
+    ]
+
+    with TestClient(app) as client:
+        gain_first = client.post(
+            "/copilot/rank-offers",
+            json={
+                "offers": offers,
+                "rank_by": "objective_score",
+                "w_gain": 100.0,
+                "w_time": 0.0,
+                "w_fuel": 0.0,
+            },
+        )
+        time_fuel_first = client.post(
+            "/copilot/rank-offers",
+            json={
+                "offers": offers,
+                "rank_by": "objective_score",
+                "w_gain": 0.0,
+                "w_time": 65.0,
+                "w_fuel": 35.0,
+            },
+        )
+
+    assert gain_first.status_code == 200
+    assert time_fuel_first.status_code == 200
+    gain_top = gain_first.json()["items"][0]["offer_id"]
+    time_fuel_top = time_fuel_first.json()["items"][0]["offer_id"]
+    assert gain_top != time_fuel_top
+
+
 def test_instant_dispatch_uses_profile_when_query_params_not_overridden(monkeypatch):
     async def fake_best_offers_around(*_args, **_kwargs):
         return {

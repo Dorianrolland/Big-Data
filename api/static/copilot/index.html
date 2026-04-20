@@ -758,6 +758,24 @@
             <button class="ghost" id="profileSaveBtn">Save Driver Profile</button>
             <span class="info-line" id="profileStatus">Driver profile: loading...</span>
           </div>
+          <div class="grid three">
+            <label title="Higher means prioritise net gain (accept score + target gap)">
+              Gain Priority
+              <input id="objWeightGain" type="range" min="0" max="100" step="1" value="62" />
+              <span class="info-line" id="objWeightGainValue">62%</span>
+            </label>
+            <label title="Higher means prioritise fast/short offers">
+              Time Priority
+              <input id="objWeightTime" type="range" min="0" max="100" step="1" value="23" />
+              <span class="info-line" id="objWeightTimeValue">23%</span>
+            </label>
+            <label title="Higher means prioritise fuel-efficient offers">
+              Fuel Priority
+              <input id="objWeightFuel" type="range" min="0" max="100" step="1" value="15" />
+              <span class="info-line" id="objWeightFuelValue">15%</span>
+            </label>
+          </div>
+          <div class="info-line" id="objectiveWeightStatus">Objective mix: gain 62% / time 23% / fuel 15%.</div>
           <div class="grid two">
             <label>Shift Plan Zone Limit<input id="shiftPlanTopK" type="number" step="1" min="3" max="20" value="6" /></label>
           </div>
