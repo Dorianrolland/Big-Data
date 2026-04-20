@@ -28,6 +28,7 @@ const state = {
   lastScoredOfferId: null,
   lastActionSummary: null,
   autoRefreshTimer: null,
+  objectiveWeights: null,
 };
 
 // Inputs users tweak in quick succession (numeric spinners, sliders) get
@@ -110,6 +111,13 @@ const profileRiskAversionInput = $('profileRiskAversion');
 const profileMaxEtaInput = $('profileMaxEta');
 const profileSaveBtn = $('profileSaveBtn');
 const profileStatusEl = $('profileStatus');
+const objWeightGainInput = $('objWeightGain');
+const objWeightTimeInput = $('objWeightTime');
+const objWeightFuelInput = $('objWeightFuel');
+const objWeightGainValueEl = $('objWeightGainValue');
+const objWeightTimeValueEl = $('objWeightTimeValue');
+const objWeightFuelValueEl = $('objWeightFuelValue');
+const objectiveWeightStatusEl = $('objectiveWeightStatus');
 const missionStartBestBtn = $('missionStartBestBtn');
 const missionStopBtn = $('missionStopBtn');
 const missionStatusEl = $('missionStatus');
@@ -151,6 +159,15 @@ const DRIVER_PROFILE_LIMITS = Object.freeze({
   consommation_l_100: { min: 2, max: 30, digits: 1 },
   aversion_risque: { min: 0, max: 1, digits: 2 },
   max_eta: { min: 3, max: 60, digits: 1 },
+});
+const OBJECTIVE_WEIGHT_DEFAULTS = Object.freeze({
+  w_gain: 62,
+  w_time: 23,
+  w_fuel: 15,
+});
+const OBJECTIVE_WEIGHT_LIMITS = Object.freeze({
+  min: 0,
+  max: 100,
 });
 
 function waitMs(ms) {
@@ -1546,7 +1563,7 @@ function renderOffers() {
       </div>
       <div class="offer-meta">
         <span class="muted">zone ${escapeHtml(zone)}</span>
-        <span><strong>${fmt(offer.accept_score, 3)}</strong> score - ${escapeHtml(String(offer.model_used || 'heuristic'))}</span>
+        <span><strong>${fmt(offer.accept_score, 3)}</strong> score - <strong>${fmt(offer.objective_score, 3)}</strong> objective - ${escapeHtml(String(offer.model_used || 'heuristic'))}</span>
       </div>
       ${offerMetricsHtml(offer)}
       <div class="muted">${escapeHtml(routeSummary(offer))}</div>
@@ -1602,7 +1619,7 @@ function renderBestOffers() {
       </div>
       <div class="offer-meta">
         <span class="muted">pickup ${fmt(offer.distance_to_pickup_km, 2)} km</span>
-        <span><strong>${fmt(offer.recommendation_score, 3)}</strong> rec - <strong>${fmt(offer.accept_score, 3)}</strong> ${escapeHtml(String(offer.model_used || 'heuristic'))}</span>
+        <span><strong>${fmt(offer.recommendation_score, 3)}</strong> rec - <strong>${fmt(offer.objective_score, 3)}</strong> objective - <strong>${fmt(offer.accept_score, 3)}</strong> ${escapeHtml(String(offer.model_used || 'heuristic'))}</span>
       </div>
       ${offerMetricsHtml(offer)}
       <div class="offer-meta">
@@ -1955,13 +1972,20 @@ function renderReplay() {
   });
 }
 
+function buildDriverOffersQuery(driver, limitHint) {
+  const limit = Math.max(20, Number(limitHint || offerLimit?.value || 20));
+  const objective = objectiveWeightsQueryString(state.objectiveWeights || objectiveWeightsFromInputs());
+  return `/copilot/driver/${encodeURIComponent(driver)}/offers?limit=${encodeURIComponent(limit)}&sort_by=objective&${objective}`;
+}
+
 function buildAroundQuery(driver) {
   const radius = Math.max(0.2, Number(aroundRadiusInput.value || 4.0));
   const limit = Math.max(1, Math.min(50, Number(aroundLimitInput.value || 10)));
   const minAccept = Math.max(0.0, Math.min(1.0, Number(aroundMinScoreInput.value || 0.25)));
   const useOsrm = aroundUseOsrmInput.checked ? 'true' : 'false';
+  const objective = objectiveWeightsQueryString(state.objectiveWeights || objectiveWeightsFromInputs());
 
-  return `/copilot/driver/${encodeURIComponent(driver)}/best-offers-around?radius_km=${encodeURIComponent(radius)}&limit=${encodeURIComponent(limit)}&min_accept_score=${encodeURIComponent(minAccept)}&use_osrm=${useOsrm}`;
+  return `/copilot/driver/${encodeURIComponent(driver)}/best-offers-around?radius_km=${encodeURIComponent(radius)}&limit=${encodeURIComponent(limit)}&min_accept_score=${encodeURIComponent(minAccept)}&rank_by=objective&${objective}&use_osrm=${useOsrm}`;
 }
 
 function buildZoneQuery(driver) {
@@ -2187,6 +2211,148 @@ async function saveDriverProfile() {
   }
 }
 
+function normalizeObjectiveWeight(rawValue, fallback) {
+  const fallbackNumber = Number.isFinite(Number(fallback)) ? Number(fallback) : 0;
+  const parsed = Number(rawValue);
+  const candidate = Number.isFinite(parsed) ? parsed : fallbackNumber;
+  return clamp(candidate, OBJECTIVE_WEIGHT_LIMITS.min, OBJECTIVE_WEIGHT_LIMITS.max);
+}
+
+function objectiveWeightsFromInputs() {
+  const gainRaw = normalizeObjectiveWeight(objWeightGainInput?.value, OBJECTIVE_WEIGHT_DEFAULTS.w_gain);
+  const timeRaw = normalizeObjectiveWeight(objWeightTimeInput?.value, OBJECTIVE_WEIGHT_DEFAULTS.w_time);
+  const fuelRaw = normalizeObjectiveWeight(objWeightFuelInput?.value, OBJECTIVE_WEIGHT_DEFAULTS.w_fuel);
+  const totalRaw = gainRaw + timeRaw + fuelRaw;
+  if (totalRaw <= 0) {
+    return {
+      w_gain: OBJECTIVE_WEIGHT_DEFAULTS.w_gain / 100,
+      w_time: OBJECTIVE_WEIGHT_DEFAULTS.w_time / 100,
+      w_fuel: OBJECTIVE_WEIGHT_DEFAULTS.w_fuel / 100,
+    };
+  }
+  return {
+    w_gain: gainRaw / totalRaw,
+    w_time: timeRaw / totalRaw,
+    w_fuel: fuelRaw / totalRaw,
+  };
+}
+
+function objectiveWeightsToPercents(weights) {
+  const normalized = weights || state.objectiveWeights || objectiveWeightsFromInputs();
+  return {
+    gain: Math.round(clamp(Number(normalized.w_gain || 0), 0, 1) * 100),
+    time: Math.round(clamp(Number(normalized.w_time || 0), 0, 1) * 100),
+    fuel: Math.round(clamp(Number(normalized.w_fuel || 0), 0, 1) * 100),
+  };
+}
+
+function normalizeObjectiveWeightsPayload(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const gainRaw = Number(raw.w_gain);
+  const timeRaw = Number(raw.w_time);
+  const fuelRaw = Number(raw.w_fuel);
+  if (!Number.isFinite(gainRaw) || !Number.isFinite(timeRaw) || !Number.isFinite(fuelRaw)) return null;
+  const maxValue = Math.max(gainRaw, timeRaw, fuelRaw);
+  const scale = maxValue > 1.0 ? 100.0 : 1.0;
+  const gain = normalizeObjectiveWeight(gainRaw * (100.0 / scale), OBJECTIVE_WEIGHT_DEFAULTS.w_gain);
+  const time = normalizeObjectiveWeight(timeRaw * (100.0 / scale), OBJECTIVE_WEIGHT_DEFAULTS.w_time);
+  const fuel = normalizeObjectiveWeight(fuelRaw * (100.0 / scale), OBJECTIVE_WEIGHT_DEFAULTS.w_fuel);
+  const total = gain + time + fuel;
+  if (total <= 0) return null;
+  return {
+    w_gain: gain / total,
+    w_time: time / total,
+    w_fuel: fuel / total,
+  };
+}
+
+function renderObjectiveWeightControls() {
+  if (!state.objectiveWeights) {
+    state.objectiveWeights = objectiveWeightsFromInputs();
+  }
+  const percents = objectiveWeightsToPercents(state.objectiveWeights);
+  if (objWeightGainInput) objWeightGainInput.value = String(percents.gain);
+  if (objWeightTimeInput) objWeightTimeInput.value = String(percents.time);
+  if (objWeightFuelInput) objWeightFuelInput.value = String(percents.fuel);
+  if (objWeightGainValueEl) objWeightGainValueEl.textContent = `${percents.gain}%`;
+  if (objWeightTimeValueEl) objWeightTimeValueEl.textContent = `${percents.time}%`;
+  if (objWeightFuelValueEl) objWeightFuelValueEl.textContent = `${percents.fuel}%`;
+  if (objectiveWeightStatusEl) {
+    objectiveWeightStatusEl.textContent = `Objective mix: gain ${percents.gain}% / time ${percents.time}% / fuel ${percents.fuel}%.`;
+  }
+}
+
+function objectiveWeightsQueryString(weights) {
+  const percents = objectiveWeightsToPercents(weights || state.objectiveWeights || objectiveWeightsFromInputs());
+  return `w_gain=${encodeURIComponent(percents.gain)}&w_time=${encodeURIComponent(percents.time)}&w_fuel=${encodeURIComponent(percents.fuel)}`;
+}
+
+function objectiveScoreFromOffer(offer, weights) {
+  const normalized = weights || state.objectiveWeights || objectiveWeightsFromInputs();
+  const accept = clamp(Number(offer?.accept_score || 0), 0, 1);
+  const targetGap = Number(offer?.target_gap_eur_h || 0);
+  const targetComponent = clamp((targetGap + 8.0) / 16.0, 0, 1);
+  const gainComponent = clamp((accept * 0.72) + (targetComponent * 0.28), 0, 1);
+
+  const duration = Number(offer?.route_duration_min);
+  const durationMin = Number.isFinite(duration) ? Math.max(duration, 1) : 20;
+  const timeComponent = 1 - clamp((durationMin - 14.0) / 32.0, 0, 1);
+
+  const fare = Number(offer?.costs?.estimated_fare_eur);
+  const fuel = Number(offer?.costs?.fuel_cost_eur);
+  const fuelShare = Number.isFinite(fare) && fare > 0 && Number.isFinite(fuel) ? fuel / fare : 0.16;
+  const fuelComponent = 1 - clamp((fuelShare - 0.06) / 0.25, 0, 1);
+
+  return clamp(
+    (normalized.w_gain * gainComponent) + (normalized.w_time * timeComponent) + (normalized.w_fuel * fuelComponent),
+    0,
+    1
+  );
+}
+
+function applyObjectiveRankingToCollections() {
+  const weights = state.objectiveWeights || objectiveWeightsFromInputs();
+
+  if (Array.isArray(state.offers) && state.offers.length) {
+    state.offers = state.offers
+      .map((offer) => ({ ...offer, objective_score: objectiveScoreFromOffer(offer, weights) }))
+      .sort((a, b) => {
+        const aObj = Number(a.objective_score || 0);
+        const bObj = Number(b.objective_score || 0);
+        if (bObj !== aObj) return bObj - aObj;
+        const acceptDelta = Number(b.accept_score || 0) - Number(a.accept_score || 0);
+        if (acceptDelta !== 0) return acceptDelta;
+        return Number(b.eur_per_hour_net || 0) - Number(a.eur_per_hour_net || 0);
+      });
+  }
+
+  if (Array.isArray(state.bestOffers) && state.bestOffers.length) {
+    state.bestOffers = state.bestOffers
+      .map((offer) => ({ ...offer, objective_score: objectiveScoreFromOffer(offer, weights) }))
+      .sort((a, b) => {
+        const aObj = Number(a.objective_score || 0);
+        const bObj = Number(b.objective_score || 0);
+        if (bObj !== aObj) return bObj - aObj;
+        const recDelta = Number(b.recommendation_score || 0) - Number(a.recommendation_score || 0);
+        if (recDelta !== 0) return recDelta;
+        return Number(b.accept_score || 0) - Number(a.accept_score || 0);
+      });
+  }
+}
+
+function handleObjectiveWeightChange() {
+  state.objectiveWeights = objectiveWeightsFromInputs();
+  renderObjectiveWeightControls();
+  applyObjectiveRankingToCollections();
+  renderKpis();
+  ensureSelectedOffer();
+  renderOffers();
+  renderBestOffers();
+  renderDecisionFlow();
+  setUxStatus('loading', 'Ranking priorities updated. Recomputing recommendations...');
+  refreshDriverDataDebounced();
+}
+
 async function refreshDriverData() {
   // If a refresh is already running, queue a trailing re-run so the user's
   // latest inputs are never silently dropped.
@@ -2197,6 +2363,10 @@ async function refreshDriverData() {
   state.refreshDriverInFlight = true;
   const driver = currentDriverId();
   const limit = Number(offerLimit.value || 12);
+  if (!state.objectiveWeights) {
+    state.objectiveWeights = objectiveWeightsFromInputs();
+  }
+  renderObjectiveWeightControls();
   if (state.missionJournalDriver !== driver) {
     state.missionJournalDriver = driver;
     refreshMissionJournal(true).catch(() => {});
@@ -2222,7 +2392,7 @@ async function refreshDriverData() {
   try {
     const [profileResp, offersResp, zonesResp, bestResp, dispatchResp, shiftPlanResp] = await Promise.all([
       api(`/copilot/driver/${encodeURIComponent(driver)}/profile`).catch((err) => ({ _error: errorMessage(err, 'profile unavailable') })),
-      api(`/copilot/driver/${encodeURIComponent(driver)}/offers?limit=${Math.max(limit, 20)}`),
+      api(buildDriverOffersQuery(driver, limit)),
       api(buildZoneQuery(driver)),
       api(buildAroundQuery(driver)).catch((err) => ({ offers: [], _error: errorMessage(err, 'best offers unavailable') })),
       api(buildDispatchQuery(driver)).catch((err) => ({ _error: errorMessage(err, 'dispatch unavailable') })),
@@ -2239,6 +2409,14 @@ async function refreshDriverData() {
     state.dispatchError = dispatchResp._error || null;
     state.shiftPlan = shiftPlanResp._error ? null : shiftPlanResp;
     state.shiftPlanError = shiftPlanResp._error || null;
+    const serverObjectiveWeights = normalizeObjectiveWeightsPayload(
+      offersResp?.objective_weights || bestResp?.objective_weights
+    );
+    if (serverObjectiveWeights) {
+      state.objectiveWeights = serverObjectiveWeights;
+    }
+    applyObjectiveRankingToCollections();
+    renderObjectiveWeightControls();
 
     renderKpis();
     ensureSelectedOffer();
@@ -2665,6 +2843,9 @@ bindChangeAndInput(zoneHomeLatInput, refreshDriverDataDebounced);
 bindChangeAndInput(zoneHomeLonInput, refreshDriverDataDebounced);
 safeBind(shiftPlanHorizonInput, 'change', refreshDriverData);
 bindChangeAndInput(shiftPlanTopKInput, refreshDriverDataDebounced);
+bindChangeAndInput(objWeightGainInput, handleObjectiveWeightChange);
+bindChangeAndInput(objWeightTimeInput, handleObjectiveWeightChange);
+bindChangeAndInput(objWeightFuelInput, handleObjectiveWeightChange);
 safeBind(autoRefreshBox, 'change', startAutoRefreshLoop);
 
 bindOfferActionDelegation(offersEl);
@@ -2675,6 +2856,8 @@ bindOfferActionDelegation(shiftPlanEl);
 setFlowStep('choose');
 renderDecisionFlow();
 renderMissionPanel();
+state.objectiveWeights = objectiveWeightsFromInputs();
+renderObjectiveWeightControls();
 setWindowMinutes(30);
 applyPreset('balanced');
 refreshAll()

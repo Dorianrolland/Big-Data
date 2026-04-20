@@ -30,8 +30,10 @@ from copilot_logic import (
     heuristic_score,
     hybrid_accept_decision,
     model_score,
+    normalize_objective_weights,
     normalize_score_weights,
     reposition_cost_model,
+    ranking_objective_score,
     recommendation_score,
     validate_model_payload,
 )
@@ -121,6 +123,13 @@ RANK_REJECT_EUR_H_DEFAULT = max(0.0, _env_float("COPILOT_RANK_REJECT_EUR_H_DEFAU
 RANK_TOP_PICK_MIN_EUR_H = max(0.0, _env_float("COPILOT_RANK_TOP_PICK_MIN_EUR_H", 14.0))
 RANK_TOP_PICK_MIN_EDGE_EUR_H = max(0.0, _env_float("COPILOT_RANK_TOP_PICK_MIN_EDGE_EUR_H", 1.0))
 RANK_BELOW_TARGET_SLACK_EUR_H = max(0.0, _env_float("COPILOT_RANK_BELOW_TARGET_SLACK_EUR_H", 0.75))
+OBJECTIVE_RANKING_WEIGHTS = normalize_objective_weights(
+    {
+        "w_gain": _env_float("COPILOT_OBJECTIVE_W_GAIN", 0.62),
+        "w_time": _env_float("COPILOT_OBJECTIVE_W_TIME", 0.23),
+        "w_fuel": _env_float("COPILOT_OBJECTIVE_W_FUEL", 0.15),
+    }
+)
 SHIFT_PLAN_TOP_K_DEFAULT = _env_int("COPILOT_SHIFT_PLAN_TOP_K_DEFAULT", 6, min_value=3, max_value=20)
 SHIFT_PLAN_REFERENCE_KM = _env_float("COPILOT_SHIFT_PLAN_REFERENCE_KM", 15.0)
 SHIFT_PLAN_DEFAULT_TARGET_EUR_H = max(0.0, _env_float("COPILOT_SHIFT_PLAN_TARGET_EUR_H", 18.0))
@@ -231,10 +240,13 @@ class RankOffersRequest(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
     offers: list[ScoreOfferRequest] = Field(..., min_length=1, max_length=20)
-    rank_by: Literal["eur_per_hour_net", "estimated_net_eur", "accept_score"] = (
+    rank_by: Literal["eur_per_hour_net", "estimated_net_eur", "accept_score", "objective_score"] = (
         "eur_per_hour_net"
     )
     use_osrm: bool = False
+    w_gain: float | None = Field(None, ge=0.0, le=100.0)
+    w_time: float | None = Field(None, ge=0.0, le=100.0)
+    w_fuel: float | None = Field(None, ge=0.0, le=100.0)
     reject_below_eur_h: float | None = Field(
         None, ge=0.0, le=200.0,
         description="Hard floor: offers with net €/h strictly below this are tagged 'reject'.",
@@ -252,6 +264,7 @@ class RankedOfferItem(BaseModel):
     accept_score: float
     decision: str
     decision_threshold: float | None = None
+    objective_score: float | None = None
     eur_per_hour_net: float
     estimated_net_eur: float
     delta_vs_top_eur_h: float
@@ -275,6 +288,7 @@ class RankOffersResponse(BaseModel):
     worst_eur_h: float
     median_eur_h: float
     hourly_gain_vs_worst_eur_h: float
+    objective_weights: dict[str, float] | None = None
     items: list[RankedOfferItem]
 
 
@@ -576,6 +590,42 @@ def _compute_heuristic_score(features: dict[str, float]) -> tuple[float, float, 
     return heuristic_score(features, weights=SCORE_WEIGHTS)
 
 
+def _has_objective_weight_override(*, w_gain: float | None, w_time: float | None, w_fuel: float | None) -> bool:
+    return any(value is not None for value in (w_gain, w_time, w_fuel))
+
+
+def _resolve_objective_weights(
+    *,
+    w_gain: float | None,
+    w_time: float | None,
+    w_fuel: float | None,
+) -> dict[str, float]:
+    if not _has_objective_weight_override(w_gain=w_gain, w_time=w_time, w_fuel=w_fuel):
+        return dict(OBJECTIVE_RANKING_WEIGHTS)
+    return normalize_objective_weights(
+        {
+            "w_gain": _as_float(w_gain, OBJECTIVE_RANKING_WEIGHTS["w_gain"]),
+            "w_time": _as_float(w_time, OBJECTIVE_RANKING_WEIGHTS["w_time"]),
+            "w_fuel": _as_float(w_fuel, OBJECTIVE_RANKING_WEIGHTS["w_fuel"]),
+        },
+        defaults=OBJECTIVE_RANKING_WEIGHTS,
+    )
+
+
+def _compute_objective_score(
+    *,
+    features: dict[str, float],
+    accept_prob: float,
+    weights: dict[str, float] | None,
+) -> float:
+    objective_score, _, _ = ranking_objective_score(
+        features,
+        float(accept_prob),
+        objective_weights=weights,
+    )
+    return round(float(objective_score), 4)
+
+
 def _decision_for_offer(
     features: dict[str, float],
     accept_prob: float,
@@ -820,6 +870,7 @@ def _dispatch_offer_summary(offer: dict[str, Any]) -> dict[str, Any]:
         "zone_id": offer.get("zone_id"),
         "recommendation_action": offer.get("recommendation_action"),
         "recommendation_score": round(float(offer.get("recommendation_score", 0.0)), 4),
+        "objective_score": round(float(offer.get("objective_score", 0.0)), 4),
         "accept_score": round(float(offer.get("accept_score", 0.0)), 4),
         "eur_per_hour_net": round(float(offer.get("eur_per_hour_net", 0.0)), 2),
         "target_gap_eur_h": round(float(offer.get("target_gap_eur_h", 0.0)), 2),
@@ -1505,11 +1556,21 @@ def _rank_offer_items(
     through FastAPI + Redis + OSRM. Takes the list of already-scored dicts
     and returns `(items, best_eur_h, worst_eur_h, median_eur_h)`.
     """
-    metric = rank_by if rank_by in {"eur_per_hour_net", "estimated_net_eur", "accept_score"} else "eur_per_hour_net"
+    metric = (
+        rank_by
+        if rank_by in {"eur_per_hour_net", "estimated_net_eur", "accept_score", "objective_score"}
+        else "eur_per_hour_net"
+    )
     key_map = {
         "eur_per_hour_net": lambda it: (it["eur_per_hour_net"], it["estimated_net_eur"], it["accept_score"]),
         "estimated_net_eur": lambda it: (it["estimated_net_eur"], it["eur_per_hour_net"], it["accept_score"]),
         "accept_score": lambda it: (it["accept_score"], it["eur_per_hour_net"], it["estimated_net_eur"]),
+        "objective_score": lambda it: (
+            _as_float(it.get("objective_score"), 0.0),
+            it["accept_score"],
+            it["eur_per_hour_net"],
+            it["estimated_net_eur"],
+        ),
     }
     tie_sorted = sorted(scored, key=lambda it: str(it.get("offer_id") or ""))
     ordered = sorted(tie_sorted, key=key_map[metric], reverse=True)
@@ -1566,6 +1627,11 @@ def _rank_offer_items(
             accept_score=it["accept_score"],
             decision=it["decision"],
             decision_threshold=float(it.get("decision_threshold")) if it.get("decision_threshold") is not None else None,
+            objective_score=(
+                float(it.get("objective_score"))
+                if it.get("objective_score") is not None
+                else None
+            ),
             eur_per_hour_net=eur_h,
             estimated_net_eur=float(it["estimated_net_eur"]),
             delta_vs_top_eur_h=delta_top,
@@ -1630,6 +1696,11 @@ async def rank_offers(request: Request, body: RankOffersRequest) -> RankOffersRe
     """
     redis_client: aioredis.Redis = request.app.state.redis
     model_payload = getattr(request.app.state, "copilot_model", None)
+    objective_weights = _resolve_objective_weights(
+        w_gain=body.w_gain,
+        w_time=body.w_time,
+        w_fuel=body.w_fuel,
+    )
 
     scored: list[dict[str, Any]] = []
     profile_cache: dict[str, dict[str, Any]] = {}
@@ -1660,6 +1731,11 @@ async def rank_offers(request: Request, body: RankOffersRequest) -> RankOffersRe
                 route_meta=route_meta,
             )
             breakdown = cost_breakdown(features)
+            objective_score = _compute_objective_score(
+                features=features,
+                accept_prob=accept_prob,
+                weights=objective_weights,
+            )
             scored.append(
                 _build_scored_offer_snapshot(
                     payload=payload,
@@ -1673,6 +1749,7 @@ async def rank_offers(request: Request, body: RankOffersRequest) -> RankOffersRe
                     model_used=model_used,
                     reasons=reasons,
                     details=details,
+                    extras={"objective_score": objective_score},
                 )
             )
     finally:
@@ -1692,6 +1769,7 @@ async def rank_offers(request: Request, body: RankOffersRequest) -> RankOffersRe
         worst_eur_h=round(worst_eur_h, 2),
         median_eur_h=round(median_eur_h, 2),
         hourly_gain_vs_worst_eur_h=round(best_eur_h - worst_eur_h, 2),
+        objective_weights={k: round(float(v), 4) for k, v in objective_weights.items()},
         items=items,
     )
 
@@ -1911,7 +1989,10 @@ async def driver_offers(
     limit: int = Query(20, ge=1, le=200),
     min_accept_score: float = Query(0.0, ge=0.0, le=1.0),
     target_hourly_net_eur: float | None = Query(None, ge=0.0, le=150.0),
-    sort_by: Literal["score", "net", "recent"] = Query("score"),
+    sort_by: Literal["score", "net", "recent", "objective"] = Query("score"),
+    w_gain: float | None = Query(None, ge=0.0, le=100.0),
+    w_time: float | None = Query(None, ge=0.0, le=100.0),
+    w_fuel: float | None = Query(None, ge=0.0, le=100.0),
     use_osrm: bool = Query(
         False,
         description="If true, recompute routes via OSRM (more precise, slower).",
@@ -1919,6 +2000,7 @@ async def driver_offers(
 ):
     redis_client: aioredis.Redis = request.app.state.redis
     driver_profile = await _resolve_driver_profile(redis_client, driver_id)
+    objective_weights = _resolve_objective_weights(w_gain=w_gain, w_time=w_time, w_fuel=w_fuel)
     offer_ids = await redis_client.lrange(f"{DRIVER_OFFERS_PREFIX}{driver_id}:offers", 0, limit - 1)
     if not offer_ids:
         return {"driver_id": driver_id, "count": 0, "offers": []}
@@ -1967,6 +2049,11 @@ async def driver_offers(
                 route_meta=route_meta,
             )
             breakdown = cost_breakdown(features)
+            objective_score = _compute_objective_score(
+                features=features,
+                accept_prob=accept_prob,
+                weights=objective_weights,
+            )
 
             offers.append(
                 _build_scored_offer_snapshot(
@@ -1984,6 +2071,7 @@ async def driver_offers(
                     extras={
                         "zone_id": off.get("zone_id"),
                         "ts": off.get("ts"),
+                        "objective_score": objective_score,
                     },
                 )
             )
@@ -1995,6 +2083,15 @@ async def driver_offers(
         offers.sort(key=lambda x: (x["accept_score"], x["eur_per_hour_net"]), reverse=True)
     elif sort_by == "net":
         offers.sort(key=lambda x: (x["eur_per_hour_net"], x["accept_score"]), reverse=True)
+    elif sort_by == "objective":
+        offers.sort(
+            key=lambda x: (
+                _as_float(x.get("objective_score"), 0.0),
+                x["accept_score"],
+                x["eur_per_hour_net"],
+            ),
+            reverse=True,
+        )
     else:
         offers.sort(key=lambda x: x.get("ts") or "", reverse=True)
 
@@ -2004,6 +2101,7 @@ async def driver_offers(
         "count": len(offers),
         "accept_count": accept_count,
         "accept_rate_pct": round((accept_count / len(offers) * 100), 1) if offers else 0.0,
+        "objective_weights": {k: round(float(v), 4) for k, v in objective_weights.items()},
         "offers": offers,
     }
 
@@ -2019,6 +2117,10 @@ async def best_offers_around(
     scan_limit: int = Query(120, ge=10, le=400),
     min_accept_score: float = Query(0.25, ge=0.0, le=1.0),
     target_hourly_net_eur: float | None = Query(None, ge=0.0, le=150.0),
+    rank_by: Literal["recommendation", "objective"] = Query("recommendation"),
+    w_gain: float | None = Query(None, ge=0.0, le=100.0),
+    w_time: float | None = Query(None, ge=0.0, le=100.0),
+    w_fuel: float | None = Query(None, ge=0.0, le=100.0),
     use_osrm: bool = Query(
         False,
         description="If true, recompute routes via OSRM (more precise, slower).",
@@ -2026,6 +2128,8 @@ async def best_offers_around(
 ):
     redis_client: aioredis.Redis = request.app.state.redis
     driver_profile = await _resolve_driver_profile(redis_client, driver_id)
+    objective_override = _has_objective_weight_override(w_gain=w_gain, w_time=w_time, w_fuel=w_fuel)
+    objective_weights = _resolve_objective_weights(w_gain=w_gain, w_time=w_time, w_fuel=w_fuel)
 
     lat, lon = await _resolve_driver_origin(redis_client, driver_id, lat, lon)
 
@@ -2104,7 +2208,16 @@ async def best_offers_around(
                 route_meta=route_meta,
             )
 
-            rec_score, rec_action, rec_signals = recommendation_score(features, accept_prob)
+            rec_score, rec_action, rec_signals = recommendation_score(
+                features,
+                accept_prob,
+                objective_weights=(objective_weights if objective_override else None),
+            )
+            objective_score = _compute_objective_score(
+                features=features,
+                accept_prob=accept_prob,
+                weights=objective_weights,
+            )
             breakdown = cost_breakdown(features)
             offers.append(
                 _build_scored_offer_snapshot(
@@ -2126,6 +2239,7 @@ async def best_offers_around(
                         "recommendation_score": rec_score,
                         "recommendation_action": rec_action,
                         "recommendation_signals": rec_signals,
+                        "objective_score": objective_score,
                     },
                 )
             )
@@ -2133,10 +2247,20 @@ async def best_offers_around(
         if osrm_client is not None:
             await osrm_client.aclose()
 
-    offers.sort(
-        key=lambda x: (x["recommendation_score"], x["accept_score"], x["eur_per_hour_net"]),
-        reverse=True,
-    )
+    if rank_by == "objective":
+        offers.sort(
+            key=lambda x: (
+                _as_float(x.get("objective_score"), 0.0),
+                x["accept_score"],
+                x["eur_per_hour_net"],
+            ),
+            reverse=True,
+        )
+    else:
+        offers.sort(
+            key=lambda x: (x["recommendation_score"], x["accept_score"], x["eur_per_hour_net"]),
+            reverse=True,
+        )
     offers = offers[:limit]
     action_counts = {
         "accept": sum(1 for x in offers if x["recommendation_action"] == "accept"),
@@ -2148,6 +2272,8 @@ async def best_offers_around(
         "driver_id": driver_id,
         "origin": {"lat": round(float(lat), 6), "lon": round(float(lon), 6)},
         "radius_km": radius_km,
+        "ranked_by": rank_by,
+        "objective_weights": {k: round(float(v), 4) for k, v in objective_weights.items()},
         "count": len(offers),
         "action_counts": action_counts,
         "offers": offers,

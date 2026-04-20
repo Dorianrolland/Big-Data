@@ -25,6 +25,8 @@ const consoleErrors = [];
 const unhandledErrors = [];
 const openedUrls = [];
 let lastProfilePutBody = null;
+let lastOffersQuery = '';
+let lastBestAroundQuery = '';
 
 process.on('unhandledRejection', (err) => {{
   unhandledErrors.push(String(err && err.message ? err.message : err));
@@ -241,6 +243,7 @@ async function fetchStub(url, _opts) {{
     }});
   }}
   if (path.endsWith('/offers')) {{
+    lastOffersQuery = parsed.searchParams.toString();
     return ok({{
       driver_id: 'drv_demo_001',
       count: 2,
@@ -250,6 +253,7 @@ async function fetchStub(url, _opts) {{
     }});
   }}
   if (path.endsWith('/best-offers-around')) {{
+    lastBestAroundQuery = parsed.searchParams.toString();
     return ok({{
       driver_id: 'drv_demo_001',
       count: 1,
@@ -496,6 +500,15 @@ async function main() {{
   if (typeof context.saveDriverProfile === 'function') {{
     await context.saveDriverProfile();
   }}
+  getNode('objWeightGain').value = '100';
+  getNode('objWeightTime').value = '0';
+  getNode('objWeightFuel').value = '0';
+  if (typeof context.handleObjectiveWeightChange === 'function') {{
+    context.handleObjectiveWeightChange();
+  }}
+  if (typeof context.refreshDriverData === 'function') {{
+    await context.refreshDriverData();
+  }}
   await new Promise((resolve) => setTimeout(resolve, 80));
 
   const scoreDecisionText = String(getNode('scoreDecision').textContent || '').trim();
@@ -551,6 +564,14 @@ async function main() {{
   }}
   if (lastProfilePutBody.target_eur_h !== 150 || lastProfilePutBody.consommation_l_100 !== 7.5 || lastProfilePutBody.aversion_risque !== 0 || lastProfilePutBody.max_eta !== 60) {{
     realConsole.error('expected normalized profile payload, got', JSON.stringify(lastProfilePutBody));
+    process.exit(1);
+  }}
+  if (!String(lastOffersQuery).includes('sort_by=objective') || !String(lastOffersQuery).includes('w_gain=')) {{
+    realConsole.error('expected weighted objective query for /offers, got', lastOffersQuery);
+    process.exit(1);
+  }}
+  if (!String(lastBestAroundQuery).includes('rank_by=objective') || !String(lastBestAroundQuery).includes('w_fuel=')) {{
+    realConsole.error('expected weighted objective query for /best-offers-around, got', lastBestAroundQuery);
     process.exit(1);
   }}
   const shiftSummary = String(getNode('shiftPlanSummary').textContent || '');
@@ -619,6 +640,10 @@ def test_pwa_index_contains_decision_flow_region() -> None:
     assert 'id="profileMaxEta"' in content
     assert 'id="profileSaveBtn"' in content
     assert 'id="profileStatus"' in content
+    assert 'id="objWeightGain"' in content
+    assert 'id="objWeightTime"' in content
+    assert 'id="objWeightFuel"' in content
+    assert 'id="objectiveWeightStatus"' in content
     assert 'aria-live="polite"' in content
 
 
