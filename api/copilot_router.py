@@ -108,6 +108,16 @@ FUEL_REFRESH_INTERVAL_S = int(os.getenv("COPILOT_FUEL_REFRESH_SECONDS", "1800"))
 FUEL_USD_TO_EUR_RATE = float(os.getenv("COPILOT_USD_TO_EUR_RATE", "0.92"))
 FUEL_GRADE = os.getenv("COPILOT_FUEL_GRADE", "regular").strip().lower()
 GALLON_TO_LITER = 3.785411784
+
+# Quality alert thresholds — exposed in /copilot/health so PWA and runbook
+# display consistent, actionable indicators without hardcoding values client-side.
+QUALITY_ALERT_THRESHOLDS = {
+    "supply_variance_min": 0.002,       # below → supply appears flat (no real signal)
+    "traffic_nonzero_rate_min": 0.30,   # below → traffic factor mostly zero (degraded)
+    "routing_success_rate_min": 0.80,   # below → OSRM routing frequently failing
+    "hold_rate_max": 0.30,              # above → driver stuck/holding too often
+}
+
 SCORE_WEIGHTS = normalize_score_weights(
     {
         "net_hourly": _env_float("COPILOT_SCORE_W_NET_HOURLY", 0.46),
@@ -3198,7 +3208,8 @@ async def replay(
             estimated_fare_eur,
             actual_fare_eur,
             demand_index,
-            supply_index
+            supply_index,
+            source_platform
         FROM read_parquet({glob_list_sql}, hive_partitioning = true)
         WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
           AND (? IS NULL OR courier_id = ?)
@@ -3228,6 +3239,7 @@ async def replay(
                 "actual_fare_eur": r[10],
                 "demand_index": r[11],
                 "supply_index": r[12],
+                "source_platform": r[13],
             }
             for r in rows
         ],
@@ -3515,5 +3527,6 @@ async def copilot_health(request: Request):
         "tlc_replay": tlc_replay,
         "events_path": str(EVENTS_PATH),
         "model_path": str(MODEL_PATH),
+        "quality_alert_thresholds": QUALITY_ALERT_THRESHOLDS,
     }
 
