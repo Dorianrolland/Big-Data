@@ -27,6 +27,7 @@ import math
 import os
 import re
 import signal
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -73,6 +74,10 @@ TLC_RESET_RUNTIME_ON_START = os.getenv("TLC_RESET_RUNTIME_ON_START", "false").lo
 TLC_TRAIN_MONTH_COUNT = int(os.getenv("TLC_TRAIN_MONTH_COUNT", "0") or "0")
 TLC_LIVE_MONTH_COUNT = int(os.getenv("TLC_LIVE_MONTH_COUNT", "0") or "0")
 TLC_SOURCE_PLATFORM = (os.getenv("TLC_SOURCE_PLATFORM", "tlc_hvfhv_historical") or "tlc_hvfhv_historical").strip()
+TLC_ROUTE_MODE = (os.getenv("TLC_ROUTE_MODE", "osrm") or "osrm").strip().lower()
+TLC_ROUTE_OSRM_URL = (os.getenv("TLC_ROUTE_OSRM_URL", os.getenv("OSRM_URL", "http://osrm:5000")) or "http://osrm:5000").strip().rstrip("/")
+TLC_ROUTE_OSRM_TIMEOUT_S = float(os.getenv("TLC_ROUTE_OSRM_TIMEOUT_S", "4.0"))
+TLC_ROUTE_CACHE_MAX = int(os.getenv("TLC_ROUTE_CACHE_MAX", "4096"))
 
 STATUS_KEY = "copilot:replay:tlc:status"
 CURSOR_KEY = "copilot:replay:tlc:cursor"
@@ -95,6 +100,10 @@ CENTROIDS_PATH = Path(__file__).parent / "nyc_zone_centroids.json"
 
 EARTH_RADIUS_KM = 6371.0
 MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+
+if TLC_ROUTE_MODE not in {"osrm", "linear"}:
+    log.warning("invalid TLC_ROUTE_MODE=%s; fallback to linear", TLC_ROUTE_MODE)
+    TLC_ROUTE_MODE = "linear"
 
 
 def utc_now_iso() -> str:
@@ -149,6 +158,99 @@ def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     x = math.sin(dlon) * math.cos(phi2)
     y = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlon)
     return (math.degrees(math.atan2(x, y)) + 360.0) % 360.0
+
+
+def decode_polyline(encoded: str, precision: int = 5) -> list[tuple[float, float]]:
+    if not encoded:
+        return []
+    coords: list[tuple[float, float]] = []
+    index = 0
+    lat = 0
+    lon = 0
+    factor = 10 ** precision
+    length = len(encoded)
+    while index < length:
+        result = 0
+        shift = 0
+        while True:
+            if index >= length:
+                return coords
+            b = ord(encoded[index]) - 63
+            index += 1
+            result |= (b & 0x1F) << shift
+            shift += 5
+            if b < 0x20:
+                break
+        dlat = ~(result >> 1) if (result & 1) else (result >> 1)
+        lat += dlat
+
+        result = 0
+        shift = 0
+        while True:
+            if index >= length:
+                return coords
+            b = ord(encoded[index]) - 63
+            index += 1
+            result |= (b & 0x1F) << shift
+            shift += 5
+            if b < 0x20:
+                break
+        dlon = ~(result >> 1) if (result & 1) else (result >> 1)
+        lon += dlon
+        coords.append((lat / factor, lon / factor))
+    return coords
+
+
+def cumulative_route_distances_km(geometry: list[tuple[float, float]]) -> list[float]:
+    if not geometry:
+        return [0.0]
+    cumulative: list[float] = [0.0]
+    total = 0.0
+    for idx in range(1, len(geometry)):
+        lat1, lon1 = geometry[idx - 1]
+        lat2, lon2 = geometry[idx]
+        total += haversine_km(lat1, lon1, lat2, lon2)
+        cumulative.append(total)
+    return cumulative
+
+
+def interpolate_on_geometry(
+    geometry: list[tuple[float, float]],
+    cumulative_km: list[float],
+    progress: float,
+) -> tuple[float, float, float]:
+    if not geometry:
+        return 40.7580, -73.9855, 0.0
+    if len(geometry) == 1 or not cumulative_km or cumulative_km[-1] <= 0:
+        lat, lon = geometry[-1]
+        return lat, lon, 0.0
+
+    p = max(0.0, min(1.0, float(progress)))
+    target_km = p * cumulative_km[-1]
+    for idx in range(1, len(cumulative_km)):
+        if cumulative_km[idx] >= target_km:
+            start_km = cumulative_km[idx - 1]
+            end_km = cumulative_km[idx]
+            span = end_km - start_km
+            ratio = 0.0 if span <= 0 else (target_km - start_km) / span
+            lat1, lon1 = geometry[idx - 1]
+            lat2, lon2 = geometry[idx]
+            lat = lat1 + (lat2 - lat1) * ratio
+            lon = lon1 + (lon2 - lon1) * ratio
+            return lat, lon, bearing_deg(lat1, lon1, lat2, lon2)
+
+    lat_last, lon_last = geometry[-1]
+    lat_prev, lon_prev = geometry[-2]
+    return lat_last, lon_last, bearing_deg(lat_prev, lon_prev, lat_last, lon_last)
+
+
+def source_platform_for_route(base_platform: str, route_source: str) -> str:
+    base = (base_platform or "unknown").strip() or "unknown"
+    if "|route=" in base:
+        base_parts = [part for part in base.split("|") if part and not part.startswith("route=")]
+        base = "|".join(base_parts) or "unknown"
+    source = "osrm" if (route_source or "").strip().lower() == "osrm" else "linear"
+    return f"{base}|route={source}"
 
 
 def _parse_month(month: str) -> tuple[int, int]:
@@ -223,6 +325,9 @@ class Trip:
         "avg_speed_kmh",
         "bearing",
         "position_zone_id",
+        "route_source",
+        "route_geometry",
+        "route_cumulative_km",
     )
 
     def __init__(
@@ -264,12 +369,19 @@ class Trip:
         self.avg_speed_kmh = min(90.0, max(5.0, trip_km / duration_h))
         self.bearing = bearing_deg(pickup_lat, pickup_lon, dropoff_lat, dropoff_lon)
         self.position_zone_id = f"nyc_{pu_loc}"
+        self.route_source = "linear"
+        self.route_geometry = [
+            (pickup_lat, pickup_lon),
+            (dropoff_lat, dropoff_lon),
+        ]
+        self.route_cumulative_km = cumulative_route_distances_km(self.route_geometry)
 
 
 class TLCReplay:
     def __init__(self, month: str) -> None:
         self.producer: AIOKafkaProducer | None = None
         self.redis: aioredis.Redis | None = None
+        self.osrm_client: httpx.AsyncClient | None = None
         self.month = month
         self.sorted_path = TLC_DATA_DIR / f"hvfhv_sorted_{self.month}.parquet"
         self.raw_path = TLC_DATA_DIR / f"fhvhv_tripdata_{self.month}.parquet"
@@ -282,7 +394,16 @@ class TLCReplay:
         self.stats_emitted_events = 0
         self.stats_dropped_no_capacity = 0
         self.stats_skipped_sample = 0
+        self.stats_route_osrm_success = 0
+        self.stats_route_linear_mode = 0
+        self.stats_route_linear_fallback = 0
+        self.stats_route_osrm_errors = 0
+        self.stats_route_cache_hits = 0
+        self.stats_route_cache_misses = 0
+        self.last_route_source = "linear"
         self._stop_flag = False
+        self.route_cache: dict[tuple[int, int], tuple[str, list[tuple[float, float]], list[float]]] = {}
+        self.route_cache_order: deque[tuple[int, int]] = deque()
         # Exposed to scenario modules (single_driver) so they don't reach
         # into module-level globals.
         self.speed_factor = TLC_SPEED_FACTOR
@@ -299,6 +420,15 @@ class TLCReplay:
         self.stats_emitted_events = 0
         self.stats_dropped_no_capacity = 0
         self.stats_skipped_sample = 0
+        self.stats_route_osrm_success = 0
+        self.stats_route_linear_mode = 0
+        self.stats_route_linear_fallback = 0
+        self.stats_route_osrm_errors = 0
+        self.stats_route_cache_hits = 0
+        self.stats_route_cache_misses = 0
+        self.last_route_source = "linear"
+        self.route_cache = {}
+        self.route_cache_order = deque()
 
     async def start(self) -> None:
         TLC_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -312,6 +442,8 @@ class TLCReplay:
         )
         await self.producer.start()
         self.redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+        if TLC_ROUTE_MODE == "osrm":
+            self.osrm_client = httpx.AsyncClient(timeout=TLC_ROUTE_OSRM_TIMEOUT_S)
         await self._status(state="starting", message="connected_kafka_redis")
 
     async def close(self) -> None:
@@ -319,6 +451,9 @@ class TLCReplay:
             await self.producer.stop()
         if self.redis is not None:
             await self.redis.aclose()
+        if self.osrm_client is not None:
+            await self.osrm_client.aclose()
+            self.osrm_client = None
         try:
             self.duck.close()
         except Exception:
@@ -337,6 +472,102 @@ class TLCReplay:
     def _centroid(self, loc_id: int) -> tuple[float, float]:
         return self.centroids.get(int(loc_id), (40.7580, -73.9855))
 
+    def _route_cache_put(
+        self,
+        key: tuple[int, int],
+        source: str,
+        geometry: list[tuple[float, float]],
+        cumulative_km: list[float],
+    ) -> None:
+        if key in self.route_cache:
+            return
+        self.route_cache[key] = (source, geometry, cumulative_km)
+        self.route_cache_order.append(key)
+        max_size = max(int(TLC_ROUTE_CACHE_MAX), 1)
+        if len(self.route_cache_order) > max_size:
+            oldest = self.route_cache_order.popleft()
+            self.route_cache.pop(oldest, None)
+
+    async def _fetch_osrm_geometry(
+        self,
+        origin_lat: float,
+        origin_lon: float,
+        dest_lat: float,
+        dest_lon: float,
+    ) -> list[tuple[float, float]]:
+        if self.osrm_client is None:
+            raise RuntimeError("osrm_client_not_initialized")
+        coords = f"{origin_lon:.6f},{origin_lat:.6f};{dest_lon:.6f},{dest_lat:.6f}"
+        url = f"{TLC_ROUTE_OSRM_URL}/route/v1/driving/{coords}"
+        params = {
+            "overview": "full",
+            "geometries": "polyline",
+            "steps": "false",
+            "annotations": "false",
+        }
+        response = await self.osrm_client.get(url, params=params)
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("code") != "Ok":
+            raise RuntimeError(f"osrm_code_{payload.get('code')}")
+        routes = payload.get("routes") or []
+        if not routes:
+            raise RuntimeError("osrm_no_routes")
+        geometry = decode_polyline(routes[0].get("geometry", ""), precision=5)
+        if len(geometry) < 2:
+            raise RuntimeError("osrm_empty_geometry")
+        return geometry
+
+    async def _prepare_trip_route(self, trip: Trip) -> None:
+        key = (int(trip.pu_loc), int(trip.do_loc))
+        cached = self.route_cache.get(key)
+        if cached is not None:
+            self.stats_route_cache_hits += 1
+            source, geometry, cumulative_km = cached
+            trip.route_source = source
+            trip.route_geometry = list(geometry)
+            trip.route_cumulative_km = list(cumulative_km)
+            self.last_route_source = source
+            return
+
+        self.stats_route_cache_misses += 1
+        source = "linear"
+        geometry = [
+            (trip.pickup_lat, trip.pickup_lon),
+            (trip.dropoff_lat, trip.dropoff_lon),
+        ]
+        cumulative_km = cumulative_route_distances_km(geometry)
+
+        if TLC_ROUTE_MODE == "osrm":
+            try:
+                geometry = await self._fetch_osrm_geometry(
+                    trip.pickup_lat,
+                    trip.pickup_lon,
+                    trip.dropoff_lat,
+                    trip.dropoff_lon,
+                )
+                cumulative_km = cumulative_route_distances_km(geometry)
+                source = "osrm"
+                self.stats_route_osrm_success += 1
+            except Exception as exc:
+                self.stats_route_osrm_errors += 1
+                self.stats_route_linear_fallback += 1
+                log.debug(
+                    "trip %s route fallback to linear (%s -> %s): %s",
+                    trip.trip_key,
+                    trip.pu_loc,
+                    trip.do_loc,
+                    exc,
+                )
+        else:
+            self.stats_route_linear_mode += 1
+
+        trip.route_source = source
+        trip.route_geometry = geometry
+        trip.route_cumulative_km = cumulative_km
+        self.last_route_source = source
+        self._route_cache_put(key, source, geometry, cumulative_km)
+
     async def _status(self, **mapping: Any) -> None:
         if self.redis is None:
             return
@@ -346,6 +577,15 @@ class TLCReplay:
         payload["speed_factor"] = str(TLC_SPEED_FACTOR)
         payload["sample_rate"] = str(TLC_TRIP_SAMPLE_RATE)
         payload["max_active"] = str(TLC_MAX_ACTIVE_TRIPS)
+        payload["trajectory_mode"] = TLC_ROUTE_MODE
+        payload["route_cache_size"] = str(len(self.route_cache))
+        payload["route_cache_hits"] = str(self.stats_route_cache_hits)
+        payload["route_cache_misses"] = str(self.stats_route_cache_misses)
+        payload["route_osrm_success"] = str(self.stats_route_osrm_success)
+        payload["route_linear_mode"] = str(self.stats_route_linear_mode)
+        payload["route_linear_fallback"] = str(self.stats_route_linear_fallback)
+        payload["route_osrm_errors"] = str(self.stats_route_osrm_errors)
+        payload["route_source_last"] = self.last_route_source
         await self.redis.hset(STATUS_KEY, mapping=payload)
         await self.redis.expire(STATUS_KEY, 86400)
 
@@ -530,7 +770,7 @@ class TLCReplay:
             weather_factor=1.0,
             traffic_factor=1.0,
             zone_id=f"nyc_{trip.pu_loc}",
-            source_platform=TLC_SOURCE_PLATFORM,
+            source_platform=source_platform_for_route(TLC_SOURCE_PLATFORM, trip.route_source),
         )
 
     def _build_event(self, trip: Trip, status: str, ts: datetime, actuals: bool) -> OrderEventV1:
@@ -546,10 +786,20 @@ class TLCReplay:
             actual_distance_km=trip.trip_km if actuals else 0.0,
             actual_duration_min=trip.trip_min if actuals else 0.0,
             zone_id=f"nyc_{trip.pu_loc}",
-            source_platform=TLC_SOURCE_PLATFORM,
+            source_platform=source_platform_for_route(TLC_SOURCE_PLATFORM, trip.route_source),
         )
 
-    def _build_position(self, trip: Trip, lat: float, lon: float, ts: datetime, status: str) -> CourierPositionV1:
+    def _build_position(
+        self,
+        trip: Trip,
+        lat: float,
+        lon: float,
+        ts: datetime,
+        status: str,
+        *,
+        heading_deg_override: float | None = None,
+    ) -> CourierPositionV1:
+        heading = float(heading_deg_override) if heading_deg_override is not None else float(trip.bearing)
         return CourierPositionV1(
             event_id=make_event_id(f"pos_{status}", f"{trip.trip_key}_{int(ts.timestamp())}"),
             event_type="courier.position.v1",
@@ -558,11 +808,11 @@ class TLCReplay:
             lat=round(lat, 6),
             lon=round(lon, 6),
             speed_kmh=round(trip.avg_speed_kmh, 1) if status != "pickup_arrived" else 0.0,
-            heading_deg=round(trip.bearing, 1),
+            heading_deg=round(heading, 1),
             status=status,
             accuracy_m=8.0,
             battery_pct=100.0,
-            source_platform=TLC_SOURCE_PLATFORM,
+            source_platform=source_platform_for_route(TLC_SOURCE_PLATFORM, trip.route_source),
         )
 
     async def _emit_trip_start(self, trip: Trip) -> None:
@@ -584,9 +834,19 @@ class TLCReplay:
             return
         elapsed = (now - trip.pickup_ts).total_seconds()
         progress = max(0.0, min(1.0, elapsed / total))
-        lat = trip.pickup_lat + (trip.dropoff_lat - trip.pickup_lat) * progress
-        lon = trip.pickup_lon + (trip.dropoff_lon - trip.pickup_lon) * progress
-        pos = self._build_position(trip, lat, lon, now, "delivering")
+        lat, lon, heading = interpolate_on_geometry(
+            trip.route_geometry,
+            trip.route_cumulative_km,
+            progress,
+        )
+        pos = self._build_position(
+            trip,
+            lat,
+            lon,
+            now,
+            "delivering",
+            heading_deg_override=heading,
+        )
         await self._send(COURIER_TOPIC, trip.courier_id, pos.SerializeToString())
         self.stats_emitted_positions += 1
 
@@ -602,13 +862,14 @@ class TLCReplay:
     async def replay(self, total_rows: int) -> None:
         cursor = await self._load_cursor()
         log.info(
-            "replay starting cursor=%d/%d speed=%.1fx sample=%.2f max_active=%d tick=%.1fs",
+            "replay starting cursor=%d/%d speed=%.1fx sample=%.2f max_active=%d tick=%.1fs trajectory_mode=%s",
             cursor,
             total_rows,
             TLC_SPEED_FACTOR,
             TLC_TRIP_SAMPLE_RATE,
             TLC_MAX_ACTIVE_TRIPS,
             TLC_TICK_INTERVAL_SEC,
+            TLC_ROUTE_MODE,
         )
 
         result = self.duck.execute(
@@ -653,6 +914,7 @@ class TLCReplay:
                 elif pending.courier_id in self.active_trips:
                     self.stats_dropped_no_capacity += 1
                 else:
+                    await self._prepare_trip_route(pending)
                     self.active_trips[pending.courier_id] = pending
                     await self._emit_trip_start(pending)
                 pending = await asyncio.to_thread(_fetch_next_trip)
@@ -685,7 +947,7 @@ class TLCReplay:
                     dropped_no_capacity=self.stats_dropped_no_capacity,
                 )
                 log.info(
-                    "tick=%d cursor=%d/%d (%.2f%%) vtime=%s active=%d offers=%d pos=%d evt=%d dropped=%d",
+                    "tick=%d cursor=%d/%d (%.2f%%) vtime=%s active=%d offers=%d pos=%d evt=%d dropped=%d route(osrm=%d linear_mode=%d linear_fallback=%d cache=%d/%d)",
                     tick_count,
                     cursor,
                     total_rows,
@@ -696,6 +958,11 @@ class TLCReplay:
                     self.stats_emitted_positions,
                     self.stats_emitted_events,
                     self.stats_dropped_no_capacity,
+                    self.stats_route_osrm_success,
+                    self.stats_route_linear_mode,
+                    self.stats_route_linear_fallback,
+                    self.stats_route_cache_hits,
+                    self.stats_route_cache_misses,
                 )
                 last_log = now_wall
 
