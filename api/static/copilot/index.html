@@ -623,6 +623,60 @@
       color: var(--ink-soft);
     }
 
+    .replay-wrap {
+      display: grid;
+      gap: 8px;
+    }
+
+    .replay-board {
+      min-height: 220px;
+      display: grid;
+      place-items: center;
+      color: var(--ink-soft);
+      font-size: 0.8rem;
+      text-align: center;
+      line-height: 1.4;
+    }
+
+    .replay-board.map-ready {
+      min-height: 280px;
+    }
+
+    .replay-controls {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.75);
+      padding: 8px 10px;
+      display: grid;
+      gap: 6px;
+    }
+
+    .replay-controls input[type="range"] {
+      width: 100%;
+      min-height: 26px;
+      accent-color: var(--accent-strong);
+      cursor: pointer;
+    }
+
+    .replay-controls input[type="range"]:disabled {
+      cursor: not-allowed;
+      opacity: 0.55;
+    }
+
+    .replay-cursor {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+      font-size: 0.76rem;
+      color: var(--ink-soft);
+    }
+
+    .replay-cursor strong {
+      color: var(--ink);
+      font-size: 0.8rem;
+    }
+
     .timeline {
       display: grid;
       gap: 8px;
@@ -638,6 +692,14 @@
       display: grid;
       gap: 4px;
       font-size: 0.78rem;
+      cursor: pointer;
+      transition: border-color 120ms ease, box-shadow 120ms ease;
+    }
+
+    .event-row:hover,
+    .event-row.active {
+      border-color: rgba(14, 116, 144, 0.35);
+      box-shadow: 0 0 0 2px rgba(14, 116, 144, 0.12);
     }
 
     .event-row strong { font-size: 0.8rem; }
@@ -921,6 +983,16 @@
         <section class="card glass">
           <h2>Replay Timeline</h2>
           <div class="info-line" id="replaySummary">No replay requested yet.</div>
+          <div class="replay-wrap">
+            <div class="map-board replay-board" id="replayMap">Replay map pending...</div>
+            <div class="replay-controls">
+              <input id="replayScrubber" type="range" min="0" max="0" value="0" step="1" disabled aria-label="Replay timeline scrubber" />
+              <div class="replay-cursor">
+                <strong id="replayCursorLabel">t-</strong>
+                <span id="replayCursorStatus">Load replay data to inspect mission trajectory.</span>
+              </div>
+            </div>
+          </div>
           <div class="timeline" id="replayTimeline"></div>
         </section>
       </div>

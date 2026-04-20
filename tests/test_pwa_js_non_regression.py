@@ -457,16 +457,53 @@ async function fetchStub(url, _opts) {{
   }}
   if (path === '/copilot/replay') {{
     return ok({{
-      count: 1,
-      events: [{{
-        event_type: '<img src=x onerror=1>',
-        status: 'ok',
-        offer_id: 'off_demo_001',
-        order_id: 'order_001',
-        zone_id: 'midtown',
-        ts: nowTs,
-        topic: 'copilot',
-      }}],
+      count: 4,
+      events: [
+        {{
+          event_type: 'courier.position.v1',
+          status: 'delivering',
+          offer_id: '',
+          order_id: '',
+          zone_id: 'midtown',
+          ts: '2026-04-17T19:57:00Z',
+          topic: 'livreurs-gps',
+          lat: 40.758,
+          lon: -73.9855,
+          speed_kmh: 18.5,
+          heading_deg: 95,
+        }},
+        {{
+          event_type: '<img src=x onerror=1>',
+          status: 'accepted',
+          offer_id: 'off_demo_001',
+          order_id: 'order_001',
+          zone_id: 'midtown',
+          ts: '2026-04-17T19:58:00Z',
+          topic: 'order-events-v1',
+        }},
+        {{
+          event_type: 'courier.position.v1',
+          status: 'delivering',
+          offer_id: '',
+          order_id: '',
+          zone_id: 'midtown',
+          ts: '2026-04-17T19:59:00Z',
+          topic: 'livreurs-gps',
+          lat: 40.7592,
+          lon: -73.9824,
+          speed_kmh: 16.2,
+          heading_deg: 98,
+        }},
+        {{
+          event_type: 'order.event.v1',
+          status: 'dropped_off',
+          offer_id: 'off_demo_001',
+          order_id: 'order_001',
+          zone_id: 'midtown',
+          ts: nowTs,
+          topic: 'order-events-v1',
+        }},
+      ],
     }});
   }}
 
@@ -558,7 +595,9 @@ async function main() {{
     process.exit(1);
   }}
   const replayRows = getNode('replayTimeline').children || [];
-  const replayHtml = replayRows.length ? String(replayRows[0].innerHTML || '') : '';
+  const replayHtml = replayRows.length
+    ? replayRows.map((row) => String(row.innerHTML || '')).join(' ')
+    : '';
   if (!replayRows.length) {{
     realConsole.error('expected replay timeline row to be rendered');
     process.exit(1);
@@ -569,6 +608,20 @@ async function main() {{
   }}
   if (!replayHtml.includes('&lt;img')) {{
     realConsole.error('expected escaped replay marker in HTML, got', replayHtml);
+    process.exit(1);
+  }}
+  const replayScrubber = getNode('replayScrubber');
+  if (replayScrubber.disabled) {{
+    realConsole.error('expected replay scrubber to be enabled when position events exist');
+    process.exit(1);
+  }}
+  if (Number(replayScrubber.max) < 1) {{
+    realConsole.error('expected replay scrubber max to reflect trajectory length, got', replayScrubber.max);
+    process.exit(1);
+  }}
+  const replayCursorStatus = String(getNode('replayCursorStatus').textContent || '');
+  if (!replayCursorStatus.toLowerCase().includes('lat')) {{
+    realConsole.error('expected replay cursor status to include coordinates, got', replayCursorStatus);
     process.exit(1);
   }}
 
@@ -676,6 +729,11 @@ def test_pwa_index_contains_decision_flow_region() -> None:
     assert 'id="objWeightTime"' in content
     assert 'id="objWeightFuel"' in content
     assert 'id="objectiveWeightStatus"' in content
+    assert 'id="replayMap"' in content
+    assert 'id="replayScrubber"' in content
+    assert 'id="replayCursorLabel"' in content
+    assert 'id="replayCursorStatus"' in content
+    assert 'aria-label="Replay timeline scrubber"' in content
     assert 'aria-live="polite"' in content
 
 
