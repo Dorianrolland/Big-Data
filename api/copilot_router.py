@@ -68,6 +68,7 @@ def _env_int(name: str, default: int, *, min_value: int | None = None, max_value
 
 
 EVENTS_PATH = Path(os.getenv("EVENTS_PATH", "/data/parquet_events"))
+POSITIONS_PATH = Path(os.getenv("DATA_PATH", "/data/parquet"))
 MODEL_PATH = Path(os.getenv("MODEL_PATH", "/data/models/copilot_model.joblib"))
 OSRM_URL = os.getenv("OSRM_URL", "http://osrm:5000")
 MODEL_MIN_ROWS = int(os.getenv("COPILOT_MODEL_MIN_ROWS", "300"))
@@ -800,6 +801,38 @@ def _existing_parquet_globs(globs: list[str]) -> list[str]:
         except OSError:
             continue
     return existing
+
+
+def _duckdb_sql_quote(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _finite_float_or_none(value: Any) -> float | None:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(out):
+        return None
+    return out
+
+
+def _hourly_partition_globs(root: Path, from_dt: datetime, to_dt: datetime) -> list[str]:
+    globs: list[str] = []
+    cursor = from_dt.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    stop = to_dt.astimezone(timezone.utc)
+    while cursor <= stop:
+        partition_path = (
+            root
+            / f"year={cursor.year}"
+            / f"month={cursor.month:02d}"
+            / f"day={cursor.day:02d}"
+            / f"hour={cursor.hour:02d}"
+            / "*.parquet"
+        )
+        globs.append(str(partition_path).replace("\\", "/"))
+        cursor += timedelta(hours=1)
+    return globs
 
 
 def _parse_fuel_price_usd_gallon(xml_text: str, grade: str) -> float:
@@ -3150,8 +3183,11 @@ async def replay(
     driver_id: str | None = Query(None),
     limit: int = Query(500, ge=1, le=5000),
 ):
-    if not EVENTS_PATH.exists():
-        raise HTTPException(status_code=404, detail=f"events path missing: {EVENTS_PATH}")
+    if not EVENTS_PATH.exists() and not POSITIONS_PATH.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"replay paths missing: events={EVENTS_PATH}, positions={POSITIONS_PATH}",
+        )
 
     try:
         from_dt = datetime.fromisoformat(from_ts)
@@ -3168,30 +3204,81 @@ async def replay(
     if (to_dt - from_dt) > timedelta(days=7):
         raise HTTPException(status_code=400, detail="range too large (>7 days)")
 
-    globs: list[str] = []
-    cursor = from_dt.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
-    stop = to_dt.astimezone(timezone.utc)
-    while cursor <= stop:
-        partition_path = (
-            EVENTS_PATH
-            / "topic=*"
-            / f"year={cursor.year}"
-            / f"month={cursor.month:02d}"
-            / f"day={cursor.day:02d}"
-            / f"hour={cursor.hour:02d}"
-            / "*.parquet"
+    event_globs = _hourly_partition_globs(EVENTS_PATH / "topic=*", from_dt, to_dt)
+    position_globs = _hourly_partition_globs(POSITIONS_PATH, from_dt, to_dt)
+    existing_event_globs = _existing_parquet_globs(event_globs)
+    existing_position_globs = _existing_parquet_globs(position_globs)
+    if not existing_event_globs and not existing_position_globs:
+        return {"from": from_ts, "to": to_ts, "driver_id": driver_id, "count": 0, "events": []}
+
+    select_parts: list[str] = []
+    params: list[Any] = []
+
+    if existing_event_globs:
+        event_glob_list_sql = "[" + ", ".join(_duckdb_sql_quote(g) for g in existing_event_globs) + "]"
+        select_parts.append(
+            f"""
+            SELECT
+                ts,
+                topic,
+                event_type,
+                event_id,
+                courier_id,
+                offer_id,
+                order_id,
+                status,
+                zone_id,
+                estimated_fare_eur,
+                actual_fare_eur,
+                demand_index,
+                supply_index,
+                source_platform,
+                CAST(NULL AS DOUBLE) AS lat,
+                CAST(NULL AS DOUBLE) AS lon,
+                CAST(NULL AS REAL) AS speed_kmh,
+                CAST(NULL AS REAL) AS heading_deg,
+                CAST(NULL AS REAL) AS accuracy_m,
+                CAST(NULL AS REAL) AS battery_pct
+            FROM read_parquet({event_glob_list_sql}, hive_partitioning = true)
+            WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
+              AND (? IS NULL OR courier_id = ?)
+            """
         )
-        globs.append(str(partition_path).replace("\\", "/"))
-        cursor += timedelta(hours=1)
+        params.extend([from_ts, to_ts, driver_id, driver_id])
 
-    if not globs:
-        return {"from": from_ts, "to": to_ts, "driver_id": driver_id, "count": 0, "events": []}
+    if existing_position_globs:
+        position_glob_list_sql = "[" + ", ".join(_duckdb_sql_quote(g) for g in existing_position_globs) + "]"
+        select_parts.append(
+            f"""
+            SELECT
+                ts,
+                'livreurs-gps' AS topic,
+                'courier.position.v1' AS event_type,
+                '' AS event_id,
+                livreur_id AS courier_id,
+                '' AS offer_id,
+                '' AS order_id,
+                COALESCE(status, 'unknown') AS status,
+                '' AS zone_id,
+                CAST(NULL AS REAL) AS estimated_fare_eur,
+                CAST(NULL AS REAL) AS actual_fare_eur,
+                CAST(NULL AS REAL) AS demand_index,
+                CAST(NULL AS REAL) AS supply_index,
+                'position_lake' AS source_platform,
+                lat,
+                lon,
+                speed_kmh,
+                heading_deg,
+                accuracy_m,
+                battery_pct
+            FROM read_parquet({position_glob_list_sql}, hive_partitioning = true)
+            WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
+              AND (? IS NULL OR livreur_id = ?)
+            """
+        )
+        params.extend([from_ts, to_ts, driver_id, driver_id])
 
-    existing_globs = _existing_parquet_globs(globs)
-    if not existing_globs:
-        return {"from": from_ts, "to": to_ts, "driver_id": driver_id, "count": 0, "events": []}
-
-    glob_list_sql = "[" + ", ".join(f"'{g}'" for g in existing_globs) + "]"
+    union_sql = "\nUNION ALL\n".join(select_parts)
     rows = await _duck_query(
         request,
         f"""
@@ -3209,14 +3296,20 @@ async def replay(
             actual_fare_eur,
             demand_index,
             supply_index,
-            source_platform
-        FROM read_parquet({glob_list_sql}, hive_partitioning = true)
-        WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
-          AND (? IS NULL OR courier_id = ?)
+            source_platform,
+            lat,
+            lon,
+            speed_kmh,
+            heading_deg,
+            accuracy_m,
+            battery_pct
+        FROM (
+            {union_sql}
+        ) replay_data
         ORDER BY ts
         LIMIT ?
         """,
-        [from_ts, to_ts, driver_id, driver_id, limit],
+        [*params, limit],
     )
 
     return {
@@ -3235,11 +3328,17 @@ async def replay(
                 "order_id": r[6],
                 "status": r[7],
                 "zone_id": r[8],
-                "estimated_fare_eur": r[9],
-                "actual_fare_eur": r[10],
-                "demand_index": r[11],
-                "supply_index": r[12],
+                "estimated_fare_eur": _finite_float_or_none(r[9]),
+                "actual_fare_eur": _finite_float_or_none(r[10]),
+                "demand_index": _finite_float_or_none(r[11]),
+                "supply_index": _finite_float_or_none(r[12]),
                 "source_platform": r[13],
+                "lat": _finite_float_or_none(r[14]),
+                "lon": _finite_float_or_none(r[15]),
+                "speed_kmh": _finite_float_or_none(r[16]),
+                "heading_deg": _finite_float_or_none(r[17]),
+                "accuracy_m": _finite_float_or_none(r[18]),
+                "battery_pct": _finite_float_or_none(r[19]),
             }
             for r in rows
         ],

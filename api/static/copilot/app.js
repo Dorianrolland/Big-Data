@@ -22,6 +22,8 @@ const state = {
   driverProfile: null,
   driverProfileError: null,
   replay: [],
+  replayVisual: null,
+  replayCursorIndex: 0,
   selectedOfferKey: null,
   selectedOfferSource: null,
   flowStep: 'choose',
@@ -69,6 +71,10 @@ const zonesEl = $('zones');
 const shiftPlanSummaryEl = $('shiftPlanSummary');
 const shiftPlanEl = $('shiftPlanList');
 const replaySummary = $('replaySummary');
+const replayMapEl = $('replayMap');
+const replayScrubberEl = $('replayScrubber');
+const replayCursorLabelEl = $('replayCursorLabel');
+const replayCursorStatusEl = $('replayCursorStatus');
 const replayTimeline = $('replayTimeline');
 const uxStatusLine = $('uxStatusLine');
 
@@ -628,6 +634,16 @@ const dispatchMapState = {
   originLayer: null,
   clusterEnabled: false,
   canvasId: 'dispatchLeafletCanvas',
+};
+
+const replayMapState = {
+  map: null,
+  pathLayer: null,
+  eventLayer: null,
+  cursorLayer: null,
+  cursorMarker: null,
+  canvasId: 'replayLeafletCanvas',
+  initialized: false,
 };
 
 const DISPATCH_MAP_DEFAULT = {
@@ -2029,49 +2045,399 @@ function renderShiftPlan() {
   });
 }
 
-function renderReplay() {
-  const events = state.replay;
-  kpiReplay.textContent = String(events.length);
+function parseReplayTsMs(value) {
+  const ms = Date.parse(String(value || ''));
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function isValidReplayCoord(lat, lon) {
+  return lat != null && lon != null && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180;
+}
+
+function replayEventKind(evt) {
+  const status = String(evt?.status || '').toLowerCase();
+  const eventType = String(evt?.event_type || '').toLowerCase();
+  if (status.includes('reject')) return 'reject';
+  if (status.includes('accept')) return 'accept';
+  if (status.includes('drop')) return 'dropoff';
+  if (status.includes('offer') || eventType.includes('offer')) return 'offer';
+  return 'event';
+}
+
+function nearestReplayPositionIndex(positions, tsMs) {
+  if (!Array.isArray(positions) || !positions.length) return -1;
+  if (!Number.isFinite(Number(tsMs))) return positions.length - 1;
+  const target = Number(tsMs);
+  let bestIdx = 0;
+  let bestDelta = Math.abs(Number(positions[0].tsMs || 0) - target);
+  for (let i = 1; i < positions.length; i += 1) {
+    const delta = Math.abs(Number(positions[i].tsMs || 0) - target);
+    if (delta < bestDelta) {
+      bestDelta = delta;
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
+}
+
+function buildReplayVisual(events) {
+  const normalized = (Array.isArray(events) ? events : [])
+    .map((evt, idx) => {
+      const tsMs = parseReplayTsMs(evt?.ts);
+      const eventType = String(evt?.event_type || '');
+      const topic = String(evt?.topic || '');
+      const lat = asFloatOrNull(evt?.lat);
+      const lon = asFloatOrNull(evt?.lon);
+      const hasCoord = isValidReplayCoord(lat, lon);
+      const isPosition =
+        eventType.toLowerCase() === 'courier.position.v1' ||
+        topic.toLowerCase() === 'livreurs-gps' ||
+        (hasCoord && !evt?.offer_id && !evt?.order_id);
+      return {
+        raw: evt || {},
+        idx,
+        tsMs,
+        eventType,
+        topic,
+        lat,
+        lon,
+        hasCoord,
+        isPosition,
+        kind: replayEventKind(evt),
+      };
+    })
+    .sort((a, b) => {
+      const ta = a.tsMs == null ? Number.MAX_SAFE_INTEGER : a.tsMs;
+      const tb = b.tsMs == null ? Number.MAX_SAFE_INTEGER : b.tsMs;
+      if (ta !== tb) return ta - tb;
+      return a.idx - b.idx;
+    });
+
+  const positions = normalized
+    .filter((evt) => evt.isPosition && evt.hasCoord)
+    .map((evt, idx) => ({
+      idx,
+      ts: String(evt.raw?.ts || ''),
+      tsMs: evt.tsMs,
+      lat: evt.lat,
+      lon: evt.lon,
+      status: String(evt.raw?.status || 'n/a'),
+      speedKmh: asFloatOrNull(evt.raw?.speed_kmh),
+      headingDeg: asFloatOrNull(evt.raw?.heading_deg),
+      eventType: evt.eventType,
+      topic: evt.topic,
+    }));
+
+  const keyEvents = normalized
+    .filter((evt) => !evt.isPosition)
+    .map((evt) => {
+      let lat = evt.hasCoord ? evt.lat : null;
+      let lon = evt.hasCoord ? evt.lon : null;
+      const nearestPositionIndex = nearestReplayPositionIndex(positions, evt.tsMs);
+      if (!isValidReplayCoord(lat, lon) && nearestPositionIndex >= 0) {
+        lat = positions[nearestPositionIndex].lat;
+        lon = positions[nearestPositionIndex].lon;
+      }
+      return {
+        kind: evt.kind,
+        ts: String(evt.raw?.ts || ''),
+        tsMs: evt.tsMs,
+        eventType: evt.eventType,
+        status: String(evt.raw?.status || 'n/a'),
+        offerId: String(evt.raw?.offer_id || ''),
+        orderId: String(evt.raw?.order_id || ''),
+        zoneId: String(evt.raw?.zone_id || ''),
+        topic: evt.topic,
+        lat,
+        lon,
+        positionIndex: nearestPositionIndex,
+      };
+    });
+
+  return { events: normalized, positions, keyEvents };
+}
+
+function clearReplayLeafletLayers() {
+  if (replayMapState.pathLayer) replayMapState.pathLayer.clearLayers();
+  if (replayMapState.eventLayer) replayMapState.eventLayer.clearLayers();
+  if (replayMapState.cursorLayer) replayMapState.cursorLayer.clearLayers();
+  replayMapState.cursorMarker = null;
+}
+
+function ensureReplayLeafletMap() {
+  if (!replayMapEl || !canUseLeaflet()) return null;
+  if (replayMapState.map) return replayMapState.map;
+
+  replayMapEl.classList.add('map-ready');
+  replayMapEl.innerHTML = `<div id="${replayMapState.canvasId}" class="dispatch-leaflet replay-leaflet"></div>`;
+
+  const map = window.L.map(replayMapState.canvasId, {
+    zoomControl: true,
+    attributionControl: true,
+  });
+  window.L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap contributors',
+  }).addTo(map);
+
+  replayMapState.map = map;
+  replayMapState.pathLayer = window.L.layerGroup().addTo(map);
+  replayMapState.eventLayer = window.L.layerGroup().addTo(map);
+  replayMapState.cursorLayer = window.L.layerGroup().addTo(map);
+  replayMapState.initialized = true;
+  map.setView([DISPATCH_MAP_DEFAULT.lat, DISPATCH_MAP_DEFAULT.lon], DISPATCH_MAP_DEFAULT.zoom);
+  setTimeout(() => map.invalidateSize(), 0);
+  return map;
+}
+
+function renderReplayMap(model) {
+  if (!replayMapEl) return;
+
+  if (!model.positions.length) {
+    if (replayMapState.map) {
+      clearReplayLeafletLayers();
+      replayMapState.map.setView([DISPATCH_MAP_DEFAULT.lat, DISPATCH_MAP_DEFAULT.lon], DISPATCH_MAP_DEFAULT.zoom);
+    } else {
+      replayMapEl.classList.remove('map-ready');
+      replayMapEl.textContent = 'Replay map unavailable: no courier positions in this window.';
+    }
+    return;
+  }
+
+  if (!canUseLeaflet()) {
+    replayMapEl.classList.remove('map-ready');
+    replayMapEl.textContent = `Replay fallback: ${model.positions.length} position samples loaded, map engine unavailable.`;
+    return;
+  }
+
+  const map = ensureReplayLeafletMap();
+  if (!map) {
+    replayMapEl.classList.remove('map-ready');
+    replayMapEl.textContent = `Replay fallback: ${model.positions.length} position samples loaded, map initialization failed.`;
+    return;
+  }
+
+  replayMapEl.classList.add('map-ready');
+  clearReplayLeafletLayers();
+
+  const latLngs = model.positions.map((p) => [p.lat, p.lon]);
+  const route = window.L.polyline(latLngs, {
+    color: '#0b7285',
+    weight: 4,
+    opacity: 0.8,
+  });
+  replayMapState.pathLayer.addLayer(route);
+
+  const start = model.positions[0];
+  const end = model.positions[model.positions.length - 1];
+  replayMapState.eventLayer.addLayer(
+    window.L.circleMarker([start.lat, start.lon], {
+      radius: 5,
+      color: '#15803d',
+      weight: 2,
+      fillColor: '#22c55e',
+      fillOpacity: 0.9,
+    }).bindPopup('start position')
+  );
+  replayMapState.eventLayer.addLayer(
+    window.L.circleMarker([end.lat, end.lon], {
+      radius: 5,
+      color: '#b45309',
+      weight: 2,
+      fillColor: '#f59e0b',
+      fillOpacity: 0.9,
+    }).bindPopup('latest position')
+  );
+
+  const kindColor = {
+    accept: '#15803d',
+    reject: '#b42318',
+    dropoff: '#b45309',
+    offer: '#2563eb',
+    event: '#475569',
+  };
+  model.keyEvents.slice(-60).forEach((evt) => {
+    if (!isValidReplayCoord(evt.lat, evt.lon)) return;
+    const color = kindColor[evt.kind] || kindColor.event;
+    const marker = window.L.circleMarker([evt.lat, evt.lon], {
+      radius: 4,
+      color,
+      weight: 2,
+      fillColor: color,
+      fillOpacity: 0.65,
+    });
+    const label = `${evt.eventType || 'event'} - ${evt.status || 'n/a'}`;
+    marker.bindPopup(escapeHtml(label));
+    replayMapState.eventLayer.addLayer(marker);
+  });
+
+  if (latLngs.length > 1) {
+    map.fitBounds(window.L.latLngBounds(latLngs).pad(0.16), { maxZoom: 15 });
+  } else {
+    map.setView(latLngs[0], 14);
+  }
+  map.invalidateSize();
+}
+
+function setReplayScrubberState(model) {
+  if (!replayScrubberEl) return;
+  const maxIdx = Math.max(0, model.positions.length - 1);
+  const currentIndex = Number.isFinite(Number(state.replayCursorIndex)) ? Number(state.replayCursorIndex) : 0;
+  replayScrubberEl.min = '0';
+  replayScrubberEl.max = String(maxIdx);
+  replayScrubberEl.step = '1';
+  if (!model.positions.length) {
+    replayScrubberEl.value = '0';
+    replayScrubberEl.disabled = true;
+    return;
+  }
+  replayScrubberEl.disabled = false;
+  replayScrubberEl.value = String(clamp(currentIndex, 0, maxIdx));
+}
+
+function setReplayCursor(index) {
+  const model = state.replayVisual;
+  if (!model || !Array.isArray(model.positions) || !model.positions.length) {
+    state.replayCursorIndex = 0;
+    if (replayCursorLabelEl) replayCursorLabelEl.textContent = 't-';
+    if (replayCursorStatusEl) replayCursorStatusEl.textContent = 'No position samples available in selected replay window.';
+    if (replayScrubberEl) replayScrubberEl.value = '0';
+    return;
+  }
+
+  const maxIdx = model.positions.length - 1;
+  const numericIndex = Number(index);
+  const safeIndex = clamp(Number.isFinite(numericIndex) ? numericIndex : maxIdx, 0, maxIdx);
+  state.replayCursorIndex = safeIndex;
+  if (replayScrubberEl) replayScrubberEl.value = String(safeIndex);
+
+  const point = model.positions[safeIndex];
+  const tsLabel = point.ts ? new Date(point.ts).toLocaleTimeString() : `sample #${safeIndex + 1}`;
+  if (replayCursorLabelEl) {
+    replayCursorLabelEl.textContent = `t ${safeIndex + 1}/${model.positions.length} - ${tsLabel}`;
+  }
+
+  const alignedEvents = model.keyEvents.filter((evt) => evt.positionIndex === safeIndex).slice(0, 2);
+  const alignedSummary = alignedEvents.length
+    ? alignedEvents.map((evt) => `${evt.kind.toUpperCase()} ${evt.status}`).join(' | ')
+    : 'no key event on this step';
+  const speedText = point.speedKmh == null ? '-' : `${fmt(point.speedKmh, 1)} km/h`;
+  const headingText = point.headingDeg == null ? '-' : `${fmt(point.headingDeg, 0)} deg`;
+  if (replayCursorStatusEl) {
+    replayCursorStatusEl.textContent =
+      `lat ${fmt(point.lat, 5)} lon ${fmt(point.lon, 5)} - speed ${speedText} - heading ${headingText} - ${alignedSummary}`;
+  }
+
+  if (replayMapState.map && replayMapState.cursorLayer) {
+    if (!replayMapState.cursorMarker) {
+      replayMapState.cursorMarker = window.L.circleMarker([point.lat, point.lon], {
+        radius: 7,
+        color: '#0f172a',
+        weight: 2,
+        fillColor: '#f8fafc',
+        fillOpacity: 1.0,
+      });
+      replayMapState.cursorLayer.addLayer(replayMapState.cursorMarker);
+    } else {
+      replayMapState.cursorMarker.setLatLng([point.lat, point.lon]);
+    }
+    const mapBounds = typeof replayMapState.map.getBounds === 'function' ? replayMapState.map.getBounds() : null;
+    if (mapBounds && typeof mapBounds.contains === 'function' && !mapBounds.contains([point.lat, point.lon])) {
+      replayMapState.map.panTo([point.lat, point.lon], { animate: false });
+    }
+  }
+
+  if (replayTimeline && replayTimeline.children) {
+    Array.from(replayTimeline.children).forEach((row) => {
+      const rowIndex = Number(row.getAttribute('data-replay-pos-index'));
+      row.classList.toggle('active', Number.isFinite(rowIndex) && rowIndex === safeIndex);
+    });
+  }
+}
+
+function renderReplayTimeline(model) {
   replayTimeline.innerHTML = '';
+  const rows = model.keyEvents.length ? model.keyEvents : model.events.filter((evt) => !evt.isPosition);
+
+  if (!rows.length) {
+    renderListState(replayTimeline, 'empty', 'Replay contains only position samples in this window.');
+    return;
+  }
+
+  rows.slice(-32).reverse().forEach((evt) => {
+    const row = document.createElement('div');
+    row.className = 'event-row';
+    if (evt.positionIndex >= 0) {
+      row.setAttribute('data-replay-pos-index', String(evt.positionIndex));
+      row.setAttribute('tabindex', '0');
+      row.setAttribute('role', 'button');
+      row.addEventListener('click', () => setReplayCursor(evt.positionIndex));
+      row.addEventListener('keydown', (event) => {
+        const key = String(event?.key || '');
+        if (key !== 'Enter' && key !== ' ') return;
+        event.preventDefault();
+        setReplayCursor(evt.positionIndex);
+      });
+    }
+
+    const eventType = escapeHtml(evt.eventType || 'event');
+    const status = escapeHtml(evt.status || 'n/a');
+    const offerId = escapeHtml(evt.offerId || '-');
+    const orderId = escapeHtml(evt.orderId || '-');
+    const zoneId = escapeHtml(evt.zoneId || '-');
+    const ts = escapeHtml(evt.ts || '-');
+    const topic = escapeHtml(evt.topic || '-');
+    const scrub = evt.positionIndex >= 0 ? `t+${evt.positionIndex + 1}` : 'n/a';
+    row.innerHTML = `
+      <strong>${eventType} - ${status}</strong>
+      <div>offer ${offerId} - order ${orderId} - zone ${zoneId}</div>
+      <div class="muted">${ts} - topic ${topic} - scrub ${scrub}</div>
+    `;
+    replayTimeline.appendChild(row);
+  });
+}
+
+function renderReplay() {
+  const events = Array.isArray(state.replay) ? state.replay : [];
+  kpiReplay.textContent = String(events.length);
 
   if (!events.length) {
-    replaySummary.textContent = 'No replay events in selected window.';
+    state.replayVisual = null;
+    state.replayCursorIndex = 0;
+    if (replayMapEl) {
+      replayMapEl.classList.remove('map-ready');
+      replayMapEl.textContent = 'Replay map pending...';
+    }
+    if (replaySummary) replaySummary.textContent = 'No replay events in selected window.';
+    setReplayScrubberState({ positions: [] });
+    setReplayCursor(0);
     renderListState(replayTimeline, 'empty', 'Try a wider window (Last 2h or Today).');
     return;
   }
 
+  const visual = buildReplayVisual(events);
+  state.replayVisual = visual;
+  state.replayCursorIndex = Math.max(0, visual.positions.length - 1);
+
   const byType = {};
-  events.forEach((evt) => {
-    const key = evt.event_type || 'unknown';
+  visual.events.forEach((evt) => {
+    const key = evt.eventType || 'unknown';
     byType[key] = (byType[key] || 0) + 1;
   });
-
   const summary = Object.entries(byType)
     .sort((a, b) => b[1] - a[1])
+    .slice(0, 4)
     .map(([name, count]) => `${name}: ${count}`)
     .join(' - ');
+  const firstTs = visual.events[0]?.raw?.ts || '-';
+  const lastTs = visual.events[visual.events.length - 1]?.raw?.ts || '-';
+  replaySummary.textContent =
+    `${events.length} events (${visual.positions.length} positions, ${visual.keyEvents.length} key events) - ${summary} - window ${firstTs} -> ${lastTs}`;
 
-  const firstTs = events[0].ts;
-  const lastTs = events[events.length - 1].ts;
-  replaySummary.textContent = `${events.length} events - ${summary} - window ${firstTs} -> ${lastTs}`;
-
-  events.slice(-20).reverse().forEach((evt) => {
-    const eventType = escapeHtml(evt.event_type || 'event');
-    const status = escapeHtml(evt.status || 'n/a');
-    const offerId = escapeHtml(evt.offer_id || '-');
-    const orderId = escapeHtml(evt.order_id || '-');
-    const zoneId = escapeHtml(evt.zone_id || '-');
-    const ts = escapeHtml(evt.ts || '-');
-    const topic = escapeHtml(evt.topic || '-');
-    const row = document.createElement('div');
-    row.className = 'event-row';
-    row.innerHTML = `
-      <strong>${eventType} - ${status}</strong>
-      <div>offer ${offerId} - order ${orderId} - zone ${zoneId}</div>
-      <div class="muted">${ts} - topic ${topic}</div>
-    `;
-    replayTimeline.appendChild(row);
-  });
+  renderReplayMap(visual);
+  setReplayScrubberState(visual);
+  renderReplayTimeline(visual);
+  setReplayCursor(state.replayCursorIndex);
 }
 
 function buildDriverOffersQuery(driver, limitHint) {
@@ -2584,8 +2950,16 @@ async function replayWindow() {
   const fromTs = fromInput.value.trim();
   const toTs = toInput.value.trim();
 
+  state.replayVisual = null;
+  state.replayCursorIndex = 0;
   replaySummary.textContent = 'Loading replay...';
   renderListState(replayTimeline, 'loading', 'Loading replay events...');
+  if (replayMapEl) {
+    replayMapEl.classList.remove('map-ready');
+    replayMapEl.textContent = 'Loading replay map...';
+  }
+  setReplayScrubberState({ positions: [] });
+  setReplayCursor(0);
 
   try {
     const replay = await api(
@@ -2596,8 +2970,16 @@ async function replayWindow() {
   } catch (err) {
     const msg = errorMessage(err, 'replay unavailable');
     state.replay = [];
+    state.replayVisual = null;
+    state.replayCursorIndex = 0;
     kpiReplay.textContent = '-';
     replaySummary.textContent = `Replay unavailable: ${msg}`;
+    if (replayMapEl) {
+      replayMapEl.classList.remove('map-ready');
+      replayMapEl.textContent = 'Replay map unavailable.';
+    }
+    setReplayScrubberState({ positions: [] });
+    setReplayCursor(0);
     renderListState(replayTimeline, 'error', `Replay request failed: ${msg}`);
   }
 }
@@ -2902,6 +3284,9 @@ safeBind(refreshFuelBtn, 'click', () => {
   refreshFuelContextNow(false).catch(() => {});
 });
 safeBind($('replayBtn'), 'click', replayWindow);
+bindChangeAndInput(replayScrubberEl, () => {
+  setReplayCursor(asFloatOrNull(replayScrubberEl?.value));
+});
 safeBind($('scoreBtn'), 'click', () => scoreManualOffer());
 safeBind(decisionQuickScoreBtn, 'click', () => {
   withBusyButton(decisionQuickScoreBtn, 'Scoring...', async () => {
