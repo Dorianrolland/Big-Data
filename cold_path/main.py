@@ -216,6 +216,21 @@ def write_events(records: list[dict]) -> None:
 
 
 def parse_position(raw: bytes) -> dict:
+    # Legacy producers on livreurs-gps emit plain JSON instead of protobuf.
+    # Field mapping: livreur_id (not courier_id), timestamp (not ts).
+    if raw and raw[0:1] == b"{":
+        data = json.loads(raw)
+        return {
+            "livreur_id": data["livreur_id"],
+            "lat": float(data["lat"]),
+            "lon": float(data["lon"]),
+            "speed_kmh": float(data.get("speed_kmh", 0.0)),
+            "heading_deg": float(data.get("heading_deg", 0.0)),
+            "status": data.get("status") or "unknown",
+            "accuracy_m": float(data.get("accuracy_m", 0.0)),
+            "battery_pct": float(data.get("battery_pct", 0.0)),
+            "ts": data.get("timestamp") or data.get("ts"),
+        }
     msg = CourierPositionV1()
     msg.ParseFromString(raw)
     return {
