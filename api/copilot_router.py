@@ -80,6 +80,7 @@ EVENTS_CONTEXT_KEY = "copilot:context:events"
 ZONE_CONTEXT_PREFIX = "copilot:context:zone:"
 OFFER_KEY_PREFIX = "copilot:offer:"
 DRIVER_OFFERS_PREFIX = "copilot:driver:"
+DRIVER_PROFILE_PREFIX = "copilot:driver:profile:"
 COURIER_HASH_PREFIX = "fleet:livreur:"
 SINGLE_REPLAY_STATUS_KEY = "copilot:replay:tlc:single:status"
 MISSION_JOURNAL_PREFIX = "copilot:mission:journal:"
@@ -123,6 +124,14 @@ RANK_BELOW_TARGET_SLACK_EUR_H = max(0.0, _env_float("COPILOT_RANK_BELOW_TARGET_S
 SHIFT_PLAN_TOP_K_DEFAULT = _env_int("COPILOT_SHIFT_PLAN_TOP_K_DEFAULT", 6, min_value=3, max_value=20)
 SHIFT_PLAN_REFERENCE_KM = _env_float("COPILOT_SHIFT_PLAN_REFERENCE_KM", 15.0)
 SHIFT_PLAN_DEFAULT_TARGET_EUR_H = max(0.0, _env_float("COPILOT_SHIFT_PLAN_TARGET_EUR_H", 18.0))
+DRIVER_PROFILE_DEFAULT_TARGET_EUR_H = max(0.0, _env_float("COPILOT_DRIVER_PROFILE_TARGET_EUR_H", 18.0))
+DRIVER_PROFILE_DEFAULT_CONSUMPTION_L_100 = max(
+    2.0, _env_float("COPILOT_DRIVER_PROFILE_CONSUMPTION_L_100", DEFAULT_CONSUMPTION_L_100KM)
+)
+DRIVER_PROFILE_DEFAULT_RISK_AVERSION = min(
+    1.0, max(0.0, _env_float("COPILOT_DRIVER_PROFILE_RISK_AVERSION", 0.5))
+)
+DRIVER_PROFILE_DEFAULT_MAX_ETA = min(60.0, max(3.0, _env_float("COPILOT_DRIVER_PROFILE_MAX_ETA", 20.0)))
 
 GBFS_STATION_INFO_URL = "https://gbfs.citibikenyc.com/gbfs/en/station_information.json"
 GBFS_STATION_STATUS_URL = "https://gbfs.citibikenyc.com/gbfs/en/station_status.json"
@@ -313,6 +322,25 @@ class ShiftPlanResponse(BaseModel):
     items: list[ShiftPlanZoneItem]
 
 
+class DriverProfileUpdateRequest(BaseModel):
+    target_eur_h: float | None = Field(None, ge=0.0, le=150.0)
+    consommation_l_100: float | None = Field(None, ge=2.0, le=30.0)
+    aversion_risque: float | None = Field(None, ge=0.0, le=1.0)
+    max_eta: float | None = Field(None, ge=3.0, le=60.0)
+
+
+class DriverProfileResponse(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
+    driver_id: str
+    target_eur_h: float
+    consommation_l_100: float
+    aversion_risque: float
+    max_eta: float
+    source: str
+    updated_at: str | None = None
+
+
 class FuelContextUpdateRequest(BaseModel):
     fuel_price_eur_l: float = Field(..., ge=0.5, le=5.0)
     vehicle_consumption_l_100km: float = Field(..., ge=2.0, le=30.0)
@@ -411,6 +439,96 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
+def _driver_profile_defaults() -> dict[str, Any]:
+    return {
+        "target_eur_h": round(float(DRIVER_PROFILE_DEFAULT_TARGET_EUR_H), 3),
+        "consommation_l_100": round(float(DRIVER_PROFILE_DEFAULT_CONSUMPTION_L_100), 3),
+        "aversion_risque": round(float(DRIVER_PROFILE_DEFAULT_RISK_AVERSION), 3),
+        "max_eta": round(float(DRIVER_PROFILE_DEFAULT_MAX_ETA), 3),
+        "source": "default",
+        "updated_at": None,
+    }
+
+
+def _normalize_driver_profile(
+    raw: dict[str, Any] | None,
+    *,
+    driver_id: str,
+    source_hint: str | None = None,
+) -> dict[str, Any]:
+    defaults = _driver_profile_defaults()
+    payload = raw or {}
+    target = _clamp(_as_float(payload.get("target_eur_h"), defaults["target_eur_h"]), 0.0, 150.0)
+    consumption = _clamp(_as_float(payload.get("consommation_l_100"), defaults["consommation_l_100"]), 2.0, 30.0)
+    risk = _clamp(_as_float(payload.get("aversion_risque"), defaults["aversion_risque"]), 0.0, 1.0)
+    max_eta = _clamp(_as_float(payload.get("max_eta"), defaults["max_eta"]), 3.0, 60.0)
+    source = str(source_hint or payload.get("source") or ("stored" if raw else defaults["source"]))
+    updated_at = payload.get("updated_at")
+    return {
+        "driver_id": str(driver_id),
+        "target_eur_h": round(float(target), 3),
+        "consommation_l_100": round(float(consumption), 3),
+        "aversion_risque": round(float(risk), 3),
+        "max_eta": round(float(max_eta), 3),
+        "source": source,
+        "updated_at": str(updated_at) if updated_at not in (None, "") else None,
+    }
+
+
+def _driver_profile_key(driver_id: str) -> str:
+    return f"{DRIVER_PROFILE_PREFIX}{driver_id}"
+
+
+def _normalize_driver_id_or_422(driver_id: str) -> str:
+    normalized = str(driver_id or "").strip()
+    if not normalized:
+        raise HTTPException(status_code=422, detail="driver_id is required")
+    return normalized
+
+
+def _profile_dispatch_strategy(aversion_risque: float) -> Literal["conservative", "balanced", "aggressive"]:
+    risk = _clamp(float(aversion_risque), 0.0, 1.0)
+    if risk >= 0.67:
+        return "conservative"
+    if risk <= 0.33:
+        return "aggressive"
+    return "balanced"
+
+
+def _apply_driver_profile_to_payload(payload: dict[str, Any], profile: dict[str, Any] | None) -> dict[str, Any]:
+    if not profile:
+        return payload
+    if payload.get("target_hourly_net_eur") in (None, ""):
+        payload["target_hourly_net_eur"] = _as_float(profile.get("target_eur_h"), DRIVER_PROFILE_DEFAULT_TARGET_EUR_H)
+    if payload.get("vehicle_consumption_l_100km") in (None, ""):
+        payload["vehicle_consumption_l_100km"] = _as_float(
+            profile.get("consommation_l_100"), DRIVER_PROFILE_DEFAULT_CONSUMPTION_L_100
+        )
+    if payload.get("driver_risk_aversion") in (None, ""):
+        payload["driver_risk_aversion"] = _as_float(profile.get("aversion_risque"), DRIVER_PROFILE_DEFAULT_RISK_AVERSION)
+    if payload.get("driver_max_eta_min") in (None, ""):
+        payload["driver_max_eta_min"] = _as_float(profile.get("max_eta"), DRIVER_PROFILE_DEFAULT_MAX_ETA)
+    return payload
+
+
+async def _resolve_driver_profile(
+    redis_client: aioredis.Redis,
+    driver_id: str,
+    *,
+    cache: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    normalized_driver_id = str(driver_id or "").strip()
+    if not normalized_driver_id:
+        return _normalize_driver_profile(None, driver_id="", source_hint="default")
+    if cache is not None and normalized_driver_id in cache:
+        return cache[normalized_driver_id]
+    raw = await redis_client.hgetall(_driver_profile_key(normalized_driver_id))
+    profile = _normalize_driver_profile(raw if raw else None, driver_id=normalized_driver_id)
+    if cache is not None:
+        cache[normalized_driver_id] = profile
+    return profile
+
+
 def _zone_context_payload(zone_raw: dict[str, Any], zone_id_hint: str | None = None) -> dict[str, Any]:
     demand = _as_float(zone_raw.get("demand_index"), 1.0)
     supply = max(_as_float(zone_raw.get("supply_index"), 1.0), 0.2)
@@ -458,14 +576,24 @@ def _compute_heuristic_score(features: dict[str, float]) -> tuple[float, float, 
     return heuristic_score(features, weights=SCORE_WEIGHTS)
 
 
-def _decision_for_offer(features: dict[str, float], accept_prob: float) -> tuple[str, float]:
+def _decision_for_offer(
+    features: dict[str, float],
+    accept_prob: float,
+    *,
+    aversion_risque: float | None = None,
+) -> tuple[str, float]:
+    risk = _clamp(float(aversion_risque) if aversion_risque is not None else 0.5, 0.0, 1.0)
+    base_threshold = _clamp(ACCEPT_BASE_THRESHOLD + ((risk - 0.5) * 0.12), 0.35, 0.85)
+    below_target_penalty_max = ACCEPT_BELOW_TARGET_PENALTY_MAX * (0.85 + (risk * 0.5))
+    high_fuel_penalty = ACCEPT_HIGH_FUEL_PENALTY * (0.8 + (risk * 0.6))
+    above_target_bonus = ACCEPT_ABOVE_TARGET_BONUS * (1.1 - (risk * 0.6))
     return hybrid_accept_decision(
         features=features,
         accept_score=float(accept_prob),
-        base_threshold=ACCEPT_BASE_THRESHOLD,
-        below_target_penalty_max=ACCEPT_BELOW_TARGET_PENALTY_MAX,
-        high_fuel_penalty=ACCEPT_HIGH_FUEL_PENALTY,
-        above_target_bonus=ACCEPT_ABOVE_TARGET_BONUS,
+        base_threshold=base_threshold,
+        below_target_penalty_max=below_target_penalty_max,
+        high_fuel_penalty=high_fuel_penalty,
+        above_target_bonus=above_target_bonus,
     )
 
 
@@ -1306,6 +1434,11 @@ async def score_offer(request: Request, body: ScoreOfferRequest) -> ScoreOfferRe
             payload.update(offer_map)
     payload.update(body.model_dump(exclude_unset=True, exclude_none=True))
     payload["use_osrm"] = bool(payload.get("use_osrm", False))
+    driver_id = str(payload.get("courier_id") or body.courier_id or "").strip()
+    driver_profile = None
+    if driver_id:
+        driver_profile = await _resolve_driver_profile(redis_client, driver_id)
+        payload = _apply_driver_profile_to_payload(payload, driver_profile)
     payload = await _merge_cost_context(redis_client, payload)
     route_meta: dict[str, Any] = {"route_source": "estimated", "route_notes": []}
     if payload["use_osrm"]:
@@ -1320,7 +1453,15 @@ async def score_offer(request: Request, body: ScoreOfferRequest) -> ScoreOfferRe
     model_prob, model_used = model_score(model_payload, features)
     accept_prob = model_prob if model_prob is not None else heuristic_prob
 
-    decision, decision_threshold = _decision_for_offer(features, float(accept_prob))
+    decision, decision_threshold = _decision_for_offer(
+        features,
+        float(accept_prob),
+        aversion_risque=(
+            _as_float(driver_profile.get("aversion_risque"), DRIVER_PROFILE_DEFAULT_RISK_AVERSION)
+            if driver_profile
+            else None
+        ),
+    )
     details = _build_explanation_details(
         features=features,
         accept_prob=float(accept_prob),
@@ -1446,11 +1587,12 @@ async def _score_offer_payload(
     body: ScoreOfferRequest,
     osrm_client: httpx.AsyncClient | None,
     use_osrm: bool,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, float], float, float, list[str], str]:
+    profile_cache: dict[str, dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, float], float, float, list[str], str, dict[str, Any] | None]:
     """Shared scoring pipeline for both /score-offer and /rank-offers.
 
     Returns `(payload, route_meta, features, accept_prob, eur_per_hour, reasons,
-    model_used)`. Callers are expected to assemble the response model.
+    model_used, driver_profile)`. Callers are expected to assemble the response model.
     """
     payload: dict[str, Any] = {}
     if body.offer_id:
@@ -1459,6 +1601,11 @@ async def _score_offer_payload(
             payload.update(offer_map)
     payload.update(body.model_dump(exclude_unset=True, exclude_none=True))
     payload["use_osrm"] = bool(use_osrm or payload.get("use_osrm", False))
+    driver_profile: dict[str, Any] | None = None
+    driver_id = str(payload.get("courier_id") or body.courier_id or "").strip()
+    if driver_id:
+        driver_profile = await _resolve_driver_profile(redis_client, driver_id, cache=profile_cache)
+        payload = _apply_driver_profile_to_payload(payload, driver_profile)
     payload = await _merge_cost_context(redis_client, payload)
     route_meta: dict[str, Any] = {"route_source": "estimated", "route_notes": []}
     if payload["use_osrm"] and osrm_client is not None:
@@ -1468,7 +1615,7 @@ async def _score_offer_payload(
     heuristic_prob, eur_per_hour, reasons = _compute_heuristic_score(features)
     model_prob, model_used = model_score(model_payload, features)
     accept_prob = model_prob if model_prob is not None else heuristic_prob
-    return payload, route_meta, features, float(accept_prob), float(eur_per_hour), reasons, model_used
+    return payload, route_meta, features, float(accept_prob), float(eur_per_hour), reasons, model_used, driver_profile
 
 
 @copilot_router.post("/rank-offers", response_model=RankOffersResponse)
@@ -1485,18 +1632,27 @@ async def rank_offers(request: Request, body: RankOffersRequest) -> RankOffersRe
     model_payload = getattr(request.app.state, "copilot_model", None)
 
     scored: list[dict[str, Any]] = []
+    profile_cache: dict[str, dict[str, Any]] = {}
     osrm_client: httpx.AsyncClient | None = None
     try:
         if body.use_osrm:
             osrm_client = httpx.AsyncClient(timeout=OSRM_SCORE_TIMEOUT_S)
 
         for offer in body.offers:
-            payload, route_meta, features, accept_prob, eur_per_hour, reasons, model_used = (
+            payload, route_meta, features, accept_prob, eur_per_hour, reasons, model_used, driver_profile = (
                 await _score_offer_payload(
-                    redis_client, model_payload, offer, osrm_client, body.use_osrm
+                    redis_client, model_payload, offer, osrm_client, body.use_osrm, profile_cache
                 )
             )
-            decision, decision_threshold = _decision_for_offer(features, float(accept_prob))
+            decision, decision_threshold = _decision_for_offer(
+                features,
+                float(accept_prob),
+                aversion_risque=(
+                    _as_float(driver_profile.get("aversion_risque"), DRIVER_PROFILE_DEFAULT_RISK_AVERSION)
+                    if driver_profile
+                    else None
+                ),
+            )
             details = _build_explanation_details(
                 features=features,
                 accept_prob=float(accept_prob),
@@ -1582,6 +1738,47 @@ async def driver_position(
         if zone_raw:
             payload["zone_context"] = _zone_context_payload(zone_raw, zone_id_hint=zone_cell)
     return payload
+
+
+@copilot_router.get("/driver/{driver_id}/profile", response_model=DriverProfileResponse)
+async def get_driver_profile(request: Request, driver_id: str) -> DriverProfileResponse:
+    redis_client: aioredis.Redis = request.app.state.redis
+    normalized_driver_id = _normalize_driver_id_or_422(driver_id)
+    profile = await _resolve_driver_profile(redis_client, normalized_driver_id)
+    return DriverProfileResponse(**profile)
+
+
+@copilot_router.put("/driver/{driver_id}/profile", response_model=DriverProfileResponse)
+async def update_driver_profile(
+    request: Request,
+    driver_id: str,
+    body: DriverProfileUpdateRequest,
+) -> DriverProfileResponse:
+    redis_client: aioredis.Redis = request.app.state.redis
+    normalized_driver_id = _normalize_driver_id_or_422(driver_id)
+    current = await _resolve_driver_profile(redis_client, normalized_driver_id)
+    updates = body.model_dump(exclude_none=True)
+    next_payload = {
+        "target_eur_h": updates.get("target_eur_h", current["target_eur_h"]),
+        "consommation_l_100": updates.get("consommation_l_100", current["consommation_l_100"]),
+        "aversion_risque": updates.get("aversion_risque", current["aversion_risque"]),
+        "max_eta": updates.get("max_eta", current["max_eta"]),
+        "source": "manual",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    normalized = _normalize_driver_profile(next_payload, driver_id=normalized_driver_id, source_hint="manual")
+    await redis_client.hset(
+        _driver_profile_key(normalized_driver_id),
+        mapping={
+            "target_eur_h": normalized["target_eur_h"],
+            "consommation_l_100": normalized["consommation_l_100"],
+            "aversion_risque": normalized["aversion_risque"],
+            "max_eta": normalized["max_eta"],
+            "source": normalized["source"],
+            "updated_at": normalized["updated_at"] or "",
+        },
+    )
+    return DriverProfileResponse(**normalized)
 
 
 @copilot_router.post("/driver/{driver_id}/mission-report")
@@ -1721,6 +1918,7 @@ async def driver_offers(
     ),
 ):
     redis_client: aioredis.Redis = request.app.state.redis
+    driver_profile = await _resolve_driver_profile(redis_client, driver_id)
     offer_ids = await redis_client.lrange(f"{DRIVER_OFFERS_PREFIX}{driver_id}:offers", 0, limit - 1)
     if not offer_ids:
         return {"driver_id": driver_id, "count": 0, "offers": []}
@@ -1740,9 +1938,11 @@ async def driver_offers(
             if not off:
                 continue
             payload = dict(off)
+            payload["courier_id"] = payload.get("courier_id") or driver_id
             payload["use_osrm"] = use_osrm
             if target_hourly_net_eur is not None:
                 payload["target_hourly_net_eur"] = target_hourly_net_eur
+            payload = _apply_driver_profile_to_payload(payload, driver_profile)
             payload = await _merge_cost_context(redis_client, payload)
             route_meta: dict[str, Any] = {"route_source": "estimated", "route_notes": []}
             if use_osrm:
@@ -1755,7 +1955,11 @@ async def driver_offers(
             accept_prob = model_prob if model_prob is not None else heur_prob
             if accept_prob < min_accept_score:
                 continue
-            decision, decision_threshold = _decision_for_offer(features, float(accept_prob))
+            decision, decision_threshold = _decision_for_offer(
+                features,
+                float(accept_prob),
+                aversion_risque=_as_float(driver_profile.get("aversion_risque"), DRIVER_PROFILE_DEFAULT_RISK_AVERSION),
+            )
             details = _build_explanation_details(
                 features=features,
                 accept_prob=float(accept_prob),
@@ -1821,6 +2025,7 @@ async def best_offers_around(
     ),
 ):
     redis_client: aioredis.Redis = request.app.state.redis
+    driver_profile = await _resolve_driver_profile(redis_client, driver_id)
 
     lat, lon = await _resolve_driver_origin(redis_client, driver_id, lat, lon)
 
@@ -1857,6 +2062,7 @@ async def best_offers_around(
             payload["use_osrm"] = use_osrm
             if target_hourly_net_eur is not None:
                 payload["target_hourly_net_eur"] = target_hourly_net_eur
+            payload = _apply_driver_profile_to_payload(payload, driver_profile)
 
             pickup_lat = _coord_from_payload(payload, "pickup_lat")
             pickup_lon = _coord_from_payload(payload, "pickup_lon")
@@ -1886,7 +2092,11 @@ async def best_offers_around(
             accept_prob = model_prob if model_prob is not None else heur_prob
             if accept_prob < min_accept_score:
                 continue
-            decision, decision_threshold = _decision_for_offer(features, float(accept_prob))
+            decision, decision_threshold = _decision_for_offer(
+                features,
+                float(accept_prob),
+                aversion_risque=_as_float(driver_profile.get("aversion_risque"), DRIVER_PROFILE_DEFAULT_RISK_AVERSION),
+            )
             details = _build_explanation_details(
                 features=features,
                 accept_prob=float(accept_prob),
@@ -1965,6 +2175,17 @@ async def instant_dispatch(
     ),
 ):
     redis_client: aioredis.Redis = request.app.state.redis
+    driver_profile = await _resolve_driver_profile(redis_client, driver_id)
+    query_keys = set(request.query_params.keys())
+    if "target_hourly_net_eur" not in query_keys and target_hourly_net_eur is None:
+        target_hourly_net_eur = _as_float(driver_profile.get("target_eur_h"), DRIVER_PROFILE_DEFAULT_TARGET_EUR_H)
+    if "max_reposition_eta_min" not in query_keys:
+        max_reposition_eta_min = _as_float(driver_profile.get("max_eta"), DEFAULT_MAX_REPOSITION_ETA_MIN)
+    if "dispatch_strategy" not in query_keys:
+        dispatch_strategy = _profile_dispatch_strategy(
+            _as_float(driver_profile.get("aversion_risque"), DRIVER_PROFILE_DEFAULT_RISK_AVERSION)
+        )
+
     lat, lon = await _resolve_driver_origin(redis_client, driver_id, lat, lon)
 
     around_payload = await best_offers_around(
@@ -1990,7 +2211,7 @@ async def instant_dispatch(
 
     fuel_context = await redis_client.hgetall(FUEL_CONTEXT_KEY)
     fuel_price = _as_float(fuel_context.get("fuel_price_eur_l"), DEFAULT_FUEL_PRICE_EUR_L)
-    consumption = _as_float(fuel_context.get("vehicle_consumption_l_100km"), DEFAULT_CONSUMPTION_L_100KM)
+    consumption = _as_float(driver_profile.get("consommation_l_100"), DEFAULT_CONSUMPTION_L_100KM)
 
     target_hourly = target_hourly_net_eur
     if target_hourly is None and local_best is not None:
@@ -1999,6 +2220,9 @@ async def instant_dispatch(
         target_hourly = 18.0
 
     strategy = dispatch_strategy_profile(dispatch_strategy)
+    risk_aversion = _as_float(driver_profile.get("aversion_risque"), DRIVER_PROFILE_DEFAULT_RISK_AVERSION)
+    risk_weight_multiplier = 0.8 + (risk_aversion * 0.8)
+    reward_weight_multiplier = 1.05 - (risk_aversion * 0.35)
     effective_max_eta = _clamp(
         max_reposition_eta_min * float(strategy.get("eta_limit_multiplier", 1.0)),
         3.0,
@@ -2105,13 +2329,13 @@ async def instant_dispatch(
             net_gain_component = _clamp((net_gain_vs_stay + 5.0) / 14.0, 0.0, 1.0)
 
             dispatch_score = _clamp(
-                float(strategy.get("weight_opportunity", 0.32)) * opportunity_component
-                + float(strategy.get("weight_eta", 0.16)) * eta_component
-                + float(strategy.get("weight_pressure", 0.14)) * pressure_component
-                + float(strategy.get("weight_target_need", 0.12)) * target_need_component
-                + float(strategy.get("weight_net_gain", 0.2)) * net_gain_component
-                - float(strategy.get("penalty_cost", 0.14)) * cost_model["reposition_cost_penalty"]
-                - float(strategy.get("penalty_volatility", 0.08)) * forecast["forecast_volatility"],
+                (float(strategy.get("weight_opportunity", 0.32)) * reward_weight_multiplier) * opportunity_component
+                + (float(strategy.get("weight_eta", 0.16)) * risk_weight_multiplier) * eta_component
+                + (float(strategy.get("weight_pressure", 0.14)) * reward_weight_multiplier) * pressure_component
+                + (float(strategy.get("weight_target_need", 0.12)) * reward_weight_multiplier) * target_need_component
+                + (float(strategy.get("weight_net_gain", 0.2)) * reward_weight_multiplier) * net_gain_component
+                - (float(strategy.get("penalty_cost", 0.14)) * risk_weight_multiplier) * cost_model["reposition_cost_penalty"]
+                - (float(strategy.get("penalty_volatility", 0.08)) * risk_weight_multiplier) * forecast["forecast_volatility"],
                 0.0,
                 1.0,
             )
@@ -2174,9 +2398,9 @@ async def instant_dispatch(
         move_potential_eur_h=move_potential_eur_h,
         max_reposition_eta_min=effective_max_eta,
         move_net_gain_eur_h=move_net_gain_eur_h,
-        negative_net_gain_guard=float(strategy.get("negative_net_gain_guard", -1.0)),
-        delta_threshold=float(strategy.get("delta_threshold", 0.1)),
-        min_net_gain_for_reposition=float(strategy.get("min_net_gain_for_reposition", -0.5)),
+        negative_net_gain_guard=float(strategy.get("negative_net_gain_guard", -1.0)) + (risk_aversion * 0.6),
+        delta_threshold=float(strategy.get("delta_threshold", 0.1)) + (risk_aversion * 0.05),
+        min_net_gain_for_reposition=float(strategy.get("min_net_gain_for_reposition", -0.5)) + (risk_aversion * 0.7),
     )
     if not reposition_options and zones:
         reasons.append("zone_coordinates_unavailable")
@@ -2197,6 +2421,14 @@ async def instant_dispatch(
         "forecast_horizon_min": round(float(forecast_horizon_min), 2),
         "effective_forecast_horizon_min": round(float(effective_forecast_horizon), 2),
         "use_osrm": use_osrm,
+        "driver_profile": {
+            "target_eur_h": round(_as_float(driver_profile.get("target_eur_h"), DRIVER_PROFILE_DEFAULT_TARGET_EUR_H), 2),
+            "consommation_l_100": round(
+                _as_float(driver_profile.get("consommation_l_100"), DRIVER_PROFILE_DEFAULT_CONSUMPTION_L_100), 2
+            ),
+            "aversion_risque": round(risk_aversion, 3),
+            "max_eta": round(_as_float(driver_profile.get("max_eta"), DEFAULT_MAX_REPOSITION_ETA_MIN), 2),
+        },
         "stay_option": stay_option,
         "reposition_option": best_reposition,
         "local_candidates_count": len(local_offers),
@@ -2480,6 +2712,7 @@ async def shift_plan(
         raise HTTPException(status_code=422, detail="horizon_min must be 60 or 90")
 
     redis_client: aioredis.Redis = request.app.state.redis
+    driver_profile = await _resolve_driver_profile(redis_client, driver_id)
     driver_lat, driver_lon = await _resolve_driver_origin(redis_client, driver_id, lat, lon)
 
     zones = await _load_zone_context_payloads(redis_client)
@@ -2491,7 +2724,11 @@ async def shift_plan(
             "horizon_min": int(horizon_min),
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "target_hourly_net_eur": round(
-                float(target_hourly_net_eur if target_hourly_net_eur is not None else SHIFT_PLAN_DEFAULT_TARGET_EUR_H),
+                float(
+                    target_hourly_net_eur
+                    if target_hourly_net_eur is not None
+                    else _as_float(driver_profile.get("target_eur_h"), SHIFT_PLAN_DEFAULT_TARGET_EUR_H)
+                ),
                 2,
             ),
             "source": "zone_context_v2",
@@ -2501,9 +2738,11 @@ async def shift_plan(
 
     fuel_context = await redis_client.hgetall(FUEL_CONTEXT_KEY)
     fuel_price = _as_float(fuel_context.get("fuel_price_eur_l"), DEFAULT_FUEL_PRICE_EUR_L)
-    consumption = _as_float(fuel_context.get("vehicle_consumption_l_100km"), DEFAULT_CONSUMPTION_L_100KM)
+    consumption = _as_float(driver_profile.get("consommation_l_100"), DEFAULT_CONSUMPTION_L_100KM)
     target_hourly = float(
-        target_hourly_net_eur if target_hourly_net_eur is not None else SHIFT_PLAN_DEFAULT_TARGET_EUR_H
+        target_hourly_net_eur
+        if target_hourly_net_eur is not None
+        else _as_float(driver_profile.get("target_eur_h"), SHIFT_PLAN_DEFAULT_TARGET_EUR_H)
     )
     if target_hourly <= 0:
         target_hourly = SHIFT_PLAN_DEFAULT_TARGET_EUR_H

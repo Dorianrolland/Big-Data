@@ -9,6 +9,7 @@ if str(_API_DIR) not in sys.path:
     sys.path.insert(0, str(_API_DIR))
 
 from copilot_router import (  # noqa: E402
+    DriverProfileResponse,
     RankedOfferItem,
     ScoreOfferResponse,
     ShiftPlanResponse,
@@ -199,3 +200,22 @@ def test_shift_plan_response_contract_is_backward_safe():
     assert out["count"] == 1
     assert isinstance(out["items"], list)
     assert out["items"][0]["zone_id"] == "40.7611_-73.9776"
+
+
+def test_driver_profile_response_contract():
+    payload = DriverProfileResponse(
+        driver_id="drv_demo_001",
+        target_eur_h=19.5,
+        consommation_l_100=7.2,
+        aversion_risque=0.45,
+        max_eta=18.0,
+        source="manual",
+        updated_at="2026-04-20T10:00:00+00:00",
+    )
+    out = payload.model_dump()
+    assert out["driver_id"] == "drv_demo_001"
+    assert out["target_eur_h"] == 19.5
+    assert out["consommation_l_100"] == 7.2
+    assert out["aversion_risque"] == 0.45
+    assert out["max_eta"] == 18.0
+    assert out["source"] == "manual"
