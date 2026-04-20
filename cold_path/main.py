@@ -443,6 +443,16 @@ async def main() -> None:
             if rejected_chunk:
                 await asyncio.to_thread(write_dlq_jsonl, rejected_chunk)
                 rejected_total += len(rejected_chunk)
+                by_topic: dict[str, dict[str, int]] = {}
+                for _topic, _raw, _reason in rejected_chunk:
+                    by_topic.setdefault(_topic, {}).setdefault(_reason, 0)
+                    by_topic[_topic][_reason] += 1
+                for _topic, _reasons in by_topic.items():
+                    for _reason, _count in _reasons.items():
+                        log.warning(
+                            "DLQ topic=%s reason=%r count=%d total_rejected=%d",
+                            _topic, _reason, _count, rejected_total,
+                        )
 
             current_size = len(positions_buffer) + len(events_buffer)
             time_exceeded = current_size > 0 and (time.monotonic() - last_flush >= BATCH_INTERVAL_S)
