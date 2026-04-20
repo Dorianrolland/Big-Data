@@ -79,6 +79,26 @@ def test_parse_context_signal_contract():
     assert rec["source"] == "sim"
 
 
+def test_parse_position_json_legacy():
+    """livreurs-gps legacy producers send plain JSON; must not go to DLQ."""
+    raw = json.dumps({
+        "livreur_id": "S00003",
+        "lat": 40.79145,
+        "lon": -74.042048,
+        "speed_kmh": 23.4,
+        "heading_deg": 353.3,
+        "status": "delivering",
+        "timestamp": "2026-04-12T18:56:14.703099+00:00",
+        "accuracy_m": 5.0,
+        "battery_pct": 88.2,
+    }).encode()
+    rec = cold.parse_position(raw)
+    assert rec["livreur_id"] == "S00003"
+    assert rec["lat"] == 40.79145
+    assert rec["status"] == "delivering"
+    assert rec["ts"] == "2026-04-12T18:56:14.703099+00:00"
+
+
 def test_write_dlq_jsonl(tmp_path):
     original = cold.DLQ_PATH
     cold.DLQ_PATH = tmp_path

@@ -216,6 +216,21 @@ def write_events(records: list[dict]) -> None:
 
 
 def parse_position(raw: bytes) -> dict:
+    # Legacy producers on livreurs-gps emit plain JSON instead of protobuf.
+    # Field mapping: livreur_id (not courier_id), timestamp (not ts).
+    if raw and raw[0:1] == b"{":
+        data = json.loads(raw)
+        return {
+            "livreur_id": data["livreur_id"],
+            "lat": float(data["lat"]),
+            "lon": float(data["lon"]),
+            "speed_kmh": float(data.get("speed_kmh", 0.0)),
+            "heading_deg": float(data.get("heading_deg", 0.0)),
+            "status": data.get("status") or "unknown",
+            "accuracy_m": float(data.get("accuracy_m", 0.0)),
+            "battery_pct": float(data.get("battery_pct", 0.0)),
+            "ts": data.get("timestamp") or data.get("ts"),
+        }
     msg = CourierPositionV1()
     msg.ParseFromString(raw)
     return {
@@ -428,6 +443,16 @@ async def main() -> None:
             if rejected_chunk:
                 await asyncio.to_thread(write_dlq_jsonl, rejected_chunk)
                 rejected_total += len(rejected_chunk)
+                by_topic: dict[str, dict[str, int]] = {}
+                for _topic, _raw, _reason in rejected_chunk:
+                    by_topic.setdefault(_topic, {}).setdefault(_reason, 0)
+                    by_topic[_topic][_reason] += 1
+                for _topic, _reasons in by_topic.items():
+                    for _reason, _count in _reasons.items():
+                        log.warning(
+                            "DLQ topic=%s reason=%r count=%d total_rejected=%d",
+                            _topic, _reason, _count, rejected_total,
+                        )
 
             current_size = len(positions_buffer) + len(events_buffer)
             time_exceeded = current_size > 0 and (time.monotonic() - last_flush >= BATCH_INTERVAL_S)
