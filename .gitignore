@@ -44,4 +44,5 @@ Thumbs.db
 logs/
 *.parquet 
 .pytest_cache/
+.tmp/
 data/

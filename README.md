@@ -414,10 +414,39 @@ Train model artifact locally:
 make train-copilot
 ```
 
+By default, training uses full history (`--train-months 0`).
+To constrain to a fixed window (for faster experiments):
+
+```bash
+python ml/train_copilot_model.py \
+  --data ./data/parquet_events \
+  --out ./data/models/copilot_model.joblib \
+  --train-start 2024-01 \
+  --train-months 10
+```
+
+Run the reproducible training demo notebook (COP-014):
+
+```bash
+make train-copilot-report
+```
+
+Or directly:
+
+```bash
+jupyter nbconvert --execute --to notebook --inplace ml/notebooks/copilot_training_report.ipynb
+```
+
 Output:
 
 - `data/models/copilot_model.joblib`
 - `data/models/copilot_model.json`
+- `data/reports/ml/copilot_training_report.json`
+- `data/reports/ml/copilot_training_report.md`
+- `data/reports/ml/copilot_roc_curve.png`
+- `data/reports/ml/copilot_pr_curve.png`
+- `data/reports/ml/copilot_calibration_curve.png`
+- `data/reports/ml/copilot_feature_importance.png`
 
 The metadata file now contains:
 

@@ -22,7 +22,9 @@ from typing import Any
 
 import duckdb
 import joblib
+import numpy as np
 import pandas as pd
+from pandas.tseries.holiday import USFederalHolidayCalendar
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     average_precision_score,
@@ -44,9 +46,25 @@ FEATURES = [
     "supply_index",
     "weather_factor",
     "traffic_factor",
+    "event_pressure",
+    "event_count_nearby",
+    "weather_precip_mm",
+    "weather_wind_kmh",
+    "weather_intensity",
+    "temporal_hour_local",
+    "is_peak_hour",
+    "is_weekend",
+    "is_holiday",
+    "temporal_pressure",
+    "context_fallback_applied",
+    "context_stale_sources",
     "pressure_ratio",
     "estimated_net_eur_h",
 ]
+
+DEFAULT_FUEL_PRICE_EUR_L = 1.85
+DEFAULT_VEHICLE_CONSUMPTION_L_100KM = 7.5
+DEFAULT_PLATFORM_FEE_PCT = 25.0
 
 
 def expected_calibration_error(y_true: pd.Series, proba: pd.Series, bins: int = 10) -> float:
@@ -109,7 +127,7 @@ def build_training_frame(
         )
 
     query = f"""
-    WITH offers AS (
+    WITH offers_raw AS (
         SELECT
             offer_id,
             courier_id,
@@ -127,6 +145,16 @@ def build_training_frame(
           AND offer_id <> ''
           {window_clause}
     ),
+    offers AS (
+        SELECT * EXCLUDE (rn)
+        FROM (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (PARTITION BY offer_id ORDER BY ts_offer ASC) AS rn
+            FROM offers_raw
+        )
+        WHERE rn = 1
+    ),
     order_outcomes AS (
         SELECT
             offer_id,
@@ -139,6 +167,7 @@ def build_training_frame(
           AND offer_id IS NOT NULL
           AND offer_id <> ''
           {window_clause}
+        GROUP BY offer_id
     ),
     context_signals AS (
         SELECT
@@ -150,37 +179,42 @@ def build_training_frame(
           AND zone_id IS NOT NULL
           AND zone_id <> ''
           AND supply_index IS NOT NULL
+    ),
+    offers_with_context AS (
+        SELECT
+            o.*,
+            c.supply_index AS supply_index_ctx,
+            epoch(o.ts_offer) - epoch(c.ts_ctx) AS context_age_s
+        FROM offers o
+        ASOF LEFT JOIN context_signals c
+          ON c.zone_id = o.zone_id
+         AND c.ts_ctx <= o.ts_offer
     )
     SELECT
-        o.offer_id,
-        o.courier_id,
-        o.zone_id,
-        o.ts_offer AS ts,
-        o.estimated_fare_eur,
-        o.estimated_distance_km,
-        o.estimated_duration_min,
-        o.demand_index,
-        COALESCE((
-            SELECT c.supply_index
-            FROM context_signals c
-            WHERE c.zone_id = o.zone_id
-              AND ABS(epoch(c.ts_ctx) - epoch(o.ts_offer)) <= {window_seconds}
-            ORDER BY ABS(epoch(c.ts_ctx) - epoch(o.ts_offer))
-            LIMIT 1
-        ), 1.0) AS supply_index,
-        o.weather_factor,
-        o.traffic_factor,
+        owc.offer_id,
+        owc.courier_id,
+        owc.zone_id,
+        owc.ts_offer AS ts,
+        owc.estimated_fare_eur,
+        owc.estimated_distance_km,
+        owc.estimated_duration_min,
+        owc.demand_index,
+        owc.weather_factor,
+        owc.traffic_factor,
+        owc.supply_index_ctx,
+        owc.context_age_s,
         COALESCE(out.accepted_flag, 0) AS accepted_flag,
         COALESCE(out.rejected_flag, 0) AS rejected_flag,
         COALESCE(out.dropped_off_flag, 0) AS dropped_off_flag,
         out.actual_fare_eur
-    FROM offers o
-    LEFT JOIN order_outcomes out ON out.offer_id = o.offer_id
-    WHERE o.estimated_fare_eur IS NOT NULL
-      AND o.estimated_distance_km IS NOT NULL
-      AND o.estimated_duration_min IS NOT NULL
+    FROM offers_with_context owc
+    LEFT JOIN order_outcomes out ON out.offer_id = owc.offer_id
+    WHERE owc.estimated_fare_eur IS NOT NULL
+      AND owc.estimated_distance_km IS NOT NULL
+      AND owc.estimated_duration_min IS NOT NULL
     """
     df = conn.execute(query).df()
+    conn.close()
     if df.empty:
         return df
 
@@ -189,7 +223,8 @@ def build_training_frame(
         "estimated_distance_km": 0.0,
         "estimated_duration_min": 1.0,
         "demand_index": 1.0,
-        "supply_index": 1.0,
+        "supply_index_ctx": None,
+        "context_age_s": None,
         "weather_factor": 1.0,
         "traffic_factor": 1.0,
         "actual_fare_eur": None,
@@ -200,19 +235,95 @@ def build_training_frame(
             df[col] = df[col].fillna(default)
 
     df["estimated_duration_min"] = df["estimated_duration_min"].clip(lower=1.0)
-    df["supply_index"] = df["supply_index"].clip(lower=0.2)
+    ts_utc = pd.to_datetime(df["ts"], utc=True, errors="coerce")
+    df = df[ts_utc.notna()].copy()
+    ts_utc = ts_utc.loc[df.index]
 
-    variable_cost = df["estimated_distance_km"] * 0.35
-    df["estimated_net_eur_h"] = ((df["estimated_fare_eur"] - variable_cost) / df["estimated_duration_min"]) * 60.0
-    df["realized_net_eur_h"] = (
-        (df["actual_fare_eur"] - variable_cost) / df["estimated_duration_min"]
-    ) * 60.0
-    df["pressure_ratio"] = df["demand_index"] / df["supply_index"]
+    has_fresh_context = (
+        df["context_age_s"].notna()
+        & (df["context_age_s"] >= 0.0)
+        & (df["context_age_s"] <= float(window_seconds))
+    )
+    df["context_fallback_applied"] = (~has_fresh_context).astype(float)
+    df["supply_index"] = df["supply_index_ctx"].where(has_fresh_context, np.nan).fillna(1.0).clip(lower=0.2)
+
+    stale_sources = np.where(
+        has_fresh_context,
+        0.0,
+        np.where(
+            df["context_age_s"].isna(),
+            3.0,
+            np.where(df["context_age_s"] <= 7200.0, 1.0, np.where(df["context_age_s"] <= 21600.0, 2.0, 3.0)),
+        ),
+    )
+    df["context_stale_sources"] = stale_sources.astype(float)
+
+    ts_local = ts_utc.dt.tz_convert("America/New_York")
+    local_hour = ts_local.dt.hour + (ts_local.dt.minute / 60.0)
+    is_peak = (((local_hour >= 7.0) & (local_hour < 10.0)) | ((local_hour >= 16.0) & (local_hour < 20.0))).astype(float)
+    is_weekend = (ts_local.dt.dayofweek >= 5).astype(float)
+
+    min_year = int(ts_local.dt.year.min())
+    max_year = int(ts_local.dt.year.max())
+    holiday_calendar = USFederalHolidayCalendar()
+    holiday_dates = set(
+        holiday_calendar.holidays(start=f"{min_year}-01-01", end=f"{max_year}-12-31").date
+    )
+    is_holiday = ts_local.dt.date.isin(holiday_dates).astype(float)
+
+    temporal_pressure = (
+        (is_peak * 0.14)
+        + (((local_hour >= 11.0) & (local_hour < 14.0) & (is_peak < 0.5)).astype(float) * 0.05)
+        + (is_weekend * 0.08)
+        + (is_holiday * 0.12)
+    )
+
+    weather_intensity = ((df["weather_factor"] - 0.95) / 0.45).clip(lower=0.0, upper=1.0)
+    weather_precip_mm = weather_intensity * 6.0
+    weather_wind_kmh = 8.0 + (weather_intensity * 42.0)
+    event_pressure = (
+        (((df["demand_index"] - 1.0).clip(lower=0.0) / 0.9).clip(upper=1.0) * 0.65)
+        + (temporal_pressure.clip(upper=0.35) / 0.35 * 0.25)
+        + (weather_intensity * 0.10)
+    ).clip(lower=0.0, upper=1.0)
+    event_count_nearby = np.rint(event_pressure * 5.0).clip(0, 8).astype(float)
+
+    fuel_cost_eur = (
+        df["estimated_distance_km"] * (DEFAULT_VEHICLE_CONSUMPTION_L_100KM / 100.0) * DEFAULT_FUEL_PRICE_EUR_L
+    )
+    platform_fee_est = df["estimated_fare_eur"] * (DEFAULT_PLATFORM_FEE_PCT / 100.0)
+    estimated_net_eur = df["estimated_fare_eur"] - platform_fee_est - fuel_cost_eur
+    estimated_net_eur_h = (estimated_net_eur / df["estimated_duration_min"]) * 60.0
+
+    realized_net_eur_h = pd.Series(np.nan, index=df.index, dtype=float)
+    actual_mask = df["actual_fare_eur"].notna()
+    if actual_mask.any():
+        platform_fee_actual = df.loc[actual_mask, "actual_fare_eur"] * (DEFAULT_PLATFORM_FEE_PCT / 100.0)
+        realized_net = df.loc[actual_mask, "actual_fare_eur"] - platform_fee_actual - fuel_cost_eur.loc[actual_mask]
+        realized_net_eur_h.loc[actual_mask] = (realized_net / df.loc[actual_mask, "estimated_duration_min"]) * 60.0
+
+    df["temporal_hour_local"] = local_hour.astype(float)
+    df["is_peak_hour"] = is_peak.astype(float)
+    df["is_weekend"] = is_weekend.astype(float)
+    df["is_holiday"] = is_holiday.astype(float)
+    df["temporal_pressure"] = temporal_pressure.astype(float)
+    df["weather_intensity"] = weather_intensity.astype(float)
+    df["weather_precip_mm"] = weather_precip_mm.astype(float)
+    df["weather_wind_kmh"] = weather_wind_kmh.astype(float)
+    df["event_pressure"] = event_pressure.astype(float)
+    df["event_count_nearby"] = event_count_nearby.astype(float)
+    df["estimated_net_eur_h"] = estimated_net_eur_h.astype(float)
+    df["realized_net_eur_h"] = realized_net_eur_h.astype(float)
+    df["pressure_ratio"] = (df["demand_index"] / df["supply_index"]).astype(float)
+    df["ts"] = ts_utc
 
     target_net_eur_h = df["realized_net_eur_h"].fillna(df["estimated_net_eur_h"])
     positive_quantile = min(max(float(positive_quantile), 0.05), 0.95)
-    quantile_threshold = float(target_net_eur_h.quantile(positive_quantile))
-    effective_threshold = max(float(revenue_threshold_eur_h), quantile_threshold)
+    month_key = ts_local.dt.strftime("%Y-%m")
+    per_month_quantile = target_net_eur_h.groupby(month_key).quantile(positive_quantile)
+    quantile_threshold = month_key.map(per_month_quantile).astype(float)
+    global_threshold = max(float(revenue_threshold_eur_h), float(target_net_eur_h.quantile(positive_quantile)))
+    effective_threshold = quantile_threshold.fillna(global_threshold).clip(lower=float(revenue_threshold_eur_h))
 
     base_label = (target_net_eur_h >= effective_threshold).astype(int)
     label = base_label.copy()
@@ -223,7 +334,9 @@ def build_training_frame(
     label_source.loc[rejected_mask] = "observed_rejected"
 
     realized_mask = (~rejected_mask) & (df["dropped_off_flag"] == 1) & df["realized_net_eur_h"].notna()
-    label.loc[realized_mask] = (df.loc[realized_mask, "realized_net_eur_h"] >= effective_threshold).astype(int)
+    label.loc[realized_mask] = (
+        df.loc[realized_mask, "realized_net_eur_h"] >= effective_threshold.loc[realized_mask]
+    ).astype(int)
     label_source.loc[realized_mask] = "observed_realized"
 
     accepted_proxy_mask = (~rejected_mask) & (~realized_mask) & (df["accepted_flag"] == 1)
@@ -231,13 +344,19 @@ def build_training_frame(
 
     df["label"] = label.astype(int)
     df["label_source"] = label_source
-    df["label_threshold_eur_h"] = effective_threshold
+    df["label_threshold_eur_h"] = effective_threshold.astype(float)
+    df["label_threshold_eur_h_global"] = float(effective_threshold.median())
 
     return df
 
 
-def train(df: pd.DataFrame, random_state: int = 42) -> tuple[Pipeline, dict[str, Any]]:
+def train_with_evaluation(
+    df: pd.DataFrame,
+    random_state: int = 42,
+    test_size: float = 0.2,
+) -> tuple[Pipeline, dict[str, Any], dict[str, Any]]:
     frame = df.dropna(subset=FEATURES + ["label"]).copy()
+    frame = frame.sort_values("ts").reset_index(drop=True)
     X = frame[FEATURES].astype(float)
     y = frame["label"].astype(int)
 
@@ -251,24 +370,140 @@ def train(df: pd.DataFrame, random_state: int = 42) -> tuple[Pipeline, dict[str,
         if y.nunique() < 2:
             raise ValueError("unable to create a two-class target")
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=0.2,
-        random_state=random_state,
-        stratify=y,
-    )
+    test_size = min(max(float(test_size), 0.1), 0.4)
+    split_idx = int(len(frame) * (1.0 - test_size))
+    split_idx = max(1, min(split_idx, len(frame) - 1))
+    train_frame = frame.iloc[:split_idx].copy()
+    test_frame = frame.iloc[split_idx:].copy()
+    split_strategy = "temporal"
+
+    if train_frame["label"].nunique() < 2 or test_frame["label"].nunique() < 2:
+        split_strategy = "stratified_random_fallback"
+        train_frame, test_frame = train_test_split(
+            frame,
+            test_size=test_size,
+            random_state=random_state,
+            stratify=frame["label"],
+        )
+        train_frame = train_frame.sort_values("ts")
+        test_frame = test_frame.sort_values("ts")
+
+    x_train = train_frame[FEATURES].astype(float)
+    y_train = train_frame["label"].astype(int)
+    x_test = test_frame[FEATURES].astype(float)
+    y_test = test_frame["label"].astype(int)
+    source_train = train_frame["label_source"].astype(str)
+
+    source_weights = source_train.map(
+        {
+            "observed_realized": 1.0,
+            "observed_rejected": 1.0,
+            "accepted_proxy": 0.75,
+            "fallback_proxy": 0.55,
+        }
+    ).fillna(1.0)
+
+    tune_size = min(len(x_train), 250_000)
+    if tune_size < len(x_train):
+        tune_idx = x_train.sample(n=tune_size, random_state=random_state).index
+        x_tune = x_train.loc[tune_idx]
+        y_tune = y_train.loc[tune_idx]
+        w_tune = source_weights.loc[tune_idx]
+    else:
+        x_tune = x_train
+        y_tune = y_train
+        w_tune = source_weights
+
+    candidate_cs = [0.35, 0.75, 1.5]
+    candidate_metrics: list[dict[str, float]] = []
+    best_c = candidate_cs[0]
+    best_score = float("-inf")
+
+    for c_value in candidate_cs:
+        candidate_model = Pipeline(
+            steps=[
+                ("scaler", StandardScaler()),
+                (
+                    "clf",
+                    LogisticRegression(
+                        C=c_value,
+                        max_iter=800,
+                        solver="lbfgs",
+                        class_weight="balanced",
+                    ),
+                ),
+            ]
+        )
+        candidate_model.fit(x_tune, y_tune, clf__sample_weight=w_tune.values)
+        proba_test = pd.Series(candidate_model.predict_proba(x_test)[:, 1], index=y_test.index)
+        auc_value = float(roc_auc_score(y_test, proba_test))
+        ap_value = float(average_precision_score(y_test, proba_test))
+        brier_value = float(brier_score_loss(y_test, proba_test))
+        combo_score = (auc_value * 0.55) + (ap_value * 0.35) + ((1.0 - brier_value) * 0.10)
+        candidate_metrics.append(
+            {
+                "c": float(c_value),
+                "roc_auc": auc_value,
+                "average_precision": ap_value,
+                "brier_score": brier_value,
+                "combo_score": combo_score,
+            }
+        )
+        if combo_score > best_score:
+            best_score = combo_score
+            best_c = c_value
 
     model = Pipeline(
         steps=[
             ("scaler", StandardScaler()),
-            ("clf", LogisticRegression(max_iter=600, solver="lbfgs", class_weight="balanced")),
+            (
+                "clf",
+                LogisticRegression(
+                    C=best_c,
+                    max_iter=900,
+                    solver="lbfgs",
+                    class_weight="balanced",
+                ),
+            ),
         ]
     )
-    model.fit(X_train, y_train)
+    model.fit(x_train, y_train, clf__sample_weight=source_weights.values)
 
-    proba = pd.Series(model.predict_proba(X_test)[:, 1])
+    proba = pd.Series(model.predict_proba(x_test)[:, 1], index=y_test.index)
     pred = (proba >= 0.5).astype(int)
+
+    x_train_r, x_test_r, y_train_r, y_test_r, source_train_r, _source_test_r = train_test_split(
+        X,
+        y,
+        frame["label_source"].astype(str),
+        test_size=test_size,
+        random_state=random_state,
+        stratify=y,
+    )
+    source_weights_r = source_train_r.map(
+        {
+            "observed_realized": 1.0,
+            "observed_rejected": 1.0,
+            "accepted_proxy": 0.75,
+            "fallback_proxy": 0.55,
+        }
+    ).fillna(1.0)
+    random_model = Pipeline(
+        steps=[
+            ("scaler", StandardScaler()),
+            (
+                "clf",
+                LogisticRegression(
+                    C=best_c,
+                    max_iter=800,
+                    solver="lbfgs",
+                    class_weight="balanced",
+                ),
+            ),
+        ]
+    )
+    random_model.fit(x_train_r, y_train_r, clf__sample_weight=source_weights_r.values)
+    random_proba = pd.Series(random_model.predict_proba(x_test_r)[:, 1], index=y_test_r.index)
 
     metrics = {
         "roc_auc": float(roc_auc_score(y_test, proba)),
@@ -278,15 +513,42 @@ def train(df: pd.DataFrame, random_state: int = 42) -> tuple[Pipeline, dict[str,
         "f1_at_0_5": float(f1_score(y_test, pred, zero_division=0)),
         "brier_score": float(brier_score_loss(y_test, proba)),
         "ece_10_bins": float(expected_calibration_error(y_test, proba, bins=10)),
+        "split_strategy": split_strategy,
+        "best_logreg_c": float(best_c),
+        "candidate_c_grid": [float(c) for c in candidate_cs],
+        "candidate_metrics": candidate_metrics,
+        "random_split_roc_auc": float(roc_auc_score(y_test_r, random_proba)),
+        "random_split_average_precision": float(average_precision_score(y_test_r, random_proba)),
+        "train_rows": int(len(y_train)),
         "test_rows": int(len(y_test)),
+        "positive_rate_train": float(y_train.mean()),
         "positive_rate_test": float(y_test.mean()),
     }
+    quality_flags: list[str] = []
+    if metrics["roc_auc"] >= 0.995:
+        quality_flags.append("temporal_auc_extremely_high")
+    if abs(metrics["roc_auc"] - metrics["random_split_roc_auc"]) > 0.06:
+        quality_flags.append("temporal_random_gap")
+    if metrics["ece_10_bins"] > 0.08:
+        quality_flags.append("calibration_warning")
+    metrics["quality_flags"] = quality_flags
+
+    evaluation = {
+        "y_test": y_test.reset_index(drop=True),
+        "proba_test": proba.reset_index(drop=True),
+        "test_frame": test_frame.reset_index(drop=True),
+    }
+    return model, metrics, evaluation
+
+
+def train(df: pd.DataFrame, random_state: int = 42) -> tuple[Pipeline, dict[str, Any]]:
+    model, metrics, _evaluation = train_with_evaluation(df, random_state=random_state)
     return model, metrics
 
 
 def _train_window_signature(window: tuple[datetime, datetime] | None) -> str:
     if window is None:
-        return ""
+        return "full"
     return f"{window[0].isoformat()}::{window[1].isoformat()}"
 
 
@@ -306,7 +568,7 @@ def _cached_model_is_current(
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
     except Exception:
         return False
-    return str(meta.get("train_window_signature", "")) == window_signature and bool(window_signature)
+    return str(meta.get("train_window_signature", "")) == window_signature
 
 
 def main() -> None:
@@ -379,13 +641,14 @@ def main() -> None:
 
     model, metrics = train(df)
     label_source_counts = {str(k): int(v) for k, v in df["label_source"].value_counts().to_dict().items()}
+    threshold_global = float(df.get("label_threshold_eur_h_global", df["label_threshold_eur_h"]).median())
 
     payload = {
         "model": model,
         "feature_columns": FEATURES,
         "trained_rows": int(len(df)),
         "positive_rate": float(df["label"].mean()),
-        "label_threshold_eur_h": float(df["label_threshold_eur_h"].iloc[0]),
+        "label_threshold_eur_h": threshold_global,
         "base_threshold_eur_h": float(args.revenue_threshold_eur_h),
         "positive_quantile": float(args.positive_quantile),
         "context_window_minutes": int(args.context_window_minutes),
@@ -406,7 +669,7 @@ def main() -> None:
                 "feature_columns": FEATURES,
                 "trained_rows": int(len(df)),
                 "positive_rate": round(float(df["label"].mean()), 4),
-                "label_threshold_eur_h": float(df["label_threshold_eur_h"].iloc[0]),
+                "label_threshold_eur_h": threshold_global,
                 "base_threshold_eur_h": float(args.revenue_threshold_eur_h),
                 "positive_quantile": float(args.positive_quantile),
                 "context_window_minutes": int(args.context_window_minutes),
@@ -426,7 +689,7 @@ def main() -> None:
     print(f"metadata saved to {meta_path}")
     print(
         f"trained_rows={len(df)} positive_rate={df['label'].mean():.4f} "
-        f"label_threshold={float(df['label_threshold_eur_h'].iloc[0]):.2f}"
+        f"label_threshold={threshold_global:.2f}"
     )
     print(
         f"roc_auc={metrics['roc_auc']:.4f} average_precision={metrics['average_precision']:.4f} "
