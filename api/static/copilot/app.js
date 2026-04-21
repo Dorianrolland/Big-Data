@@ -3253,6 +3253,143 @@ async function refreshAll() {
   await refreshDriverData();
 }
 
+// ── COP-029 : Wallboard Flotte (map multi-markers + drill-down) ──────────────
+(function setupFleetWallboard() {
+  const mapEl = document.getElementById('fleetMap');
+  const refreshBtn = document.getElementById('fleetRefreshBtn');
+  const activeChip = document.getElementById('fleetActiveChip');
+  const pressureChip = document.getElementById('fleetPressureChip');
+  const opportunitiesList = document.getElementById('fleetOpportunitiesList');
+  const driverDetail = document.getElementById('fleetDriverDetail');
+  const alertsList = document.getElementById('fleetAlertsList');
+
+  if (!mapEl || typeof L === 'undefined') return;
+
+  const fleetMap = L.map(mapEl, { zoomControl: true }).setView([40.75, -73.99], 12);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '© OpenStreetMap',
+    maxZoom: 18,
+  }).addTo(fleetMap);
+
+  const clusterGroup = L.markerClusterGroup({ maxClusterRadius: 40, disableClusteringAtZoom: 15 });
+  fleetMap.addLayer(clusterGroup);
+
+  let _fleetMarkers = {};
+  let _refreshTimer = null;
+
+  function _scoreColor(score) {
+    if (score >= 0.7) return '#22c55e';
+    if (score >= 0.45) return '#f59e0b';
+    return '#94a3b8';
+  }
+
+  function _driverIcon(score) {
+    const color = _scoreColor(score);
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 22 22">
+      <circle cx="11" cy="11" r="9" fill="${color}" stroke="#0f172a" stroke-width="2"/>
+      <text x="11" y="15" font-size="10" text-anchor="middle" fill="#0f172a" font-weight="bold">${Math.round(score * 10)}</text>
+    </svg>`;
+    return L.divIcon({
+      html: svg, className: '', iconSize: [22, 22], iconAnchor: [11, 11],
+    });
+  }
+
+  function _renderDriverDetail(d) {
+    if (!driverDetail) return;
+    const color = _scoreColor(d.opportunity_score);
+    driverDetail.innerHTML = `
+      <div style="font-weight:600;color:#f8fafc">${escapeHtml(d.courier_id)}</div>
+      <div>Zone: <b>${escapeHtml(d.zone_id)}</b> — ${escapeHtml(d.status)}</div>
+      <div>Score: <b style="color:${color}">${d.opportunity_score}</b> — ${escapeHtml(d.best_action)}</div>
+      <div>Demand: ${d.demand_index} / Supply: ${d.supply_index}</div>
+      <div>Pression: ${d.pressure_ratio}</div>
+      <div style="color:#64748b;font-size:.75rem">${d.updated_at || ''}</div>
+    `;
+  }
+
+  async function refreshFleet() {
+    try {
+      const data = await api('/copilot/fleet/overview?limit=300');
+      const drivers = Array.isArray(data.drivers) ? data.drivers : [];
+
+      // Update chips
+      if (activeChip) activeChip.textContent = `${data.active_drivers} actifs`;
+      if (pressureChip) pressureChip.textContent = `pression ${(data.avg_pressure_ratio || 0).toFixed(2)}`;
+
+      // Update map markers
+      const seen = new Set();
+      for (const d of drivers) {
+        if (!d.lat || !d.lon) continue;
+        seen.add(d.courier_id);
+        if (_fleetMarkers[d.courier_id]) {
+          _fleetMarkers[d.courier_id].setLatLng([d.lat, d.lon]);
+          _fleetMarkers[d.courier_id].setIcon(_driverIcon(d.opportunity_score));
+          _fleetMarkers[d.courier_id]._fleetData = d;
+        } else {
+          const marker = L.marker([d.lat, d.lon], { icon: _driverIcon(d.opportunity_score) });
+          marker._fleetData = d;
+          marker.on('click', () => _renderDriverDetail(marker._fleetData));
+          marker.bindTooltip(d.courier_id, { permanent: false, direction: 'top' });
+          clusterGroup.addLayer(marker);
+          _fleetMarkers[d.courier_id] = marker;
+        }
+      }
+      // Remove stale markers
+      for (const cid of Object.keys(_fleetMarkers)) {
+        if (!seen.has(cid)) {
+          clusterGroup.removeLayer(_fleetMarkers[cid]);
+          delete _fleetMarkers[cid];
+        }
+      }
+
+      // Top opportunities panel
+      if (opportunitiesList) {
+        const top = (data.top_opportunities || []).slice(0, 6);
+        opportunitiesList.innerHTML = top.length === 0
+          ? '<div style="color:#64748b;font-size:.8rem">Aucune opportunité forte détectée.</div>'
+          : top.map(d => {
+              const color = _scoreColor(d.opportunity_score);
+              return `<div style="display:flex;justify-content:space-between;align-items:center;background:rgba(255,255,255,.07);border-radius:.3rem;padding:.3rem .5rem;cursor:pointer"
+                data-cid="${escapeHtml(d.courier_id)}">
+                <span style="font-size:.8rem;color:#e2e8f0">${escapeHtml(d.courier_id)} <span style="color:#64748b">${escapeHtml(d.zone_id)}</span></span>
+                <span style="font-weight:700;color:${color}">${d.opportunity_score}</span>
+              </div>`;
+            }).join('');
+        // Click on opportunity row
+        opportunitiesList.querySelectorAll('[data-cid]').forEach(row => {
+          row.addEventListener('click', () => {
+            const cid = row.dataset.cid;
+            const m = _fleetMarkers[cid];
+            if (m) {
+              fleetMap.setView(m.getLatLng(), 15);
+              _renderDriverDetail(m._fleetData);
+            }
+          });
+        });
+      }
+
+      // Alerts
+      if (alertsList) {
+        const alerts = data.alerts || [];
+        alertsList.textContent = alerts.length === 0 ? '—' : alerts.map(a => a.message).join(' | ');
+      }
+
+    } catch (err) {
+      if (alertsList) alertsList.textContent = `Erreur: ${errorMessage(err)}`;
+    }
+  }
+
+  if (refreshBtn) refreshBtn.addEventListener('click', refreshFleet);
+
+  // Auto-refresh every 15s alongside main loop
+  function startFleetAutoRefresh() {
+    clearInterval(_refreshTimer);
+    _refreshTimer = setInterval(refreshFleet, 15000);
+  }
+  refreshFleet();
+  startFleetAutoRefresh();
+})();
+
 // ── PWA: Service Worker + offline banner (COP-022) ───────────────────────────
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/static/copilot/sw.js').catch(() => {});
