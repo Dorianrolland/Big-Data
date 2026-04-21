@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 _API_DIR = Path(__file__).resolve().parent.parent / "api"
 if str(_API_DIR) not in sys.path:
     sys.path.insert(0, str(_API_DIR))
@@ -95,6 +97,7 @@ def test_session_report_csv_parseable():
 
 
 def test_session_report_pdf_format():
+    pytest.importorskip("fpdf", reason="fpdf2 not installed")
     req = _make_request(_SAMPLE_MISSIONS)
     response = asyncio.run(router.session_report(req, "drv_001", fmt="pdf", limit=50))
     assert response.media_type == "application/pdf"
