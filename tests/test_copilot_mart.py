@@ -2,11 +2,9 @@
 from __future__ import annotations
 
 import sys
-import tempfile
 from pathlib import Path
 
 import duckdb
-import pandas as pd
 import pytest
 
 _ROOT = Path(__file__).resolve().parent.parent

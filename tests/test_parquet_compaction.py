@@ -1,7 +1,6 @@
 """Tests de non-régression compaction Parquet (COP-026)."""
 from __future__ import annotations
 
-import sys
 import tempfile
 from pathlib import Path
 from importlib.util import spec_from_file_location, module_from_spec
@@ -116,7 +115,6 @@ def test_compact_report_generated():
 
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "compacted"
-        import json
         # Patch report path to tmp
         orig = compact_mod._ROOT
         compact_mod._ROOT = Path(tmp)

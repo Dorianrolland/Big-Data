@@ -1,7 +1,6 @@
 """Tests de cohérence du backtest Copilot vs baselines (COP-015)."""
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 

@@ -1,7 +1,6 @@
 """Tests du mode flotte démo (COP-027)."""
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 from importlib.util import spec_from_file_location, module_from_spec
 

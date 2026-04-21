@@ -252,7 +252,6 @@ def run_backtest(
     print(f"[backtest] Saved {csv_path}")
 
     # Print comparison table
-    copilot_kpi = next(r for r in results if r["strategy"] == "copilot")
     print("\n── Backtest Results ────────────────────────────────────────────────")
     print(f"{'Strategy':<18} {'Accept%':>8} {'Net €/h':>9} {'Net €':>10} {'Km':>8} {'Fuel €':>8}")
     print("─" * 68)

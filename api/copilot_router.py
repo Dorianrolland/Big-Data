@@ -18,7 +18,7 @@ import joblib
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from copilot_logic import (

@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import sys
 import time
 from pathlib import Path
@@ -56,7 +55,7 @@ def _benchmark(glob_pattern: str, con: duckdb.DuckDBPyConnection) -> list[dict]:
         try:
             con.execute(sql).fetchdf()
             elapsed_ms = (time.perf_counter() - t0) * 1000
-        except Exception as e:
+        except Exception:
             elapsed_ms = -1.0
         results.append({"id": q["id"], "label": q["label"], "elapsed_ms": round(elapsed_ms, 1)})
     return results
@@ -152,7 +151,7 @@ def run_compaction(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     total_before = _count_files(parquet_dir)
-    print(f"\n── Compaction Parquet Events ─────────────────────────────")
+    print("\n── Compaction Parquet Events ─────────────────────────────")
     print(f"  Source     : {parquet_dir}")
     print(f"  Sortie     : {out_dir}")
     print(f"  Fichiers   : {total_before}")

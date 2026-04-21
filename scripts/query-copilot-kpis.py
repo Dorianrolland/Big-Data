@@ -133,7 +133,7 @@ def main() -> None:
     mart_dir = _ROOT / args.mart
     if not mart_dir.exists():
         print(f"[kpi] Mart not found: {mart_dir} — build it first:")
-        print(f"  python3 scripts/build-copilot-mart.py")
+        print("  python3 scripts/build-copilot-mart.py")
         sys.exit(1)
 
     if args.fmt == "table":
