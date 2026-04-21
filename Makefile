@@ -1,4 +1,4 @@
-.PHONY: up fleet-up down logs build clean restart status train-copilot train-copilot-10m train-copilot-report demo-copilot demo-rank demo-next-zone bench-copilot smoke-e2e perf-lot4 proof-lot4 real-mode sim-mode demo-ingest prepare-routing-osrm single-driver-reset single-driver-up single-driver-down single-driver-logs focus-map demo-scoreboard demo-scenarios
+.PHONY: up fleet-up down logs build clean restart status train-copilot train-copilot-10m train-copilot-report demo-copilot demo-rank demo-next-zone bench-copilot smoke-e2e perf-lot4 proof-lot4 real-mode sim-mode demo-ingest prepare-routing-osrm single-driver-reset single-driver-up single-driver-down single-driver-logs focus-map demo-scoreboard demo-scenarios build-mart query-kpis fleet-demo-up fleet-demo-down fleet-demo-check
 
 ## Lance l'intégralité du stack (build + démarrage)
 up:
@@ -196,6 +196,23 @@ build-mart:
 ## Requêtes KPI sur le Data Mart (COP-025)
 query-kpis:
 	python3 scripts/query-copilot-kpis.py
+
+## Lance le mode flotte multi-chauffeurs (COP-027)
+fleet-demo-up:
+	docker compose --env-file env/fleet_demo.env up --build -d
+	@echo "Fleet demo démarré — en attente de 50+ chauffeurs actifs..."
+	@echo "Vérifier : make fleet-demo-check"
+
+## Arrête le mode flotte
+fleet-demo-down:
+	docker compose down
+
+## Vérifie la stabilité du mode flotte (chauffeurs actifs, erreurs)
+fleet-demo-check:
+	@echo "── Fleet demo status ──"
+	@curl -s "http://localhost:8001/health" | python3 -m json.tool 2>/dev/null || echo "API indisponible"
+	@echo ""
+	@curl -s "http://localhost:8001/stats" | python3 -m json.tool 2>/dev/null || echo "Stats indisponibles"
 
 ## Lance explicitement le mode flotte (utile pour stress/perf uniquement)
 fleet-up:
