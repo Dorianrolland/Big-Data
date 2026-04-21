@@ -3253,9 +3253,41 @@ async function refreshAll() {
   await refreshDriverData();
 }
 
+// ── PWA: Service Worker + offline banner (COP-022) ───────────────────────────
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/static/copilot/sw.js').catch(() => {});
 }
+
+(function setupOfflineBanner() {
+  const banner = document.createElement('div');
+  banner.id = 'offlineBanner';
+  banner.setAttribute('role', 'alert');
+  banner.setAttribute('aria-live', 'assertive');
+  banner.style.cssText = [
+    'display:none',
+    'position:fixed',
+    'top:0',
+    'left:0',
+    'right:0',
+    'z-index:9999',
+    'background:#dc2626',
+    'color:#fff',
+    'text-align:center',
+    'padding:.45rem 1rem',
+    'font-size:.85rem',
+    'font-weight:600',
+    'letter-spacing:.02em',
+  ].join(';');
+  banner.textContent = 'Hors ligne — les données affichées peuvent être obsolètes.';
+  document.body.prepend(banner);
+
+  function update() {
+    banner.style.display = navigator.onLine ? 'none' : 'block';
+  }
+  window.addEventListener('online', update);
+  window.addEventListener('offline', update);
+  update();
+})();
 
 safeBind($('window30'), 'click', () => {
   setWindowMinutes(30);
@@ -3340,6 +3372,41 @@ bindChangeAndInput(objWeightGainInput, handleObjectiveWeightChange);
 bindChangeAndInput(objWeightTimeInput, handleObjectiveWeightChange);
 bindChangeAndInput(objWeightFuelInput, handleObjectiveWeightChange);
 safeBind(autoRefreshBox, 'change', startAutoRefreshLoop);
+
+// ── Session report export (COP-023) ──────────────────────────────────────────
+function _triggerDownload(url, filename) {
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
+safeBind($('exportSessionJsonBtn'), 'click', () => {
+  const driverId = currentDriverId();
+  const url = `/copilot/driver/${encodeURIComponent(driverId)}/session-report?format=json`;
+  fetch(url).then(r => r.json()).then(data => {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    _triggerDownload(URL.createObjectURL(blob), `session_${driverId}.json`);
+  }).catch(err => setUxStatus('error', `Export JSON failed: ${errorMessage(err)}`));
+});
+
+safeBind($('exportSessionCsvBtn'), 'click', () => {
+  const driverId = currentDriverId();
+  _triggerDownload(
+    `/copilot/driver/${encodeURIComponent(driverId)}/session-report?format=csv`,
+    `session_${driverId}.csv`,
+  );
+});
+
+safeBind($('exportSessionPdfBtn'), 'click', () => {
+  const driverId = currentDriverId();
+  _triggerDownload(
+    `/copilot/driver/${encodeURIComponent(driverId)}/session-report?format=pdf`,
+    `session_${driverId}.pdf`,
+  );
+});
 
 bindOfferActionDelegation(offersEl);
 bindOfferActionDelegation(bestOffersEl);
