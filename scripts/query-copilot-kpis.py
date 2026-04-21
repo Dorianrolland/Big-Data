@@ -1,12 +1,4 @@
-"""COP-025 — Requêtes KPI sur le Data Mart Copilot.
-
-Sort 10 KPIs clés en < 5s pour démonstration Big Data jury.
-
-Usage:
-    python3 scripts/query-copilot-kpis.py
-    python3 scripts/query-copilot-kpis.py --mart data/marts/copilot --fmt table
-    python3 scripts/query-copilot-kpis.py --fmt json
-"""
+"""Run KPI queries on the Copilot data mart."""
 from __future__ import annotations
 
 import argparse
@@ -30,7 +22,7 @@ KPI_QUERIES: list[dict] = [
         "id": "kpi_02",
         "label": "Taux de surge (demand>0.7 & supply<0.4)",
         "table": "fact_context_signals",
-        "sql": "SELECT ROUND(100.0 * SUM(CASE WHEN surge_candidate THEN 1 ELSE 0 END) / COUNT(*), 2) AS surge_rate_pct FROM '{table}'",
+        "sql": "SELECT ROUND(100.0 * SUM(CASE WHEN surge_candidate THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 2) AS surge_rate_pct FROM '{table}'",
     },
     {
         "id": "kpi_03",
@@ -46,9 +38,47 @@ KPI_QUERIES: list[dict] = [
     },
     {
         "id": "kpi_05",
-        "label": "Accept rate (offres → events)",
+        "label": "Accept rate reel (offres decidees)",
         "table": "fact_order_events",
-        "sql": "SELECT COUNT(*) AS events, COUNT(DISTINCT courier_id) AS drivers FROM '{table}'",
+        "sql": """
+            WITH normalized AS (
+                SELECT
+                    offer_id,
+                    COALESCE(NULLIF(LOWER(TRIM(status)), ''), 'unknown') AS status_norm,
+                    ts
+                FROM '{table}'
+                WHERE offer_id IS NOT NULL AND offer_id <> ''
+            ),
+            final_decisions AS (
+                SELECT
+                    offer_id,
+                    CASE WHEN status_norm = 'accepted' THEN 1 ELSE 0 END AS accepted_flag,
+                    CASE WHEN status_norm = 'rejected' THEN 1 ELSE 0 END AS rejected_flag
+                FROM (
+                    SELECT
+                        offer_id,
+                        status_norm,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY offer_id
+                            ORDER BY ts DESC NULLS LAST
+                        ) AS rn
+                    FROM normalized
+                    WHERE status_norm IN ('accepted', 'rejected')
+                )
+                WHERE rn = 1
+            )
+            SELECT
+                CAST(COUNT(*) AS BIGINT) AS decided_offers,
+                CAST(COALESCE(SUM(CASE WHEN accepted_flag = 1 THEN 1 ELSE 0 END), 0) AS BIGINT) AS accepted_offers,
+                CAST(COALESCE(SUM(CASE WHEN rejected_flag = 1 THEN 1 ELSE 0 END), 0) AS BIGINT) AS rejected_offers,
+                ROUND(
+                    100.0 *
+                    SUM(CASE WHEN accepted_flag = 1 THEN 1 ELSE 0 END)
+                    / NULLIF(COUNT(*), 0),
+                    2
+                ) AS accept_rate_pct
+            FROM final_decisions
+        """,
     },
     {
         "id": "kpi_06",
@@ -58,9 +88,17 @@ KPI_QUERIES: list[dict] = [
     },
     {
         "id": "kpi_07",
-        "label": "Répartition par source_platform",
+        "label": "Repartition par source_platform",
         "table": "fact_context_signals",
-        "sql": "SELECT source_platform, COUNT(*) AS cnt FROM '{table}' GROUP BY source_platform ORDER BY cnt DESC",
+        "sql": """
+            SELECT
+                COALESCE(NULLIF(split_part(source_platform, ';', 1), ''), 'unknown') AS source_platform,
+                COUNT(*) AS cnt
+            FROM '{table}'
+            GROUP BY 1
+            ORDER BY cnt DESC
+            LIMIT 10
+        """,
     },
     {
         "id": "kpi_08",
@@ -70,17 +108,21 @@ KPI_QUERIES: list[dict] = [
     },
     {
         "id": "kpi_09",
-        "label": "Impact météo sur pression offre",
+        "label": "Impact meteo sur pression offre",
         "table": "fact_context_signals",
         "sql": "SELECT ROUND(weather_factor, 1) AS weather_bucket, ROUND(AVG(demand_index), 4) AS avg_demand, COUNT(*) AS n FROM '{table}' GROUP BY weather_bucket ORDER BY weather_bucket",
     },
     {
         "id": "kpi_10",
-        "label": "Missions réalisées net EUR/h vs predit",
+        "label": "Missions realisees net EUR/h",
         "table": "fact_missions",
         "sql": "SELECT COUNT(*) AS missions, ROUND(AVG(realized_net_eur_h), 2) AS avg_realized_net_eur_h FROM '{table}' WHERE realized_net_eur_h IS NOT NULL",
     },
 ]
+
+
+def _duck_path(path: Path) -> str:
+    return str(path).replace("\\", "/").replace("'", "''")
 
 
 def run_kpis(mart_dir: Path, fmt: str = "table") -> list[dict]:
@@ -88,56 +130,59 @@ def run_kpis(mart_dir: Path, fmt: str = "table") -> list[dict]:
     results = []
     total_start = time.perf_counter()
 
-    for kpi in KPI_QUERIES:
-        table_path = mart_dir / f"{kpi['table']}.parquet"
-        if not table_path.exists():
+    try:
+        for kpi in KPI_QUERIES:
+            table_path = mart_dir / f"{kpi['table']}.parquet"
+            if not table_path.exists():
+                if fmt == "table":
+                    print(f"  [{kpi['id']}] {kpi['label']}: SKIP (table missing)")
+                continue
+
+            sql = kpi["sql"].replace("{table}", _duck_path(table_path))
+            t0 = time.perf_counter()
+            try:
+                df = con.execute(sql).fetchdf()
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+            except Exception as exc:
+                if fmt == "table":
+                    print(f"  [{kpi['id']}] {kpi['label']}: ERROR - {exc}")
+                continue
+
+            entry = {
+                "id": kpi["id"],
+                "label": kpi["label"],
+                "elapsed_ms": round(elapsed_ms, 1),
+                "rows": len(df),
+                "data": df.to_dict(orient="records"),
+            }
+            results.append(entry)
+
             if fmt == "table":
-                print(f"  [{kpi['id']}] {kpi['label']}: SKIP (table missing)")
-            continue
+                print(f"\n  [{kpi['id']}] {kpi['label']}  ({elapsed_ms:.1f} ms)")
+                print(df.to_string(index=False))
 
-        sql = kpi["sql"].replace("{table}", str(table_path))
-        t0 = time.perf_counter()
-        try:
-            df = con.execute(sql).fetchdf()
-            elapsed_ms = (time.perf_counter() - t0) * 1000
-        except Exception as e:
-            if fmt == "table":
-                print(f"  [{kpi['id']}] {kpi['label']}: ERROR — {e}")
-            continue
-
-        entry = {
-            "id": kpi["id"],
-            "label": kpi["label"],
-            "elapsed_ms": round(elapsed_ms, 1),
-            "rows": len(df),
-            "data": df.to_dict(orient="records"),
-        }
-        results.append(entry)
-
+        total_ms = (time.perf_counter() - total_start) * 1000
         if fmt == "table":
-            print(f"\n  [{kpi['id']}] {kpi['label']}  ({elapsed_ms:.1f} ms)")
-            print(df.to_string(index=False))
-
-    total_ms = (time.perf_counter() - total_start) * 1000
-    if fmt == "table":
-        print(f"\n── {len(results)} KPIs en {total_ms:.0f} ms ──")
-    return results
+            print(f"\n-- {len(results)} KPIs en {total_ms:.0f} ms --")
+        return results
+    finally:
+        con.close()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Requêtes KPI Copilot Data Mart")
+    parser = argparse.ArgumentParser(description="Requetes KPI Copilot Data Mart")
     parser.add_argument("--mart", default="data/marts/copilot")
     parser.add_argument("--fmt", choices=["table", "json"], default="table")
     args = parser.parse_args()
 
     mart_dir = _ROOT / args.mart
     if not mart_dir.exists():
-        print(f"[kpi] Mart not found: {mart_dir} — build it first:")
-        print("  python3 scripts/build-copilot-mart.py")
+        print(f"[kpi] Mart not found: {mart_dir} - build it first:")
+        print("  python scripts/build-copilot-mart.py")
         sys.exit(1)
 
     if args.fmt == "table":
-        print("\n══ FleetStream — KPIs Data Mart Copilot ══")
+        print("\n== FleetStream - KPIs Data Mart Copilot ==")
     results = run_kpis(mart_dir, fmt=args.fmt)
 
     if args.fmt == "json":
