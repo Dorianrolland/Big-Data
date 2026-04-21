@@ -3817,3 +3817,105 @@ async def session_report(
         )
     return report
 
+
+
+# ── COP-028 : Fleet Copilot Overview ─────────────────────────────────────────
+
+def _parse_fleet_driver(courier_id: str, state: dict) -> dict | None:
+    """Build a fleet driver entry from Redis hash. Returns None if stale/empty."""
+    lat = _as_float(state.get("lat"), 0.0)
+    lon = _as_float(state.get("lon"), 0.0)
+    if lat == 0.0 and lon == 0.0:
+        return None
+
+    status = state.get("status", "unknown")
+    zone_id = state.get("zone_id") or state.get("zone_cell") or "unknown"
+    demand = _as_float(state.get("demand_index"), 0.0)
+    supply = _as_float(state.get("supply_index"), 0.5)
+    weather = _as_float(state.get("weather_factor"), 1.0)
+    traffic = _as_float(state.get("traffic_factor"), 1.0)
+    pressure = demand / max(supply, 0.01)
+
+    # Heuristic opportunity score from context
+    opp_score = round(min(max(pressure / 5.0 * 0.6 + demand * 0.4, 0.0), 1.0), 3)
+
+    best_action = "hold"
+    if opp_score >= 0.7:
+        best_action = "accept_next"
+    elif opp_score >= 0.45:
+        best_action = "reposition"
+
+    return {
+        "courier_id": courier_id,
+        "status": status,
+        "zone_id": zone_id,
+        "lat": round(lat, 6),
+        "lon": round(lon, 6),
+        "demand_index": round(demand, 4),
+        "supply_index": round(supply, 4),
+        "weather_factor": round(weather, 3),
+        "traffic_factor": round(traffic, 3),
+        "pressure_ratio": round(pressure, 4),
+        "opportunity_score": opp_score,
+        "best_action": best_action,
+        "updated_at": state.get("updated_at") or state.get("ts"),
+    }
+
+
+@copilot_router.get("/fleet/overview")
+async def fleet_overview(
+    request: Request,
+    zone: str | None = Query(None, description="Filtrer par zone_id"),
+    status: str | None = Query(None, description="Filtrer par status (moving, idle, ...)"),
+    min_score: float = Query(0.0, ge=0.0, le=1.0, description="Score opportunité minimum"),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """Vue agrégée flotte : top chauffeurs, scores opportunité, alertes."""
+    redis_client: aioredis.Redis = request.app.state.redis
+
+    drivers: list[dict] = []
+    async for key in redis_client.scan_iter(match=f"{COURIER_HASH_PREFIX}*", count=200):
+        courier_id = key.replace(COURIER_HASH_PREFIX, "") if isinstance(key, str) else key.decode().replace(COURIER_HASH_PREFIX, "")
+        raw = await redis_client.hgetall(key)
+        if not raw:
+            continue
+        entry = _parse_fleet_driver(courier_id, raw)
+        if entry is None:
+            continue
+        if zone and entry["zone_id"] != zone:
+            continue
+        if status and entry["status"] != status:
+            continue
+        if entry["opportunity_score"] < min_score:
+            continue
+        drivers.append(entry)
+        if len(drivers) >= limit:
+            break
+
+    drivers.sort(key=lambda d: -d["opportunity_score"])
+
+    # Aggregate fleet KPIs
+    n = len(drivers)
+    top_opportunities = [d for d in drivers[:10] if d["opportunity_score"] >= 0.6]
+    alerts: list[dict] = []
+    if n == 0:
+        alerts.append({"type": "no_active_drivers", "message": "Aucun chauffeur actif en Redis."})
+
+    avg_demand = round(sum(d["demand_index"] for d in drivers) / max(n, 1), 4)
+    avg_pressure = round(sum(d["pressure_ratio"] for d in drivers) / max(n, 1), 4)
+    zone_counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
+    for d in drivers:
+        zone_counts[d["zone_id"]] = zone_counts.get(d["zone_id"], 0) + 1
+        status_counts[d["status"]] = status_counts.get(d["status"], 0) + 1
+
+    return {
+        "active_drivers": n,
+        "avg_demand_index": avg_demand,
+        "avg_pressure_ratio": avg_pressure,
+        "top_zones": sorted(zone_counts.items(), key=lambda x: -x[1])[:5],
+        "status_distribution": status_counts,
+        "top_opportunities": top_opportunities,
+        "alerts": alerts,
+        "drivers": drivers,
+    }
