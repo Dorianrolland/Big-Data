@@ -125,6 +125,11 @@ def _duck_path(path: Path) -> str:
     return str(path).replace("\\", "/").replace("'", "''")
 
 
+def _safe_print(text: str) -> None:
+    encoding = sys.stdout.encoding or "utf-8"
+    print(text.encode(encoding, errors="replace").decode(encoding, errors="replace"))
+
+
 def run_kpis(mart_dir: Path, fmt: str = "table") -> list[dict]:
     con = duckdb.connect()
     results = []
@@ -135,7 +140,7 @@ def run_kpis(mart_dir: Path, fmt: str = "table") -> list[dict]:
             table_path = mart_dir / f"{kpi['table']}.parquet"
             if not table_path.exists():
                 if fmt == "table":
-                    print(f"  [{kpi['id']}] {kpi['label']}: SKIP (table missing)")
+                    _safe_print(f"  [{kpi['id']}] {kpi['label']}: SKIP (table missing)")
                 continue
 
             sql = kpi["sql"].replace("{table}", _duck_path(table_path))
@@ -145,7 +150,7 @@ def run_kpis(mart_dir: Path, fmt: str = "table") -> list[dict]:
                 elapsed_ms = (time.perf_counter() - t0) * 1000
             except Exception as exc:
                 if fmt == "table":
-                    print(f"  [{kpi['id']}] {kpi['label']}: ERROR - {exc}")
+                    _safe_print(f"  [{kpi['id']}] {kpi['label']}: ERROR - {exc}")
                 continue
 
             entry = {
@@ -158,12 +163,12 @@ def run_kpis(mart_dir: Path, fmt: str = "table") -> list[dict]:
             results.append(entry)
 
             if fmt == "table":
-                print(f"\n  [{kpi['id']}] {kpi['label']}  ({elapsed_ms:.1f} ms)")
-                print(df.to_string(index=False))
+                _safe_print(f"\n  [{kpi['id']}] {kpi['label']}  ({elapsed_ms:.1f} ms)")
+                _safe_print(df.to_string(index=False))
 
         total_ms = (time.perf_counter() - total_start) * 1000
         if fmt == "table":
-            print(f"\n-- {len(results)} KPIs en {total_ms:.0f} ms --")
+            _safe_print(f"\n-- {len(results)} KPIs en {total_ms:.0f} ms --")
         return results
     finally:
         con.close()
@@ -177,16 +182,16 @@ def main() -> None:
 
     mart_dir = _ROOT / args.mart
     if not mart_dir.exists():
-        print(f"[kpi] Mart not found: {mart_dir} - build it first:")
-        print("  python scripts/build-copilot-mart.py")
+        _safe_print(f"[kpi] Mart not found: {mart_dir} - build it first:")
+        _safe_print("  python scripts/build-copilot-mart.py")
         sys.exit(1)
 
     if args.fmt == "table":
-        print("\n== FleetStream - KPIs Data Mart Copilot ==")
+        _safe_print("\n== FleetStream - KPIs Data Mart Copilot ==")
     results = run_kpis(mart_dir, fmt=args.fmt)
 
     if args.fmt == "json":
-        print(json.dumps(results, indent=2, ensure_ascii=False))
+        _safe_print(json.dumps(results, indent=2, ensure_ascii=True))
 
 
 if __name__ == "__main__":
