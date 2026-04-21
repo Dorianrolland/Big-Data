@@ -61,12 +61,16 @@ def _copilot_score(row: pd.Series, model: object | None) -> float:
             return float(model.predict_proba([feats])[0][1])
         except Exception:
             pass
-    # Heuristic fallback
-    net_h = _net_eur_h(
-        float(row.get("estimated_fare_eur", 0) or 0),
-        float(row.get("estimated_distance_km", 1) or 1),
-        float(row.get("estimated_duration_min", 1) or 1),
-    )
+    # Heuristic fallback — use pre-computed net_eur_h if present (e.g. scenario with fuel modifier)
+    net_h_col = row.get("estimated_net_eur_h")
+    if net_h_col is not None and float(net_h_col) != 0.0:
+        net_h = float(net_h_col)
+    else:
+        net_h = _net_eur_h(
+            float(row.get("estimated_fare_eur", 0) or 0),
+            float(row.get("estimated_distance_km", 1) or 1),
+            float(row.get("estimated_duration_min", 1) or 1),
+        )
     demand = float(row.get("demand_index", 0.5) or 0.5)
     supply = float(row.get("supply_index", 0.5) or 0.5)
     pressure = demand / max(supply, 0.01)
@@ -181,12 +185,17 @@ def run_backtest(
     parquet_dir: Path,
     out_dir: Path,
     model_path: Path | None = None,
+    _override_df: "pd.DataFrame | None" = None,
 ) -> dict:
-    df = _load_offers(parquet_dir)
-    synthetic = len(df) < 100
-    if synthetic:
-        print(f"[backtest] Only {len(df)} real offers — using 2000 synthetic offers for demo.")
-        df = _generate_synthetic_offers(2000, seed=RANDOM_SEED)
+    if _override_df is not None:
+        df = _override_df.copy()
+        synthetic = False
+    else:
+        df = _load_offers(parquet_dir)
+        synthetic = len(df) < 100
+        if synthetic:
+            print(f"[backtest] Only {len(df)} real offers — using 2000 synthetic offers for demo.")
+            df = _generate_synthetic_offers(2000, seed=RANDOM_SEED)
 
     rng = random.Random(RANDOM_SEED)
 
