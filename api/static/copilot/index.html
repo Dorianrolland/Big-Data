@@ -5,6 +5,11 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>FleetStream Copilot</title>
   <meta name="theme-color" content="#0f172a" />
+  <meta name="description" content="Copilote décisionnel temps réel pour chauffeurs VTC - FleetStream CY Tech" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Copilot" />
   <link rel="manifest" href="/static/copilot/manifest.webmanifest" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
@@ -735,6 +740,20 @@
 
       .offer-actions button {
         flex: 1 1 100%;
+      }
+    }
+
+    @media (max-width: 480px) {
+      .page { padding: .5rem; }
+      .card { padding: .75rem; }
+      .header-top { flex-direction: column; gap: .5rem; }
+      .chip-row { flex-wrap: wrap; gap: .3rem; }
+      .quick-row { flex-direction: column; gap: .4rem; }
+      .quick-row button { width: 100%; }
+      h2 { font-size: 1rem; }
+      .info-line { font-size: .8rem; }
+      input[type="text"], input[type="number"], select {
+        font-size: 16px; /* prevent iOS auto-zoom */
       }
     }
   </style>
