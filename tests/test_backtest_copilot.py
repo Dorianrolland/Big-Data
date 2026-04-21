@@ -9,6 +9,7 @@ if str(_ROOT / "ml") not in sys.path:
     sys.path.insert(0, str(_ROOT / "ml"))
 
 from backtest_copilot import (
+    _coerce_max_offers,
     _compute_kpis,
     _generate_synthetic_offers,
     _net_eur,
@@ -16,6 +17,7 @@ from backtest_copilot import (
     run_backtest,
 )
 import numpy as np
+import pandas as pd
 import tempfile
 
 
@@ -61,6 +63,24 @@ def test_compute_kpis_never_accept():
     assert kpis["net_eur_total"] == 0.0
 
 
+def test_compute_kpis_fallbacks_to_estimated_when_actual_is_nan():
+    df = pd.DataFrame(
+        {
+            "courier_id": ["drv_a", "drv_b"],
+            "estimated_fare_eur": [10.0, 12.0],
+            "estimated_distance_km": [3.0, 4.0],
+            "estimated_duration_min": [15.0, 20.0],
+            "actual_fare_eur": [np.nan, np.nan],
+            "actual_distance_km": [np.nan, np.nan],
+            "actual_duration_min": [np.nan, np.nan],
+        }
+    )
+    mask = np.array([True, True], dtype=bool)
+    kpis = _compute_kpis(df, mask, "test")
+    assert kpis["net_eur_total"] > 0.0
+    assert kpis["km_total"] > 0.0
+
+
 def test_backtest_produces_files():
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "reports"
@@ -89,3 +109,25 @@ def test_backtest_kpi_coherence():
             assert 0.0 <= s["accept_rate"] <= 1.0
         # copilot accept_rate < always_accept
         assert by_strat["copilot"]["accept_rate"] <= by_strat["always_accept"]["accept_rate"]
+
+
+def test_coerce_max_offers():
+    assert _coerce_max_offers(None) is None
+    assert _coerce_max_offers(0) is None
+    assert _coerce_max_offers(-5) is None
+    assert _coerce_max_offers(123) == 123
+
+
+def test_backtest_respects_max_offers_with_override_df():
+    df = _generate_synthetic_offers(800, seed=123)
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "reports"
+        summary = run_backtest(
+            _ROOT / "data" / "parquet_events",
+            out,
+            model_path=None,
+            _override_df=df,
+            max_offers=150,
+        )
+        assert summary["meta"]["n_offers"] == 150
+        assert summary["meta"]["max_offers"] == 150
