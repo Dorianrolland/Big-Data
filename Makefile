@@ -1,4 +1,4 @@
-.PHONY: up fleet-up down logs build clean restart status train-copilot train-copilot-10m train-copilot-report demo-copilot demo-rank demo-next-zone bench-copilot smoke-e2e perf-lot4 proof-lot4 real-mode sim-mode demo-ingest prepare-routing-osrm single-driver-reset single-driver-up single-driver-down single-driver-logs focus-map
+.PHONY: up fleet-up down logs build clean restart status train-copilot train-copilot-10m train-copilot-report demo-copilot demo-rank demo-next-zone bench-copilot smoke-e2e perf-lot4 proof-lot4 real-mode sim-mode demo-ingest prepare-routing-osrm single-driver-reset single-driver-up single-driver-down single-driver-logs focus-map demo-scoreboard demo-scenarios build-mart query-kpis fleet-demo-up fleet-demo-down fleet-demo-check
 
 ## Lance l'intégralité du stack (build + démarrage)
 up:
@@ -177,6 +177,42 @@ demo-ingest:
 	@echo ""
 	@echo "→ Vérif API live map source (Redis hot path):"
 	curl -s "http://localhost:8001/livreurs/L001" | python3 -m json.tool
+
+## Backtest scoreboard Copilot vs baselines (jury demo)
+demo-scoreboard:
+	python3 ml/backtest_copilot.py --out data/reports
+	@echo "Backtest CSV -> data/reports/backtest_summary.csv"
+
+## Génère les 5 scénarios de démo (pluie, trafic, carburant, event, baseline)
+demo-scenarios:
+	python3 ml/scenario_generator.py --out data/scenarios
+	@echo "Scénarios -> data/scenarios/scenarios_comparison.json"
+
+## Construit le Data Mart Copilot (COP-025)
+build-mart:
+	python3 scripts/build-copilot-mart.py
+	@echo "Mart -> data/marts/copilot/"
+
+## Requêtes KPI sur le Data Mart (COP-025)
+query-kpis:
+	python3 scripts/query-copilot-kpis.py
+
+## Lance le mode flotte multi-chauffeurs (COP-027)
+fleet-demo-up:
+	docker compose --env-file env/fleet_demo.env up --build -d
+	@echo "Fleet demo démarré — en attente de 50+ chauffeurs actifs..."
+	@echo "Vérifier : make fleet-demo-check"
+
+## Arrête le mode flotte
+fleet-demo-down:
+	docker compose down
+
+## Vérifie la stabilité du mode flotte (chauffeurs actifs, erreurs)
+fleet-demo-check:
+	@echo "── Fleet demo status ──"
+	@curl -s "http://localhost:8001/health" | python3 -m json.tool 2>/dev/null || echo "API indisponible"
+	@echo ""
+	@curl -s "http://localhost:8001/stats" | python3 -m json.tool 2>/dev/null || echo "Stats indisponibles"
 
 ## Lance explicitement le mode flotte (utile pour stress/perf uniquement)
 fleet-up:

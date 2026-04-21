@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import glob
+import io
 import json
 import logging
 import math
@@ -16,7 +18,7 @@ import joblib
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from copilot_logic import (
@@ -3629,3 +3631,291 @@ async def copilot_health(request: Request):
         "quality_alert_thresholds": QUALITY_ALERT_THRESHOLDS,
     }
 
+
+# ── COP-023 : Session Report Export ──────────────────────────────────────────
+
+def _build_session_report(driver_id: str, missions: list[dict]) -> dict:
+    """Aggregate KPIs + decision list from mission journal entries."""
+    elapsed_values = [float(m["elapsed_min"]) for m in missions if m.get("elapsed_min") is not None]
+    realized_values = [float(m["realized_delta_eur_h"]) for m in missions if m.get("realized_delta_eur_h") is not None]
+    predicted_values = [float(m["predicted_delta_eur_h"]) for m in missions if m.get("predicted_delta_eur_h") is not None]
+    alignment_values = [float(m["alignment_score"]) for m in missions if m.get("alignment_score") is not None]
+    success_count = sum(1 for m in missions if bool(m.get("success")))
+    win_count = sum(1 for v in realized_values if v >= 0.0)
+    zone_counts: dict[str, int] = {}
+    for m in missions:
+        z = str(m.get("zone_id") or "unknown")
+        zone_counts[z] = zone_counts.get(z, 0) + 1
+
+    def _avg(lst):
+        return round(sum(lst) / len(lst), 3) if lst else None
+
+    return {
+        "driver_id": driver_id,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "kpis": {
+            "missions_count": len(missions),
+            "success_rate_pct": round(success_count / len(missions) * 100, 2) if missions else None,
+            "avg_elapsed_min": _avg(elapsed_values),
+            "avg_realized_delta_eur_h": _avg(realized_values),
+            "avg_predicted_delta_eur_h": _avg(predicted_values),
+            "realized_win_rate_pct": round(win_count / len(realized_values) * 100, 2) if realized_values else None,
+            "avg_alignment_score": _avg(alignment_values),
+            "top_zones": sorted(zone_counts.items(), key=lambda x: -x[1])[:5],
+        },
+        "decisions": missions,
+    }
+
+
+def _report_to_csv(report: dict) -> str:
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+
+    # KPI header
+    writer.writerow(["# FleetStream Session Report", report["driver_id"], report["generated_at"]])
+    writer.writerow([])
+    writer.writerow(["# KPIs"])
+    for k, v in report["kpis"].items():
+        if k != "top_zones":
+            writer.writerow([k, v])
+    writer.writerow([])
+
+    # Decisions
+    if report["decisions"]:
+        cols = list(report["decisions"][0].keys())
+        writer.writerow(["# Decisions"] + [""] * (len(cols) - 1))
+        writer.writerow(cols)
+        for d in report["decisions"]:
+            writer.writerow([d.get(c, "") for c in cols])
+
+    return buf.getvalue()
+
+
+def _report_to_pdf(report: dict) -> bytes:
+    try:
+        from fpdf import FPDF
+    except ImportError:
+        raise HTTPException(status_code=501, detail="fpdf2 not installed")
+
+    class _PDF(FPDF):
+        def header(self):
+            self.set_font("Helvetica", "B", 10)
+            self.set_fill_color(30, 30, 30)
+            self.set_text_color(255, 255, 255)
+            self.cell(0, 8, "FleetStream - Rapport de Session Copilot", fill=True, new_x="LMARGIN", new_y="NEXT", align="C")
+            self.set_text_color(0, 0, 0)
+            self.ln(2)
+
+        def footer(self):
+            self.set_y(-12)
+            self.set_font("Helvetica", "I", 8)
+            self.set_text_color(120, 120, 120)
+            self.cell(0, 8, f"FleetStream CY Tech - Page {self.page_no()}", align="C")
+
+    pdf = _PDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.set_margins(15, 15, 15)
+    pdf.add_page()
+
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.set_text_color(20, 20, 20)
+    pdf.cell(0, 10, f"Rapport de session - Chauffeur {report['driver_id']}", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.set_font("Helvetica", "I", 9)
+    pdf.set_text_color(100, 100, 100)
+    pdf.cell(0, 6, f"Genere le {report['generated_at'][:10]}", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(4)
+
+    # KPIs
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.set_fill_color(240, 240, 240)
+    pdf.cell(0, 7, "KPIs de session", fill=True, new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(1)
+
+    kpi_labels = {
+        "missions_count": "Missions",
+        "success_rate_pct": "Taux de succes (%)",
+        "avg_elapsed_min": "Duree moyenne (min)",
+        "avg_realized_delta_eur_h": "Gain moyen realise (EUR/h)",
+        "avg_predicted_delta_eur_h": "Gain moyen predit (EUR/h)",
+        "realized_win_rate_pct": "Taux missions gagnantes (%)",
+        "avg_alignment_score": "Score alignement pred/realise",
+    }
+    for key, label in kpi_labels.items():
+        val = report["kpis"].get(key)
+        pdf.set_font("Helvetica", "", 9)
+        pdf.cell(100, 6, label)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.cell(0, 6, str(val) if val is not None else "N/A", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(4)
+
+    # Decisions table
+    decisions = report["decisions"]
+    if decisions:
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_fill_color(240, 240, 240)
+        pdf.cell(0, 7, f"Decisions ({len(decisions)} missions)", fill=True, new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(1)
+        cols = ["mission_id", "zone_id", "elapsed_min", "realized_delta_eur_h", "success"]
+        widths = [50, 25, 25, 40, 25]
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.set_fill_color(60, 60, 60)
+        pdf.set_text_color(255, 255, 255)
+        for col, w in zip(cols, widths):
+            pdf.cell(w, 6, col, border=1, fill=True)
+        pdf.ln()
+        pdf.set_text_color(0, 0, 0)
+        for i, d in enumerate(decisions):
+            pdf.set_font("Helvetica", "", 7)
+            pdf.set_fill_color(248, 248, 248)
+            fill = i % 2 == 0
+            for col, w in zip(cols, widths):
+                val = d.get(col)
+                pdf.cell(w, 5, str(val)[:25] if val is not None else "", border=1, fill=fill)
+            pdf.ln()
+
+    buf = io.BytesIO()
+    pdf.output(buf)
+    return buf.getvalue()
+
+
+@copilot_router.get("/driver/{driver_id}/session-report")
+async def session_report(
+    request: Request,
+    driver_id: str,
+    fmt: str = Query("json", alias="format", pattern="^(json|csv|pdf)$"),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """Export rapport de session complet (KPIs + decisions) en JSON, CSV ou PDF."""
+    redis_client: aioredis.Redis = request.app.state.redis
+    key = _mission_journal_key(driver_id)
+    raw_items = await redis_client.lrange(key, 0, limit - 1)
+    missions: list[dict] = []
+    for raw in raw_items:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                missions.append(parsed)
+        except Exception:
+            continue
+
+    report = _build_session_report(driver_id, missions)
+
+    if fmt == "csv":
+        content = _report_to_csv(report)
+        return Response(
+            content=content,
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=session_{driver_id}.csv"},
+        )
+    if fmt == "pdf":
+        content = _report_to_pdf(report)
+        return Response(
+            content=content,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename=session_{driver_id}.pdf"},
+        )
+    return report
+
+
+
+# ── COP-028 : Fleet Copilot Overview ─────────────────────────────────────────
+
+def _parse_fleet_driver(courier_id: str, state: dict) -> dict | None:
+    """Build a fleet driver entry from Redis hash. Returns None if stale/empty."""
+    lat = _as_float(state.get("lat"), 0.0)
+    lon = _as_float(state.get("lon"), 0.0)
+    if lat == 0.0 and lon == 0.0:
+        return None
+
+    status = state.get("status", "unknown")
+    zone_id = state.get("zone_id") or state.get("zone_cell") or "unknown"
+    demand = _as_float(state.get("demand_index"), 0.0)
+    supply = _as_float(state.get("supply_index"), 0.5)
+    weather = _as_float(state.get("weather_factor"), 1.0)
+    traffic = _as_float(state.get("traffic_factor"), 1.0)
+    pressure = demand / max(supply, 0.01)
+
+    # Heuristic opportunity score from context
+    opp_score = round(min(max(pressure / 5.0 * 0.6 + demand * 0.4, 0.0), 1.0), 3)
+
+    best_action = "hold"
+    if opp_score >= 0.7:
+        best_action = "accept_next"
+    elif opp_score >= 0.45:
+        best_action = "reposition"
+
+    return {
+        "courier_id": courier_id,
+        "status": status,
+        "zone_id": zone_id,
+        "lat": round(lat, 6),
+        "lon": round(lon, 6),
+        "demand_index": round(demand, 4),
+        "supply_index": round(supply, 4),
+        "weather_factor": round(weather, 3),
+        "traffic_factor": round(traffic, 3),
+        "pressure_ratio": round(pressure, 4),
+        "opportunity_score": opp_score,
+        "best_action": best_action,
+        "updated_at": state.get("updated_at") or state.get("ts"),
+    }
+
+
+@copilot_router.get("/fleet/overview")
+async def fleet_overview(
+    request: Request,
+    zone: str | None = Query(None, description="Filtrer par zone_id"),
+    status: str | None = Query(None, description="Filtrer par status (moving, idle, ...)"),
+    min_score: float = Query(0.0, ge=0.0, le=1.0, description="Score opportunité minimum"),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """Vue agrégée flotte : top chauffeurs, scores opportunité, alertes."""
+    redis_client: aioredis.Redis = request.app.state.redis
+
+    drivers: list[dict] = []
+    async for key in redis_client.scan_iter(match=f"{COURIER_HASH_PREFIX}*", count=200):
+        courier_id = key.replace(COURIER_HASH_PREFIX, "") if isinstance(key, str) else key.decode().replace(COURIER_HASH_PREFIX, "")
+        raw = await redis_client.hgetall(key)
+        if not raw:
+            continue
+        entry = _parse_fleet_driver(courier_id, raw)
+        if entry is None:
+            continue
+        if zone and entry["zone_id"] != zone:
+            continue
+        if status and entry["status"] != status:
+            continue
+        if entry["opportunity_score"] < min_score:
+            continue
+        drivers.append(entry)
+        if len(drivers) >= limit:
+            break
+
+    drivers.sort(key=lambda d: -d["opportunity_score"])
+
+    # Aggregate fleet KPIs
+    n = len(drivers)
+    top_opportunities = [d for d in drivers[:10] if d["opportunity_score"] >= 0.6]
+    alerts: list[dict] = []
+    if n == 0:
+        alerts.append({"type": "no_active_drivers", "message": "Aucun chauffeur actif en Redis."})
+
+    avg_demand = round(sum(d["demand_index"] for d in drivers) / max(n, 1), 4)
+    avg_pressure = round(sum(d["pressure_ratio"] for d in drivers) / max(n, 1), 4)
+    zone_counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
+    for d in drivers:
+        zone_counts[d["zone_id"]] = zone_counts.get(d["zone_id"], 0) + 1
+        status_counts[d["status"]] = status_counts.get(d["status"], 0) + 1
+
+    return {
+        "active_drivers": n,
+        "avg_demand_index": avg_demand,
+        "avg_pressure_ratio": avg_pressure,
+        "top_zones": sorted(zone_counts.items(), key=lambda x: -x[1])[:5],
+        "status_distribution": status_counts,
+        "top_opportunities": top_opportunities,
+        "alerts": alerts,
+        "drivers": drivers,
+    }
