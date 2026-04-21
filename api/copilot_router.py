@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import glob
+import io
 import json
 import logging
 import math
@@ -16,7 +18,7 @@ import joblib
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from copilot_logic import (
@@ -3628,4 +3630,190 @@ async def copilot_health(request: Request):
         "model_path": str(MODEL_PATH),
         "quality_alert_thresholds": QUALITY_ALERT_THRESHOLDS,
     }
+
+
+# ── COP-023 : Session Report Export ──────────────────────────────────────────
+
+def _build_session_report(driver_id: str, missions: list[dict]) -> dict:
+    """Aggregate KPIs + decision list from mission journal entries."""
+    elapsed_values = [float(m["elapsed_min"]) for m in missions if m.get("elapsed_min") is not None]
+    realized_values = [float(m["realized_delta_eur_h"]) for m in missions if m.get("realized_delta_eur_h") is not None]
+    predicted_values = [float(m["predicted_delta_eur_h"]) for m in missions if m.get("predicted_delta_eur_h") is not None]
+    alignment_values = [float(m["alignment_score"]) for m in missions if m.get("alignment_score") is not None]
+    success_count = sum(1 for m in missions if bool(m.get("success")))
+    win_count = sum(1 for v in realized_values if v >= 0.0)
+    zone_counts: dict[str, int] = {}
+    for m in missions:
+        z = str(m.get("zone_id") or "unknown")
+        zone_counts[z] = zone_counts.get(z, 0) + 1
+
+    def _avg(lst):
+        return round(sum(lst) / len(lst), 3) if lst else None
+
+    return {
+        "driver_id": driver_id,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "kpis": {
+            "missions_count": len(missions),
+            "success_rate_pct": round(success_count / len(missions) * 100, 2) if missions else None,
+            "avg_elapsed_min": _avg(elapsed_values),
+            "avg_realized_delta_eur_h": _avg(realized_values),
+            "avg_predicted_delta_eur_h": _avg(predicted_values),
+            "realized_win_rate_pct": round(win_count / len(realized_values) * 100, 2) if realized_values else None,
+            "avg_alignment_score": _avg(alignment_values),
+            "top_zones": sorted(zone_counts.items(), key=lambda x: -x[1])[:5],
+        },
+        "decisions": missions,
+    }
+
+
+def _report_to_csv(report: dict) -> str:
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+
+    # KPI header
+    writer.writerow(["# FleetStream Session Report", report["driver_id"], report["generated_at"]])
+    writer.writerow([])
+    writer.writerow(["# KPIs"])
+    for k, v in report["kpis"].items():
+        if k != "top_zones":
+            writer.writerow([k, v])
+    writer.writerow([])
+
+    # Decisions
+    if report["decisions"]:
+        cols = list(report["decisions"][0].keys())
+        writer.writerow(["# Decisions"] + [""] * (len(cols) - 1))
+        writer.writerow(cols)
+        for d in report["decisions"]:
+            writer.writerow([d.get(c, "") for c in cols])
+
+    return buf.getvalue()
+
+
+def _report_to_pdf(report: dict) -> bytes:
+    try:
+        from fpdf import FPDF
+    except ImportError:
+        raise HTTPException(status_code=501, detail="fpdf2 not installed")
+
+    class _PDF(FPDF):
+        def header(self):
+            self.set_font("Helvetica", "B", 10)
+            self.set_fill_color(30, 30, 30)
+            self.set_text_color(255, 255, 255)
+            self.cell(0, 8, "FleetStream - Rapport de Session Copilot", fill=True, new_x="LMARGIN", new_y="NEXT", align="C")
+            self.set_text_color(0, 0, 0)
+            self.ln(2)
+
+        def footer(self):
+            self.set_y(-12)
+            self.set_font("Helvetica", "I", 8)
+            self.set_text_color(120, 120, 120)
+            self.cell(0, 8, f"FleetStream CY Tech - Page {self.page_no()}", align="C")
+
+    pdf = _PDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.set_margins(15, 15, 15)
+    pdf.add_page()
+
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.set_text_color(20, 20, 20)
+    pdf.cell(0, 10, f"Rapport de session - Chauffeur {report['driver_id']}", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.set_font("Helvetica", "I", 9)
+    pdf.set_text_color(100, 100, 100)
+    pdf.cell(0, 6, f"Genere le {report['generated_at'][:10]}", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(4)
+
+    # KPIs
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.set_fill_color(240, 240, 240)
+    pdf.cell(0, 7, "KPIs de session", fill=True, new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(1)
+
+    kpi_labels = {
+        "missions_count": "Missions",
+        "success_rate_pct": "Taux de succes (%)",
+        "avg_elapsed_min": "Duree moyenne (min)",
+        "avg_realized_delta_eur_h": "Gain moyen realise (EUR/h)",
+        "avg_predicted_delta_eur_h": "Gain moyen predit (EUR/h)",
+        "realized_win_rate_pct": "Taux missions gagnantes (%)",
+        "avg_alignment_score": "Score alignement pred/realise",
+    }
+    for key, label in kpi_labels.items():
+        val = report["kpis"].get(key)
+        pdf.set_font("Helvetica", "", 9)
+        pdf.cell(100, 6, label)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.cell(0, 6, str(val) if val is not None else "N/A", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(4)
+
+    # Decisions table
+    decisions = report["decisions"]
+    if decisions:
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_fill_color(240, 240, 240)
+        pdf.cell(0, 7, f"Decisions ({len(decisions)} missions)", fill=True, new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(1)
+        cols = ["mission_id", "zone_id", "elapsed_min", "realized_delta_eur_h", "success"]
+        widths = [50, 25, 25, 40, 25]
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.set_fill_color(60, 60, 60)
+        pdf.set_text_color(255, 255, 255)
+        for col, w in zip(cols, widths):
+            pdf.cell(w, 6, col, border=1, fill=True)
+        pdf.ln()
+        pdf.set_text_color(0, 0, 0)
+        for i, d in enumerate(decisions):
+            pdf.set_font("Helvetica", "", 7)
+            pdf.set_fill_color(248, 248, 248)
+            fill = i % 2 == 0
+            for col, w in zip(cols, widths):
+                val = d.get(col)
+                pdf.cell(w, 5, str(val)[:25] if val is not None else "", border=1, fill=fill)
+            pdf.ln()
+
+    buf = io.BytesIO()
+    pdf.output(buf)
+    return buf.getvalue()
+
+
+@copilot_router.get("/driver/{driver_id}/session-report")
+async def session_report(
+    request: Request,
+    driver_id: str,
+    fmt: str = Query("json", alias="format", pattern="^(json|csv|pdf)$"),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """Export rapport de session complet (KPIs + decisions) en JSON, CSV ou PDF."""
+    redis_client: aioredis.Redis = request.app.state.redis
+    key = _mission_journal_key(driver_id)
+    raw_items = await redis_client.lrange(key, 0, limit - 1)
+    missions: list[dict] = []
+    for raw in raw_items:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                missions.append(parsed)
+        except Exception:
+            continue
+
+    report = _build_session_report(driver_id, missions)
+
+    if fmt == "csv":
+        content = _report_to_csv(report)
+        return Response(
+            content=content,
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=session_{driver_id}.csv"},
+        )
+    if fmt == "pdf":
+        content = _report_to_pdf(report)
+        return Response(
+            content=content,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename=session_{driver_id}.pdf"},
+        )
+    return report
 

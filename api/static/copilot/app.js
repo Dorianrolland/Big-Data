@@ -3341,6 +3341,41 @@ bindChangeAndInput(objWeightTimeInput, handleObjectiveWeightChange);
 bindChangeAndInput(objWeightFuelInput, handleObjectiveWeightChange);
 safeBind(autoRefreshBox, 'change', startAutoRefreshLoop);
 
+// ── Session report export (COP-023) ──────────────────────────────────────────
+function _triggerDownload(url, filename) {
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
+safeBind($('exportSessionJsonBtn'), 'click', () => {
+  const driverId = currentDriverId();
+  const url = `/copilot/driver/${encodeURIComponent(driverId)}/session-report?format=json`;
+  fetch(url).then(r => r.json()).then(data => {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    _triggerDownload(URL.createObjectURL(blob), `session_${driverId}.json`);
+  }).catch(err => setUxStatus('error', `Export JSON failed: ${errorMessage(err)}`));
+});
+
+safeBind($('exportSessionCsvBtn'), 'click', () => {
+  const driverId = currentDriverId();
+  _triggerDownload(
+    `/copilot/driver/${encodeURIComponent(driverId)}/session-report?format=csv`,
+    `session_${driverId}.csv`,
+  );
+});
+
+safeBind($('exportSessionPdfBtn'), 'click', () => {
+  const driverId = currentDriverId();
+  _triggerDownload(
+    `/copilot/driver/${encodeURIComponent(driverId)}/session-report?format=pdf`,
+    `session_${driverId}.pdf`,
+  );
+});
+
 bindOfferActionDelegation(offersEl);
 bindOfferActionDelegation(bestOffersEl);
 bindOfferActionDelegation(dispatchPlanEl);
