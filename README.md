@@ -300,6 +300,21 @@ make stress          # Stress test 1000 livreurs
 make stress-5k       # Stress test 5000 livreurs
 make redis-cli       # Accès Redis CLI interactif
 make clean           # Supprime containers + volumes + Parquet
+
+# ── Demo & Jury ─────────────────────────────────────────────────
+make demo-scoreboard # Backtest Copilot vs baselines (CSV + table)
+make demo-scenarios  # 5 scénarios de démo (pluie, trafic, fuel, event, baseline)
+make build-mart      # Construit le Data Mart analytique (DuckDB + Parquet)
+make query-kpis      # 10 KPIs en < 300ms depuis le Data Mart
+
+# Mode flotte multi-chauffeurs (250 drivers)
+make fleet-demo-up   # Lance le stack en mode fleet_demo.env
+make fleet-demo-check # Vérifie la readiness (chauffeurs actifs, KPIs)
+make fleet-demo-down  # Stoppe
+
+# Script jury one-click (Windows PowerShell)
+# .\scripts\demo-jury.ps1
+# .\scripts\demo-jury.ps1 -Fleet -MinDrivers 50
 ```
 
 ---
