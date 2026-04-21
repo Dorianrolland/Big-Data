@@ -188,6 +188,15 @@ demo-scenarios:
 	python3 ml/scenario_generator.py --out data/scenarios
 	@echo "Scénarios -> data/scenarios/scenarios_comparison.json"
 
+## Construit le Data Mart Copilot (COP-025)
+build-mart:
+	python3 scripts/build-copilot-mart.py
+	@echo "Mart -> data/marts/copilot/"
+
+## Requêtes KPI sur le Data Mart (COP-025)
+query-kpis:
+	python3 scripts/query-copilot-kpis.py
+
 ## Lance explicitement le mode flotte (utile pour stress/perf uniquement)
 fleet-up:
 	TLC_SCENARIO=fleet \
