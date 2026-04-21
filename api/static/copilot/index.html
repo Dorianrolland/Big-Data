@@ -5,6 +5,11 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>FleetStream Copilot</title>
   <meta name="theme-color" content="#0f172a" />
+  <meta name="description" content="Copilote décisionnel temps réel pour chauffeurs VTC - FleetStream CY Tech" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Copilot" />
   <link rel="manifest" href="/static/copilot/manifest.webmanifest" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
@@ -737,6 +742,20 @@
         flex: 1 1 100%;
       }
     }
+
+    @media (max-width: 480px) {
+      .page { padding: .5rem; }
+      .card { padding: .75rem; }
+      .header-top { flex-direction: column; gap: .5rem; }
+      .chip-row { flex-wrap: wrap; gap: .3rem; }
+      .quick-row { flex-direction: column; gap: .4rem; }
+      .quick-row button { width: 100%; }
+      h2 { font-size: 1rem; }
+      .info-line { font-size: .8rem; }
+      input[type="text"], input[type="number"], select {
+        font-size: 16px; /* prevent iOS auto-zoom */
+      }
+    }
   </style>
 </head>
 <body>
@@ -876,6 +895,9 @@
           <h2>Mission Journal</h2>
           <div class="quick-row">
             <button class="ghost" id="missionJournalRefreshBtn">Refresh Journal</button>
+            <button class="ghost" id="exportSessionJsonBtn">Export JSON</button>
+            <button class="ghost" id="exportSessionCsvBtn">Export CSV</button>
+            <button class="ghost" id="exportSessionPdfBtn">Export PDF</button>
           </div>
           <div class="info-line" id="missionJournalSummary">No mission report yet.</div>
           <div class="mission-stats">
@@ -996,6 +1018,35 @@
           <div class="timeline" id="replayTimeline"></div>
         </section>
       </div>
+    </section>
+
+    <!-- ── COP-029 : Wallboard Flotte ──────────────────────────────────── -->
+    <section class="card glass" id="fleetWallboard" style="margin-top:1.2rem">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.5rem">
+        <h2 style="margin:0">Wallboard Flotte</h2>
+        <div style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:center">
+          <span class="chip" id="fleetActiveChip">0 actifs</span>
+          <span class="chip" id="fleetPressureChip">pression —</span>
+          <button class="ghost" id="fleetRefreshBtn">Refresh Flotte</button>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 320px;gap:.8rem;margin-top:.8rem" id="fleetGrid">
+        <div id="fleetMap" style="height:380px;border-radius:.5rem;background:#1e293b;min-width:0"></div>
+        <div style="display:flex;flex-direction:column;gap:.5rem;overflow:hidden">
+          <div style="font-size:.8rem;font-weight:600;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em">Top opportunités</div>
+          <div id="fleetOpportunitiesList" style="display:flex;flex-direction:column;gap:.35rem;overflow-y:auto;max-height:180px"></div>
+          <div style="font-size:.8rem;font-weight:600;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;margin-top:.4rem">Chauffeur sélectionné</div>
+          <div id="fleetDriverDetail" style="font-size:.85rem;color:#e2e8f0">Cliquez sur un marqueur pour voir le détail.</div>
+          <div style="font-size:.8rem;font-weight:600;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;margin-top:.4rem">Alertes</div>
+          <div id="fleetAlertsList" style="font-size:.8rem;color:#fbbf24">—</div>
+        </div>
+      </div>
+      <style>
+        @media (max-width: 720px) {
+          #fleetGrid { grid-template-columns: 1fr; }
+          #fleetMap { height: 260px; }
+        }
+      </style>
     </section>
 
     <div class="footer">MVP local - no paid dependencies - lot 3 UX</div>
