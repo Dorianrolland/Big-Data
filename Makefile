@@ -197,6 +197,11 @@ build-mart:
 query-kpis:
 	python3 scripts/query-copilot-kpis.py
 
+## Compaction Parquet cold path (COP-026) — 193 → 8 fichiers, scan 217ms → 10ms
+compact-parquet:
+	python3 scripts/compact-events-parquet.py
+	@echo "Compact -> data/parquet_compacted/"
+
 ## Lance le mode flotte multi-chauffeurs (COP-027)
 fleet-demo-up:
 	docker compose --env-file env/fleet_demo.env up --build -d
