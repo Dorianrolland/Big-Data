@@ -1,8 +1,48 @@
 {
   "name": "FleetStream Driver Copilot",
-  "short_name": "Driver AI",
+  "short_name": "Copilot",
+  "description": "Copilote décisionnel temps réel pour chauffeurs VTC — FleetStream CY Tech",
   "start_url": "/copilot",
+  "scope": "/copilot",
   "display": "standalone",
-  "background_color": "#f3f6ef",
-  "theme_color": "#0f172a"
+  "orientation": "portrait-primary",
+  "background_color": "#0f172a",
+  "theme_color": "#0f172a",
+  "lang": "fr",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Crect width='192' height='192' rx='28' fill='%230f172a'/%3E%3Ctext x='96' y='130' font-size='110' text-anchor='middle' fill='%2322c55e'%3E%F0%9F%9A%96%3C/text%3E%3C/svg%3E",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect width='512' height='512' rx='72' fill='%230f172a'/%3E%3Ctext x='256' y='350' font-size='300' text-anchor='middle' fill='%2322c55e'%3E%F0%9F%9A%96%3C/text%3E%3C/svg%3E",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "screenshots": [
+    {
+      "src": "/copilot",
+      "sizes": "1280x720",
+      "type": "text/html",
+      "form_factor": "wide",
+      "label": "Dashboard Copilot desktop"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Score Offer",
+      "url": "/copilot#score",
+      "description": "Score une offre manuellement"
+    },
+    {
+      "name": "Health",
+      "url": "/copilot#health",
+      "description": "État du pipeline et qualité des données"
+    }
+  ],
+  "categories": ["productivity", "navigation"]
 }
