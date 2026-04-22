@@ -659,13 +659,11 @@ _FLEET_MAP_HTML = f"""
 <head>
 <meta charset="utf-8"/>
 <script src="https://unpkg.com/deck.gl@9.1.4/dist.min.js"></script>
-<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
-<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet"/>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@500;700;800&display=swap" rel="stylesheet"/>
 <style>
   * {{ margin:0; padding:0; }}
   body {{ background: transparent; font-family: 'Inter', sans-serif; }}
-  #map {{ width:100%; height:430px; border-radius:12px; overflow:hidden; }}
+  #map {{ width:100%; height:430px; border-radius:12px; overflow:hidden; background:#e8ecf4; }}
   #hud {{
     position:absolute; top:12px; right:14px; z-index:10;
     display:flex; gap:10px; font-size:11px; font-weight:700;
@@ -733,12 +731,32 @@ function computeMapBackoffMs() {{
   return Math.min(MAP_POLL_MAX_MS, MAP_POLL_BASE_MS * Math.pow(2, Math.min(mapPollFailures, 4)));
 }}
 
+const BASEMAP = new deck.TileLayer({{
+  id: 'basemap',
+  data: [
+    'https://a.basemaps.cartocdn.com/rastertiles/voyager/{{z}}/{{x}}/{{y}}.png',
+    'https://b.basemaps.cartocdn.com/rastertiles/voyager/{{z}}/{{x}}/{{y}}.png',
+    'https://c.basemaps.cartocdn.com/rastertiles/voyager/{{z}}/{{x}}/{{y}}.png',
+    'https://d.basemaps.cartocdn.com/rastertiles/voyager/{{z}}/{{x}}/{{y}}.png',
+  ],
+  tileSize: 256,
+  minZoom: 0,
+  maxZoom: 19,
+  renderSubLayers: props => {{
+    const {{ bbox: {{ west, south, east, north }} }} = props.tile;
+    return new deck.BitmapLayer(props, {{
+      data: null,
+      image: props.data,
+      bounds: [west, south, east, north],
+    }});
+  }},
+}});
+
 const deckgl = new deck.DeckGL({{
   container: 'map',
-  mapStyle: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
-  initialViewState: {{ latitude:40.7580, longitude:-73.9855, zoom:11, pitch:25 }},
+  initialViewState: {{ latitude:40.7580, longitude:-73.9855, zoom:11, pitch:0 }},
   controller: true,
-  layers: [],
+  layers: [BASEMAP],
   getTooltip: null,
   onHover: (info) => {{
     const tt = document.getElementById('tooltip');
@@ -790,6 +808,7 @@ async function refresh() {{
 
     deckgl.setProps({{
       layers: [
+        BASEMAP,
         new deck.ScatterplotLayer({{
           id: 'glow',
           data: livreurs,

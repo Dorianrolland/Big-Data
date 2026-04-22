@@ -3274,6 +3274,13 @@ async function refreshAll() {
   const clusterGroup = L.markerClusterGroup({ maxClusterRadius: 40, disableClusteringAtZoom: 15 });
   fleetMap.addLayer(clusterGroup);
 
+  // CSS grid may not have finalized dimensions at init time — force Leaflet to
+  // recalculate after two animation frames (post-paint), then again at 500ms as
+  // a safety net. Without this the tile canvas stays black on first load.
+  requestAnimationFrame(() => requestAnimationFrame(() => fleetMap.invalidateSize()));
+  setTimeout(() => fleetMap.invalidateSize(), 500);
+  window.addEventListener('resize', () => fleetMap.invalidateSize());
+
   let _fleetMarkers = {};
   let _refreshTimer = null;
 
@@ -3298,12 +3305,12 @@ async function refreshAll() {
     if (!driverDetail) return;
     const color = _scoreColor(d.opportunity_score);
     driverDetail.innerHTML = `
-      <div style="font-weight:600;color:#f8fafc">${escapeHtml(d.courier_id)}</div>
-      <div>Zone: <b>${escapeHtml(d.zone_id)}</b> — ${escapeHtml(d.status)}</div>
-      <div>Score: <b style="color:${color}">${d.opportunity_score}</b> — ${escapeHtml(d.best_action)}</div>
-      <div>Demand: ${d.demand_index} / Supply: ${d.supply_index}</div>
-      <div>Pression: ${d.pressure_ratio}</div>
-      <div style="color:#64748b;font-size:.75rem">${d.updated_at || ''}</div>
+      <div style="font-weight:600;color:var(--ink)">${escapeHtml(d.courier_id)}</div>
+      <div style="color:var(--ink-soft)">Zone: <b style="color:var(--ink)">${escapeHtml(d.zone_id)}</b> — ${escapeHtml(d.status)}</div>
+      <div style="color:var(--ink-soft)">Score: <b style="color:${color}">${d.opportunity_score}</b> — ${escapeHtml(d.best_action)}</div>
+      <div style="color:var(--ink-soft)">Demand: ${d.demand_index} / Supply: ${d.supply_index}</div>
+      <div style="color:var(--ink-soft)">Pression: ${d.pressure_ratio}</div>
+      <div style="color:var(--ink-soft);font-size:.75rem">${d.updated_at || ''}</div>
     `;
   }
 
@@ -3349,9 +3356,9 @@ async function refreshAll() {
           ? '<div style="color:#64748b;font-size:.8rem">Aucune opportunité forte détectée.</div>'
           : top.map(d => {
               const color = _scoreColor(d.opportunity_score);
-              return `<div style="display:flex;justify-content:space-between;align-items:center;background:rgba(255,255,255,.07);border-radius:.3rem;padding:.3rem .5rem;cursor:pointer"
+              return `<div style="display:flex;justify-content:space-between;align-items:center;background:rgba(0,0,0,.05);border-radius:.3rem;padding:.3rem .5rem;cursor:pointer"
                 data-cid="${escapeHtml(d.courier_id)}">
-                <span style="font-size:.8rem;color:#e2e8f0">${escapeHtml(d.courier_id)} <span style="color:#64748b">${escapeHtml(d.zone_id)}</span></span>
+                <span style="font-size:.8rem;color:var(--ink)">${escapeHtml(d.courier_id)} <span style="color:var(--ink-soft)">${escapeHtml(d.zone_id)}</span></span>
                 <span style="font-weight:700;color:${color}">${d.opportunity_score}</span>
               </div>`;
             }).join('');
