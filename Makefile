@@ -2,13 +2,10 @@
 
 ## Lance l'intégralité du stack (build + démarrage)
 up:
-	TLC_SCENARIO=$${TLC_SCENARIO:-single_driver} \
-	TLC_TRAIN_MONTH_COUNT=$${TLC_TRAIN_MONTH_COUNT:-10} \
-	TLC_LIVE_MONTH_COUNT=$${TLC_LIVE_MONTH_COUNT:-2} \
-	TLC_RESET_RUNTIME_ON_START=$${TLC_RESET_RUNTIME_ON_START:-true} \
-	docker compose up --build -d
+	docker compose --env-file env/fleet_demo.env up --build -d
 	@echo ""
 	@echo "✓ FleetStream démarré !"
+	@echo "  Scenario       → fleet_demo (env/fleet_demo.env)"
 	@echo "  API docs       → http://localhost:8001/docs"
 	@echo "  Dashboard live → http://localhost:8501"
 	@echo "  Redpanda UI    → http://localhost:8080"
@@ -204,8 +201,9 @@ compact-parquet:
 
 ## Lance le mode flotte multi-chauffeurs (COP-027)
 fleet-demo-up:
-	docker compose --env-file env/fleet_demo.env up --build -d
+	docker compose --env-file env/fleet_demo.env --profile routing up --build -d
 	@echo "Fleet demo démarré — en attente de 50+ chauffeurs actifs..."
+	@echo "Trajectoires route-aware: profile 'routing' activé (OSRM local si data disponible)."
 	@echo "Vérifier : make fleet-demo-check"
 
 ## Arrête le mode flotte
@@ -214,10 +212,7 @@ fleet-demo-down:
 
 ## Vérifie la stabilité du mode flotte (chauffeurs actifs, erreurs)
 fleet-demo-check:
-	@echo "── Fleet demo status ──"
-	@curl -s "http://localhost:8001/health" | python3 -m json.tool 2>/dev/null || echo "API indisponible"
-	@echo ""
-	@curl -s "http://localhost:8001/stats" | python3 -m json.tool 2>/dev/null || echo "Stats indisponibles"
+	python3 scripts/fleet_demo_check.py --min-drivers $${FLEET_DEMO_WARMUP_MIN_DRIVERS:-50} --timeout $${FLEET_DEMO_WARMUP_TIMEOUT_S:-120}
 
 ## Lance explicitement le mode flotte (utile pour stress/perf uniquement)
 fleet-up:

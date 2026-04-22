@@ -67,8 +67,10 @@ def test_decode_polyline_known_shape():
 
 def test_source_platform_for_route_replaces_existing_route_suffix():
     tagged = replay_main.source_platform_for_route("tlc_hvfhv|route=linear", "osrm")
+    tagged_public = replay_main.source_platform_for_route("tlc_hvfhv", "osrm_public")
 
     assert tagged == "tlc_hvfhv|route=osrm"
+    assert tagged_public == "tlc_hvfhv|route=osrm"
 
 
 def test_prepare_trip_route_falls_back_to_linear_when_osrm_fails(monkeypatch):
@@ -84,9 +86,41 @@ def test_prepare_trip_route_falls_back_to_linear_when_osrm_fails(monkeypatch):
     asyncio.run(replay._prepare_trip_route(trip))
 
     assert trip.route_source == "linear"
-    assert len(trip.route_geometry) == 2
+    assert len(trip.route_geometry) >= 2
+    assert trip.route_geometry[0] == (trip.pickup_lat, trip.pickup_lon)
+    assert trip.route_geometry[-1] == (trip.dropoff_lat, trip.dropoff_lon)
     assert replay.stats_route_linear_fallback == 1
     assert replay.stats_route_osrm_errors == 1
+
+
+def test_synthetic_grid_geometry_uses_turn_for_long_segments():
+    geometry = replay_main.synthetic_grid_geometry(
+        origin_lat=40.7580,
+        origin_lon=-73.9855,
+        dest_lat=40.7420,
+        dest_lon=-73.9730,
+    )
+
+    assert len(geometry) >= 4
+    assert geometry[0] == (40.7580, -73.9855)
+    assert geometry[-1] == (40.7420, -73.9730)
+
+
+def test_densify_geometry_inserts_intermediate_points():
+    geometry = [(40.7580, -73.9855), (40.7580, -73.9655)]  # ~1.7 km east-west
+    dense = replay_main.densify_geometry(geometry, max_step_km=0.2)
+
+    assert len(dense) > len(geometry)
+    assert dense[0] == geometry[0]
+    assert dense[-1] == geometry[-1]
+
+
+def test_route_geometry_for_replay_respects_disable_switch(monkeypatch):
+    geometry = [(40.7580, -73.9855), (40.7420, -73.9730)]
+    monkeypatch.setattr(replay_main, "TLC_ROUTE_DENSIFY_MAX_STEP_KM", 0.0)
+
+    out = replay_main.route_geometry_for_replay(geometry)
+    assert out == geometry
 
 
 def test_prepare_trip_route_uses_zone_pair_cache(monkeypatch):
@@ -115,6 +149,131 @@ def test_prepare_trip_route_uses_zone_pair_cache(monkeypatch):
     assert replay.stats_route_cache_misses == 1
     assert trip_a.route_source == "osrm"
     assert trip_b.route_source == "osrm"
+
+
+def test_fetch_osrm_geometry_falls_back_to_public_provider():
+    replay = replay_main.TLCReplay("2024-01")
+    replay.route_osrm_targets = [
+        ("osrm", "http://local-osrm"),
+        ("osrm_public", "https://router.project-osrm.org"),
+    ]
+
+    class _FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "code": "Ok",
+                "routes": [{"geometry": "_p~iF~ps|U_ulLnnqC_mqNvxq`@"}],
+            }
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def get(self, url: str, params=None):  # noqa: ANN001
+            _ = params
+            self.calls.append(url)
+            if "local-osrm" in url:
+                raise RuntimeError("local_osrm_down")
+            return _FakeResponse()
+
+    replay.osrm_client = _FakeClient()
+    source, geometry = asyncio.run(
+        replay._fetch_osrm_geometry(
+            origin_lat=40.7580,
+            origin_lon=-73.9855,
+            dest_lat=40.7420,
+            dest_lon=-73.9730,
+        )
+    )
+
+    assert source == "osrm_public"
+    assert len(geometry) >= 2
+    assert replay._last_osrm_provider == "osrm_public"
+
+
+def test_prepare_trip_route_tracks_public_osrm_source(monkeypatch):
+    replay = replay_main.TLCReplay("2024-01")
+    trip = _make_trip(trip_key="public_osrm_case")
+
+    async def _fake_osrm(*_args, **_kwargs):
+        replay._last_osrm_provider = "osrm_public"
+        return [
+            (40.7580, -73.9855),
+            (40.7500, -73.9790),
+            (40.7420, -73.9730),
+        ]
+
+    monkeypatch.setattr(replay_main, "TLC_ROUTE_MODE", "osrm")
+    monkeypatch.setattr(replay, "_fetch_osrm_geometry", _fake_osrm)
+    asyncio.run(replay._prepare_trip_route(trip))
+
+    assert trip.route_source == "osrm_public"
+    assert replay.stats_route_osrm_public_success == 1
+    assert replay.stats_route_osrm_success == 0
+
+
+def test_prepare_trip_route_timeout_triggers_prefetch_schedule(monkeypatch):
+    replay = replay_main.TLCReplay("2024-01")
+    trip = _make_trip(trip_key="prefetch_timeout_case")
+    called: dict[str, int] = {"count": 0}
+
+    async def _slow_fetch(*_args, **_kwargs):
+        await asyncio.sleep(0.05)
+        return "osrm_public", [
+            (40.7580, -73.9855),
+            (40.7500, -73.9790),
+            (40.7420, -73.9730),
+        ]
+
+    def _fake_schedule(_trip, _key):
+        called["count"] += 1
+
+    monkeypatch.setattr(replay_main, "TLC_ROUTE_MODE", "osrm")
+    monkeypatch.setattr(replay_main, "TLC_ROUTE_FETCH_TIMEOUT_S", 0.001)
+    monkeypatch.setattr(replay, "_fetch_osrm_geometry", _slow_fetch)
+    monkeypatch.setattr(replay, "_schedule_route_prefetch", _fake_schedule)
+
+    asyncio.run(replay._prepare_trip_route(trip))
+
+    assert trip.route_source == "linear"
+    assert replay.stats_route_linear_fallback == 1
+    assert called["count"] == 1
+
+
+def test_schedule_route_prefetch_populates_cache(monkeypatch):
+    replay = replay_main.TLCReplay("2024-01")
+    trip = _make_trip(trip_key="prefetch_cache_case", pu_loc=33, do_loc=44)
+    key = (int(trip.pu_loc), int(trip.do_loc))
+
+    async def _fake_fetch(*_args, **_kwargs):
+        return "osrm_public", [
+            (40.7580, -73.9855),
+            (40.7500, -73.9790),
+            (40.7420, -73.9730),
+        ]
+
+    monkeypatch.setattr(replay_main, "TLC_ROUTE_MODE", "osrm")
+    monkeypatch.setattr(replay_main, "TLC_ROUTE_PREFETCH_ENABLED", True)
+    replay.osrm_client = object()
+    monkeypatch.setattr(replay, "_fetch_osrm_geometry", _fake_fetch)
+
+    async def _run_prefetch():
+        replay._schedule_route_prefetch(trip, key)
+        while replay.route_prefetch_tasks:
+            await asyncio.sleep(0.01)
+
+    asyncio.run(_run_prefetch())
+
+    assert key in replay.route_cache
+    source, geometry, cumulative = replay.route_cache[key]
+    assert source == "osrm_public"
+    assert len(geometry) >= 2
+    assert cumulative[-1] > 0
+    assert replay.stats_route_prefetch_started == 1
+    assert replay.stats_route_prefetch_success == 1
 
 
 def test_prepare_trip_route_respects_cache_max(monkeypatch):

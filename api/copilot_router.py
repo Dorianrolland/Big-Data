@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -156,6 +157,26 @@ DRIVER_PROFILE_DEFAULT_RISK_AVERSION = min(
     1.0, max(0.0, _env_float("COPILOT_DRIVER_PROFILE_RISK_AVERSION", 0.5))
 )
 DRIVER_PROFILE_DEFAULT_MAX_ETA = min(60.0, max(3.0, _env_float("COPILOT_DRIVER_PROFILE_MAX_ETA", 20.0)))
+REPLAY_EVENT_TOPICS = tuple(
+    token.strip()
+    for token in os.getenv("COPILOT_REPLAY_EVENT_TOPICS", "order-events-v1,order-offers-v1").split(",")
+    if token.strip()
+)
+REPLAY_DEFAULT_LIMIT = _env_int("COPILOT_REPLAY_DEFAULT_LIMIT", 300, min_value=1, max_value=5000)
+REPLAY_MAX_LIMIT = _env_int("COPILOT_REPLAY_MAX_LIMIT", 2000, min_value=50, max_value=5000)
+REPLAY_HARD_LIMIT = _env_int("COPILOT_REPLAY_HARD_LIMIT", 5000, min_value=100, max_value=10000)
+REPLAY_MAX_RANGE_HOURS = _env_int("COPILOT_REPLAY_MAX_RANGE_HOURS", 24, min_value=1, max_value=168)
+REPLAY_MAX_RANGE_NO_DRIVER_HOURS = _env_int(
+    "COPILOT_REPLAY_MAX_RANGE_NO_DRIVER_HOURS",
+    3,
+    min_value=1,
+    max_value=24,
+)
+REPLAY_SOURCE_LIMIT_FACTOR = _env_int("COPILOT_REPLAY_SOURCE_LIMIT_FACTOR", 4, min_value=1, max_value=20)
+REPLAY_SOURCE_LIMIT_MIN = _env_int("COPILOT_REPLAY_SOURCE_LIMIT_MIN", 200, min_value=20, max_value=5000)
+REPLAY_SOURCE_LIMIT_CAP = _env_int("COPILOT_REPLAY_SOURCE_LIMIT_CAP", 6000, min_value=100, max_value=20000)
+REPLAY_COLUMN_CACHE_TTL_SECONDS = max(0.0, _env_float("COPILOT_REPLAY_COLUMN_CACHE_TTL_SECONDS", 45.0))
+REPLAY_COLUMN_CACHE_MAX = _env_int("COPILOT_REPLAY_COLUMN_CACHE_MAX", 256, min_value=32, max_value=2048)
 
 GBFS_STATION_INFO_URL = "https://gbfs.citibikenyc.com/gbfs/en/station_information.json"
 GBFS_STATION_STATUS_URL = "https://gbfs.citibikenyc.com/gbfs/en/station_status.json"
@@ -172,6 +193,7 @@ NYC_ZONE_CENTROID_PATHS = (
     Path(__file__).resolve().parent.parent / "tlc_replay" / "nyc_zone_centroids.json",
 )
 _NYC_ZONE_CENTROIDS: dict[str, tuple[float, float]] | None = None
+_PARQUET_COLUMNS_CACHE: dict[str, tuple[float, set[str]]] = {}
 
 copilot_router = APIRouter(prefix="/copilot", tags=["Copilot"])
 
@@ -809,6 +831,41 @@ def _duckdb_sql_quote(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+async def _parquet_columns(request: Request, glob_list_sql: str) -> set[str]:
+    cache_enabled = REPLAY_COLUMN_CACHE_TTL_SECONDS > 0.0
+    now = time.monotonic()
+    if cache_enabled:
+        cached = _PARQUET_COLUMNS_CACHE.get(glob_list_sql)
+        if cached is not None and (now - cached[0]) <= REPLAY_COLUMN_CACHE_TTL_SECONDS:
+            return set(cached[1])
+
+    try:
+        rows = await _duck_query(
+            request,
+            (
+                "DESCRIBE SELECT * "
+                f"FROM read_parquet({glob_list_sql}, hive_partitioning = true) "
+                "LIMIT 0"
+            ),
+            timeout_sec=6.0,
+        )
+    except Exception:
+        return set()
+    out: set[str] = set()
+    for row in rows:
+        if not row:
+            continue
+        name = str(row[0] or "").strip()
+        if name:
+            out.add(name)
+    if cache_enabled:
+        if len(_PARQUET_COLUMNS_CACHE) >= REPLAY_COLUMN_CACHE_MAX:
+            oldest_key = min(_PARQUET_COLUMNS_CACHE, key=lambda key: _PARQUET_COLUMNS_CACHE[key][0])
+            _PARQUET_COLUMNS_CACHE.pop(oldest_key, None)
+        _PARQUET_COLUMNS_CACHE[glob_list_sql] = (now, set(out))
+    return out
+
+
 def _finite_float_or_none(value: Any) -> float | None:
     try:
         out = float(value)
@@ -835,6 +892,29 @@ def _hourly_partition_globs(root: Path, from_dt: datetime, to_dt: datetime) -> l
         globs.append(str(partition_path).replace("\\", "/"))
         cursor += timedelta(hours=1)
     return globs
+
+
+def _dedupe_keep_order(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _replay_event_roots() -> list[Path]:
+    roots: list[Path] = []
+    for topic in REPLAY_EVENT_TOPICS:
+        topic_root = EVENTS_PATH / f"topic={topic}"
+        if topic_root.exists():
+            roots.append(topic_root)
+    # Fallback for legacy/eventually different topic names.
+    if not roots:
+        roots.append(EVENTS_PATH / "topic=*")
+    return roots
 
 
 def _parse_fuel_price_usd_gallon(xml_text: str, grade: str) -> float:
@@ -3183,7 +3263,7 @@ async def replay(
     from_ts: str = Query(..., alias="from"),
     to_ts: str = Query(..., alias="to"),
     driver_id: str | None = Query(None),
-    limit: int = Query(500, ge=1, le=5000),
+    limit: int = Query(REPLAY_DEFAULT_LIMIT, ge=1, le=REPLAY_MAX_LIMIT),
 ):
     if not EVENTS_PATH.exists() and not POSITIONS_PATH.exists():
         raise HTTPException(
@@ -3203,23 +3283,148 @@ async def replay(
         to_dt = to_dt.replace(tzinfo=timezone.utc)
     if to_dt < from_dt:
         raise HTTPException(status_code=400, detail="'to' must be >= 'from'")
-    if (to_dt - from_dt) > timedelta(days=7):
-        raise HTTPException(status_code=400, detail="range too large (>7 days)")
+    replay_range = to_dt - from_dt
+    if replay_range > timedelta(hours=REPLAY_MAX_RANGE_HOURS):
+        raise HTTPException(status_code=400, detail=f"range too large (>{REPLAY_MAX_RANGE_HOURS}h)")
+    if driver_id is None and replay_range > timedelta(hours=REPLAY_MAX_RANGE_NO_DRIVER_HOURS):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "driver_id is required for wide replay windows "
+                f"(>{REPLAY_MAX_RANGE_NO_DRIVER_HOURS}h)"
+            ),
+        )
 
-    event_globs = _hourly_partition_globs(EVENTS_PATH / "topic=*", from_dt, to_dt)
+    effective_limit = min(REPLAY_HARD_LIMIT, max(1, int(limit)))
+    source_limit = min(
+        REPLAY_SOURCE_LIMIT_CAP,
+        max(REPLAY_SOURCE_LIMIT_MIN, effective_limit * REPLAY_SOURCE_LIMIT_FACTOR),
+    )
+
+    event_globs: list[str] = []
+    for root in _replay_event_roots():
+        event_globs.extend(_hourly_partition_globs(root, from_dt, to_dt))
+    event_globs = _dedupe_keep_order(event_globs)
+
     position_globs = _hourly_partition_globs(POSITIONS_PATH, from_dt, to_dt)
     existing_event_globs = _existing_parquet_globs(event_globs)
     existing_position_globs = _existing_parquet_globs(position_globs)
     if not existing_event_globs and not existing_position_globs:
-        return {"from": from_ts, "to": to_ts, "driver_id": driver_id, "count": 0, "events": []}
+        return {
+            "from": from_ts,
+            "to": to_ts,
+            "driver_id": driver_id,
+            "count": 0,
+            "events": [],
+            "replay_mode": "empty",
+            "degraded_fallback": False,
+            "sources_used": {
+                "events": False,
+                "positions": False,
+            },
+        }
+
+    replay_mode = "events+positions"
+    if existing_event_globs and not existing_position_globs:
+        replay_mode = "events_only"
+    elif existing_position_globs and not existing_event_globs:
+        replay_mode = "positions_only"
+    degraded_fallback = False
 
     select_parts: list[str] = []
     params: list[Any] = []
+    event_select_sql: str | None = None
+    event_params: list[Any] = []
+    position_select_sql: str | None = None
+    position_params: list[Any] = []
 
     if existing_event_globs:
         event_glob_list_sql = "[" + ", ".join(_duckdb_sql_quote(g) for g in existing_event_globs) + "]"
-        select_parts.append(
+        event_columns = await _parquet_columns(request, event_glob_list_sql)
+        source_platform_expr = "'unknown'"
+        if "source_platform" in event_columns:
+            source_platform_expr = "source_platform"
+        elif "source" in event_columns:
+            source_platform_expr = "source"
+        event_select_sql = f"""
+            SELECT * FROM (
+                SELECT
+                    ts,
+                    topic,
+                    event_type,
+                    event_id,
+                    courier_id,
+                    offer_id,
+                    order_id,
+                    status,
+                    zone_id,
+                    estimated_fare_eur,
+                    actual_fare_eur,
+                    demand_index,
+                    supply_index,
+                    {source_platform_expr} AS source_platform,
+                    CAST(NULL AS DOUBLE) AS lat,
+                    CAST(NULL AS DOUBLE) AS lon,
+                    CAST(NULL AS REAL) AS speed_kmh,
+                    CAST(NULL AS REAL) AS heading_deg,
+                    CAST(NULL AS REAL) AS accuracy_m,
+                    CAST(NULL AS REAL) AS battery_pct
+                FROM read_parquet({event_glob_list_sql}, hive_partitioning = true)
+                WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
+                  AND (? IS NULL OR courier_id = ?)
+                ORDER BY ts DESC
+                LIMIT {int(source_limit)}
+            ) replay_events
+            """
+        select_parts.append(event_select_sql)
+        event_params = [from_ts, to_ts, driver_id, driver_id]
+        params.extend(event_params)
+
+    if existing_position_globs:
+        position_glob_list_sql = "[" + ", ".join(_duckdb_sql_quote(g) for g in existing_position_globs) + "]"
+        position_select_sql = f"""
+            SELECT * FROM (
+                SELECT
+                    ts,
+                    'livreurs-gps' AS topic,
+                    'courier.position.v1' AS event_type,
+                    '' AS event_id,
+                    livreur_id AS courier_id,
+                    '' AS offer_id,
+                    '' AS order_id,
+                    COALESCE(status, 'unknown') AS status,
+                    '' AS zone_id,
+                    CAST(NULL AS REAL) AS estimated_fare_eur,
+                    CAST(NULL AS REAL) AS actual_fare_eur,
+                    CAST(NULL AS REAL) AS demand_index,
+                    CAST(NULL AS REAL) AS supply_index,
+                    'position_lake' AS source_platform,
+                    lat,
+                    lon,
+                    speed_kmh,
+                    heading_deg,
+                    accuracy_m,
+                    battery_pct
+                FROM read_parquet({position_glob_list_sql}, hive_partitioning = true)
+                WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
+                  AND (? IS NULL OR livreur_id = ?)
+                ORDER BY ts DESC
+                LIMIT {int(source_limit)}
+            ) replay_positions
+            """
+        select_parts.append(position_select_sql)
+        position_params = [from_ts, to_ts, driver_id, driver_id]
+        params.extend(position_params)
+
+    async def _run_replay_union(parts: list[str], query_params: list[Any]) -> list[Any]:
+        union_sql = "\nUNION ALL\n".join(parts)
+        return await _duck_query(
+            request,
             f"""
+        WITH replay_data AS (
+            {union_sql}
+        ),
+        latest AS (
             SELECT
                 ts,
                 topic,
@@ -3235,55 +3440,16 @@ async def replay(
                 demand_index,
                 supply_index,
                 source_platform,
-                CAST(NULL AS DOUBLE) AS lat,
-                CAST(NULL AS DOUBLE) AS lon,
-                CAST(NULL AS REAL) AS speed_kmh,
-                CAST(NULL AS REAL) AS heading_deg,
-                CAST(NULL AS REAL) AS accuracy_m,
-                CAST(NULL AS REAL) AS battery_pct
-            FROM read_parquet({event_glob_list_sql}, hive_partitioning = true)
-            WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
-              AND (? IS NULL OR courier_id = ?)
-            """
-        )
-        params.extend([from_ts, to_ts, driver_id, driver_id])
-
-    if existing_position_globs:
-        position_glob_list_sql = "[" + ", ".join(_duckdb_sql_quote(g) for g in existing_position_globs) + "]"
-        select_parts.append(
-            f"""
-            SELECT
-                ts,
-                'livreurs-gps' AS topic,
-                'courier.position.v1' AS event_type,
-                '' AS event_id,
-                livreur_id AS courier_id,
-                '' AS offer_id,
-                '' AS order_id,
-                COALESCE(status, 'unknown') AS status,
-                '' AS zone_id,
-                CAST(NULL AS REAL) AS estimated_fare_eur,
-                CAST(NULL AS REAL) AS actual_fare_eur,
-                CAST(NULL AS REAL) AS demand_index,
-                CAST(NULL AS REAL) AS supply_index,
-                'position_lake' AS source_platform,
                 lat,
                 lon,
                 speed_kmh,
                 heading_deg,
                 accuracy_m,
                 battery_pct
-            FROM read_parquet({position_glob_list_sql}, hive_partitioning = true)
-            WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
-              AND (? IS NULL OR livreur_id = ?)
-            """
+            FROM replay_data
+            ORDER BY ts DESC
+            LIMIT ?
         )
-        params.extend([from_ts, to_ts, driver_id, driver_id])
-
-    union_sql = "\nUNION ALL\n".join(select_parts)
-    rows = await _duck_query(
-        request,
-        f"""
         SELECT
             ts,
             topic,
@@ -3305,20 +3471,35 @@ async def replay(
             heading_deg,
             accuracy_m,
             battery_pct
-        FROM (
-            {union_sql}
-        ) replay_data
-        ORDER BY ts
-        LIMIT ?
+        FROM latest
+        ORDER BY ts ASC
         """,
-        [*params, limit],
-    )
+            [*query_params, effective_limit],
+        )
+
+    try:
+        rows = await _run_replay_union(select_parts, params)
+    except HTTPException as exc:
+        if exc.status_code == 504 and event_select_sql and position_select_sql:
+            # Under heavy load, replay positions can dominate scan time.
+            # Fallback to events-only keeps the endpoint available for smoke/demo checks.
+            rows = await _run_replay_union([event_select_sql], event_params)
+            replay_mode = "events_only_fallback"
+            degraded_fallback = True
+        else:
+            raise
 
     return {
         "from": from_ts,
         "to": to_ts,
         "driver_id": driver_id,
         "count": len(rows),
+        "replay_mode": replay_mode,
+        "degraded_fallback": degraded_fallback,
+        "sources_used": {
+            "events": bool(existing_event_globs),
+            "positions": bool(existing_position_globs),
+        },
         "events": [
             {
                 "ts": str(r[0]),

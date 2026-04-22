@@ -306,11 +306,14 @@
    Tuiles : OSM standard (fiable) + dark mode CSS filter sur tile-pane
    ══════════════════════════════════════════════════════════════════════════ */
 
-const API      = '';
-const POLL_GPS = 2000;
-const POLL_PERF = 20000;
+const API = '';
+const _urlParams = new URLSearchParams(window.location.search);
+const POLL_GPS = Math.max(700, Number(_urlParams.get('gpsPoll') || '1200'));
+const POLL_PERF = 60000;
 const HTTP_TIMEOUT_MS = 4500;
 const BOOT_SPINNER_FAILSAFE_MS = 7000;
+const POLL_BACKOFF_BASE_MS = 1500;
+const POLL_BACKOFF_MAX_MS = 20000;
 
 /* ── Focus mode ────────────────────────────────────────────────────────────
    Active when the URL has ?focus=<driver_id>. In this mode the map tracks
@@ -318,13 +321,18 @@ const BOOT_SPINNER_FAILSAFE_MS = 7000;
    interpolates between polls so the marker slides smoothly. The marker
    never disappears on a brief stale window — a "stale" pill is shown
    instead. */
-const _urlParams = new URLSearchParams(window.location.search);
 const FOCUS_DRIVER = (_urlParams.get('focus') || '').trim();
 const FOCUS_ENABLED = FOCUS_DRIVER.length > 0;
-const FOCUS_TRAIL_POINTS = Number(_urlParams.get('trail') || '60');
-const FOCUS_POLL_MS = Number(_urlParams.get('focusPoll') || '1500');
+const FOCUS_TRAIL_POINTS = Number(_urlParams.get('trail') || '36');
+const FOCUS_POLL_MS = Number(_urlParams.get('focusPoll') || '2000');
 const FOCUS_STATUS_POLL_MS = Number(_urlParams.get('focusStatusPoll') || '10000');
 const FOCUS_INTERP_MS = 60;
+const PERF_POLL_ENABLED = (_urlParams.get('perf') || (FOCUS_ENABLED ? '0' : '1')) === '1';
+const FLEET_QUERY_LIMIT = Math.max(50, Number(_urlParams.get('fleetLimit') || '500'));
+const FLEET_INTERP_MIN_MS = 550;
+const FLEET_INTERP_MAX_MS = 18000;
+const FLEET_INTERP_TARGET_KMH = Number(_urlParams.get('fleetKmh') || '24');
+const FLEET_REMOVE_GRACE_MS = Math.max(4000, Number(_urlParams.get('fleetKeepMs') || '12000'));
 
 setTimeout(() => {
   const spinner = document.getElementById('spinner');
@@ -360,10 +368,52 @@ L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
 /* ── State ──────────────────────────────────────────────────────────────── */
 const halos   = new Map();  // id → halo CircleMarker (rayon large, opacité faible)
 const markers = new Map();  // id → CircleMarker principal
+const fleetMotion = new Map(); // id -> interpolation state for smooth marker gliding
+const fleetSeenAt = new Map(); // id -> last time seen in /livreurs-proches payload
 let firstLoad = true;
 let gpsPollInFlight = false;
 let statsPollInFlight = false;
 let perfPollInFlight = false;
+const pollFailures = Object.create(null);
+const pollCooldownUntil = Object.create(null);
+const pollLastWarnAt = Object.create(null);
+let pageHidden = document.hidden === true;
+
+document.addEventListener('visibilitychange', () => {
+  pageHidden = document.hidden === true;
+});
+
+function isAbortLike(err) {
+  if (!err) return false;
+  const name = String(err.name || '').toLowerCase();
+  const msg = String(err.message || '').toLowerCase();
+  return name.includes('abort') || msg.includes('abort');
+}
+
+function pollReady(key) {
+  return Date.now() >= (pollCooldownUntil[key] || 0);
+}
+
+function markPollSuccess(key) {
+  pollFailures[key] = 0;
+  pollCooldownUntil[key] = 0;
+}
+
+function markPollFailure(key, label, err) {
+  const isAbort = isAbortLike(err);
+  const failures = Math.min(8, (pollFailures[key] || 0) + 1);
+  pollFailures[key] = failures;
+  const backoffMs = Math.min(POLL_BACKOFF_MAX_MS, POLL_BACKOFF_BASE_MS * Math.pow(2, failures - 1));
+  pollCooldownUntil[key] = Date.now() + backoffMs;
+  if (!isAbort) {
+    const now = Date.now();
+    const lastWarn = pollLastWarnAt[key] || 0;
+    if (failures <= 2 || (now - lastWarn) >= 15000) {
+      console.warn(`${label} (x${failures}, retry in ${Math.round(backoffMs)}ms):`, err);
+      pollLastWarnAt[key] = now;
+    }
+  }
+}
 
 function hideSpinner() {
   const spinner = document.getElementById('spinner');
@@ -468,14 +518,111 @@ function setBar(sid, bid, ms) {
   bar.className = 'bar-fill ' + (ms > 10 ? 'bad' : ms > 7 ? 'warn' : '');
 }
 
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const toRad = (d) => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2
+    + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 6371 * 2 * Math.asin(Math.sqrt(Math.max(0, Math.min(1, a))));
+}
+
+function parseIsoTimestampMs(ts) {
+  if (!ts || typeof ts !== 'string') return null;
+  const ms = Date.parse(ts);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function fleetInterpolatedPosition(state, now) {
+  const span = Math.max(1, state.targetWall - state.startWall);
+  const t = Math.max(0, Math.min(1, (now - state.startWall) / span));
+  return {
+    lat: state.fromLat + (state.targetLat - state.fromLat) * t,
+    lon: state.fromLon + (state.targetLon - state.fromLon) * t,
+  };
+}
+
+function fleetDurationMs(fromLat, fromLon, toLat, toLon, sourceDeltaMs) {
+  const distanceKm = haversineKm(fromLat, fromLon, toLat, toLon);
+  const speed = Math.max(10, FLEET_INTERP_TARGET_KMH || 24);
+  const travelMs = (distanceKm / speed) * 3600 * 1000;
+  const observedMs = Number.isFinite(sourceDeltaMs) && sourceDeltaMs > 250
+    ? sourceDeltaMs
+    : POLL_GPS;
+  const budgetMs = Math.max(observedMs * 0.9, travelMs);
+  const dynamicMax = Math.max(FLEET_INTERP_MAX_MS, observedMs * 2.0);
+  return Math.max(FLEET_INTERP_MIN_MS, Math.min(dynamicMax, budgetMs));
+}
+
+function upsertFleetMotion(lv, now) {
+  const marker = markers.get(lv.livreur_id);
+  if (!marker) return;
+  const halo = halos.get(lv.livreur_id);
+  const s = STATUS[lv.status] || defaultStatus;
+  const nextServerTsMs = parseIsoTimestampMs(lv.ts);
+  let state = fleetMotion.get(lv.livreur_id);
+  if (!state) {
+    state = {
+      fromLat: lv.lat,
+      fromLon: lv.lon,
+      targetLat: lv.lat,
+      targetLon: lv.lon,
+      startWall: now,
+      targetWall: now + FLEET_INTERP_MIN_MS,
+      lastServerTsMs: nextServerTsMs,
+      payload: lv,
+    };
+    fleetMotion.set(lv.livreur_id, state);
+    marker.setLatLng([lv.lat, lv.lon]);
+    halo?.setLatLng([lv.lat, lv.lon]);
+  } else {
+    const current = fleetInterpolatedPosition(state, now);
+    const sourceDeltaMs = (
+      nextServerTsMs != null
+      && state.lastServerTsMs != null
+      && nextServerTsMs > state.lastServerTsMs
+    ) ? (nextServerTsMs - state.lastServerTsMs) : null;
+    state.fromLat = current.lat;
+    state.fromLon = current.lon;
+    state.targetLat = lv.lat;
+    state.targetLon = lv.lon;
+    state.startWall = now;
+    state.targetWall = now + fleetDurationMs(current.lat, current.lon, lv.lat, lv.lon, sourceDeltaMs);
+    if (nextServerTsMs != null) state.lastServerTsMs = nextServerTsMs;
+    state.payload = lv;
+  }
+  marker.setStyle({ fillColor: s.color });
+  halo?.setStyle({ fillColor: s.color });
+  if (marker.isPopupOpen()) marker.setPopupContent(buildPopup(lv));
+}
+
+function fleetRenderTick() {
+  if (!FOCUS_ENABLED && !pageHidden && fleetMotion.size > 0) {
+    const now = performance.now();
+    for (const [id, state] of fleetMotion) {
+      const marker = markers.get(id);
+      const halo = halos.get(id);
+      if (!marker || !halo) continue;
+      const pos = fleetInterpolatedPosition(state, now);
+      marker.setLatLng([pos.lat, pos.lon]);
+      halo.setLatLng([pos.lat, pos.lon]);
+    }
+  }
+  requestAnimationFrame(fleetRenderTick);
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
    POLLING GPS — setLatLng en place, zero recreate
    ══════════════════════════════════════════════════════════════════════════ */
 async function pollGPS() {
+  if (pageHidden) return;
+  if (!pollReady('gps')) return;
   if (gpsPollInFlight) return;
   gpsPollInFlight = true;
   try {
-    const data = await fetchJson('/livreurs-proches?lat=40.7580&lon=-73.9855&rayon=20&limit=200');
+    const data = await fetchJson(
+      '/livreurs-proches?lat=40.7580&lon=-73.9855&rayon=20&limit=' + encodeURIComponent(String(FLEET_QUERY_LIMIT))
+    );
     const livreurs = data.livreurs || [];
 
     if (firstLoad) {
@@ -485,35 +632,28 @@ async function pollGPS() {
 
     let nDel = 0, nAvail = 0;
     const seen = new Set();
+    const now = performance.now();
 
     livreurs.forEach(lv => {
       seen.add(lv.livreur_id);
+      fleetSeenAt.set(lv.livreur_id, now);
       if (lv.status === 'delivering') nDel++;
       else if (lv.status === 'available') nAvail++;
 
-      const s = STATUS[lv.status] || defaultStatus;
-      const ll = [lv.lat, lv.lon];
-
-      if (markers.has(lv.livreur_id)) {
-        const m = markers.get(lv.livreur_id);
-        const h = halos.get(lv.livreur_id);
-        m.setLatLng(ll);
-        m.setStyle({ fillColor: s.color });
-        h.setLatLng(ll);
-        h.setStyle({ fillColor: s.color });
-        if (m.isPopupOpen()) m.setPopupContent(buildPopup(lv));
-      } else {
-        markers.set(lv.livreur_id, mkMarker(lv));
-      }
+      if (!markers.has(lv.livreur_id)) markers.set(lv.livreur_id, mkMarker(lv));
+      upsertFleetMotion(lv, now);
     });
 
     // Purge TTL expirés
     for (const [id, m] of markers) {
-      if (!seen.has(id)) {
+      const lastSeen = fleetSeenAt.get(id) || 0;
+      if (!seen.has(id) && (now - lastSeen) > FLEET_REMOVE_GRACE_MS) {
         m.remove();
         halos.get(id)?.remove();
         markers.delete(id);
         halos.delete(id);
+        fleetMotion.delete(id);
+        fleetSeenAt.delete(id);
       }
     }
 
@@ -523,19 +663,22 @@ async function pollGPS() {
     document.getElementById('k-avail').textContent = nAvail;
     setConnectionLabel('⟳ ' + new Date().toLocaleTimeString('fr-FR'));
     updateList(livreurs);
+    markPollSuccess('gps');
   } catch (e) {
     if (firstLoad) {
       hideSpinner();
       firstLoad = false;
     }
     setConnectionLabel('API indisponible (reconnexion...)');
-    console.warn('GPS poll:', e);
+    markPollFailure('gps', 'GPS poll failed', e);
   } finally {
     gpsPollInFlight = false;
   }
 }
 
 async function pollStats() {
+  if (pageHidden) return;
+  if (!pollReady('stats')) return;
   if (statsPollInFlight) return;
   statsPollInFlight = true;
   try {
@@ -545,30 +688,34 @@ async function pollStats() {
       (d.hot_path?.messages_traites || 0).toLocaleString('fr-FR');
     document.getElementById('c-files').textContent = cp.fichiers_parquet ?? '—';
     document.getElementById('c-size').textContent  = (cp.taille_totale_mb ?? '—') + ' MB';
+    markPollSuccess('stats');
   } catch (e) {
     document.getElementById('k-msgs').textContent = '—';
-    console.warn('Stats poll:', e);
+    markPollFailure('stats', 'Stats poll failed', e);
   } finally {
     statsPollInFlight = false;
   }
 }
 
 async function pollPerf() {
+  if (pageHidden) return;
+  if (!pollReady('perf')) return;
   if (perfPollInFlight) return;
   perfPollInFlight = true;
   try {
-    const d = await fetchJson('/health/performance?samples=50', 8000);
+    const d = await fetchJson('/health/performance?samples=10', 6000);
     const b = d.geosearch_benchmark || {};
     document.getElementById('k-p99').textContent = b.p99_ms != null ? b.p99_ms + ' ms' : '—';
     setBar('s-p50','b-p50', b.p50_ms);
     setBar('s-p95','b-p95', b.p95_ms);
     setBar('s-p99','b-p99', b.p99_ms);
+    markPollSuccess('perf');
   } catch (e) {
     document.getElementById('k-p99').textContent = '—';
     setBar('s-p50','b-p50', 0);
     setBar('s-p95','b-p95', 0);
     setBar('s-p99','b-p99', 0);
-    console.warn('Perf poll:', e);
+    markPollFailure('perf', 'Perf poll failed', e);
   } finally {
     perfPollInFlight = false;
   }
@@ -608,7 +755,24 @@ const focusState = {
   statusPillEl: null,
   stale: false,
   statusMeta: null,
+  missingPositionStreak: 0,
+  fallbackTriggered: false,
 };
+
+function fallbackToFleetMode(reason) {
+  if (focusState.fallbackTriggered) return;
+  focusState.fallbackTriggered = true;
+  console.warn('Focus disabled, fallback to fleet mode:', reason || 'unsupported');
+  setConnectionLabel('mode flotte (focus indisponible)');
+  const redirect = new URL(window.location.href);
+  redirect.searchParams.delete('focus');
+  redirect.searchParams.delete('trail');
+  redirect.searchParams.delete('focusPoll');
+  redirect.searchParams.delete('focusStatusPoll');
+  redirect.searchParams.delete('perf');
+  const query = redirect.searchParams.toString();
+  window.location.replace(redirect.pathname + (query ? '?' + query : ''));
+}
 
 function ensureFocusPill() {
   if (focusState.statusPillEl) return focusState.statusPillEl;
@@ -654,6 +818,8 @@ function setFocusPillState(stale, ageS) {
   if (meta) {
     const parts = [
       'driver: ' + (meta.driver_id || FOCUS_DRIVER),
+      'scenario: ' + (meta.scenario || '?'),
+      'focus_supported: ' + (meta.focus_supported !== false),
       'state: ' + (meta.state || '?'),
       'virtual_time: ' + (meta.virtual_time || '?'),
       'providers: ' + (meta.routing_providers && meta.routing_providers.length
@@ -675,14 +841,21 @@ function setFocusPillState(stale, ageS) {
 }
 
 async function pollFocusStatus() {
+  if (pageHidden) return;
+  if (!pollReady('focusStatus')) return;
   try {
     const d = await fetchJson('/livreurs/focus/status');
     focusState.statusMeta = d || null;
+    if (d && d.focus_supported === false) {
+      fallbackToFleetMode('single-driver focus not supported in this scenario');
+      return;
+    }
     // refresh the pill text so counters update without waiting for next pollFocus
     setFocusPillState(focusState.stale, focusState.lastAge);
+    markPollSuccess('focusStatus');
   } catch (e) {
     // non-fatal: status is informative, position stream is the live path
-    console.warn('Focus status poll:', e);
+    markPollFailure('focusStatus', 'Focus status poll failed', e);
   }
 }
 
@@ -746,6 +919,8 @@ function renderTrail(points) {
 }
 
 async function pollFocus() {
+  if (pageHidden) return;
+  if (!pollReady('focus')) return;
   if (focusState.inflight) return;
   focusState.inflight = true;
   try {
@@ -761,6 +936,7 @@ async function pollFocus() {
     setFocusPillState(focusState.stale, focusState.lastAge);
 
     if (pos && Number.isFinite(pos.lat) && Number.isFinite(pos.lon)) {
+      focusState.missingPositionStreak = 0;
       ensureFocusMarker(pos.lat, pos.lon, pos.status);
       const now = performance.now();
       if (focusState.lastLat == null) {
@@ -781,15 +957,25 @@ async function pollFocus() {
         map.setView([pos.lat, pos.lon], 14, { animate: false });
         focusState.firstFit = true;
       }
+    } else {
+      focusState.missingPositionStreak += 1;
+      const unsupportedScenario = focusState.statusMeta
+        && focusState.statusMeta.scenario
+        && String(focusState.statusMeta.scenario).toLowerCase() !== 'single_driver';
+      if (unsupportedScenario && focusState.missingPositionStreak >= 3) {
+        fallbackToFleetMode('missing focus position in non single-driver scenario');
+        return;
+      }
     }
     if (d && Array.isArray(d.trail)) {
       renderTrail(d.trail);
     }
     setConnectionLabel('⟳ focus ' + new Date().toLocaleTimeString('fr-FR'));
+    markPollSuccess('focus');
   } catch (e) {
     if (firstLoad) { hideSpinner(); firstLoad = false; }
     setConnectionLabel('focus: API retry…');
-    console.warn('Focus poll:', e);
+    markPollFailure('focus', 'Focus poll failed', e);
   } finally {
     focusState.inflight = false;
   }
@@ -815,14 +1001,19 @@ if (FOCUS_ENABLED) {
   setInterval(pollFocus, FOCUS_POLL_MS);
   setInterval(pollFocusStatus, FOCUS_STATUS_POLL_MS);
   requestAnimationFrame(focusRenderTick);
-  pollStats(); pollPerf();
-  setInterval(pollStats, 5000);
-  setInterval(pollPerf, POLL_PERF);
+  pollStats();
+  setInterval(pollStats, 12000);
+  if (PERF_POLL_ENABLED) {
+    pollPerf();
+    setInterval(pollPerf, POLL_PERF);
+  }
 } else {
-  pollGPS(); pollStats(); pollPerf();
+  pollGPS(); pollStats();
+  if (PERF_POLL_ENABLED) pollPerf();
+  requestAnimationFrame(fleetRenderTick);
   setInterval(pollGPS,   POLL_GPS);
   setInterval(pollStats, 5000);
-  setInterval(pollPerf,  POLL_PERF);
+  if (PERF_POLL_ENABLED) setInterval(pollPerf, POLL_PERF);
 }
 </script>
 </body>

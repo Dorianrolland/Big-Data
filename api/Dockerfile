@@ -28,5 +28,5 @@ COPY . .
 
 EXPOSE 8000
 
-# 1 worker : nécessaire pour que Prometheus multiprocess fonctionne correctement
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+# 1 worker par défaut ; configurable via UVICORN_WORKERS pour les démos chargées.
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS:-1}"]
