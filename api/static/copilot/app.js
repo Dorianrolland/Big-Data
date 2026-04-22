@@ -2963,7 +2963,7 @@ async function replayWindow() {
 
   try {
     const replay = await api(
-      `/copilot/replay?from=${encodeURIComponent(fromTs)}&to=${encodeURIComponent(toTs)}&driver_id=${encodeURIComponent(driver)}&limit=400`
+      `/copilot/replay?from=${encodeURIComponent(fromTs)}&to=${encodeURIComponent(toTs)}&driver_id=${encodeURIComponent(driver)}&limit=250`
     );
     state.replay = Array.isArray(replay.events) ? replay.events : [];
     renderReplay();

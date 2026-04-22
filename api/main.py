@@ -18,6 +18,7 @@ import math
 import os
 import statistics
 import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -53,6 +54,22 @@ REDIS_OP_TIMEOUT_SECONDS = float(os.getenv("REDIS_OP_TIMEOUT_SECONDS", "6.0"))
 DUCKDB_QUERY_TIMEOUT_SECONDS = float(os.getenv("DUCKDB_QUERY_TIMEOUT_SECONDS", "12.0"))
 TLC_SCENARIO = (os.getenv("TLC_SCENARIO", "fleet") or "fleet").strip().lower()
 TLC_SINGLE_DRIVER_ID = (os.getenv("TLC_SINGLE_DRIVER_ID", "drv_demo_001") or "drv_demo_001").strip()
+FOCUS_TRAIL_LOOKBACK_MIN = max(10, min(180, int(os.getenv("FOCUS_TRAIL_LOOKBACK_MIN", "45") or "45")))
+FOCUS_TRAIL_MAX_HOURS = max(1, min(12, int(os.getenv("FOCUS_TRAIL_MAX_HOURS", "2") or "2")))
+FOCUS_TRAIL_QUERY_TIMEOUT_SECONDS = float(os.getenv("FOCUS_TRAIL_QUERY_TIMEOUT_SECONDS", "3.0"))
+FOCUS_TRAIL_CACHE_TTL_SECONDS = max(1.0, float(os.getenv("FOCUS_TRAIL_CACHE_TTL_SECONDS", "8.0") or "8.0"))
+FOCUS_TRAIL_CACHE_MAX = max(32, int(os.getenv("FOCUS_TRAIL_CACHE_MAX", "512") or "512"))
+PERF_BENCH_CACHE_TTL_SECONDS = max(10.0, float(os.getenv("PERF_BENCH_CACHE_TTL_SECONDS", "60.0") or "60.0"))
+PERF_BENCH_MAX_SAMPLES = max(20, int(os.getenv("PERF_BENCH_MAX_SAMPLES", "120") or "120"))
+STATS_STATUS_SCAN_LIMIT = max(0, int(os.getenv("STATS_STATUS_SCAN_LIMIT", "1500") or "1500"))
+STATS_COLD_CACHE_TTL_SECONDS = max(
+    5.0,
+    float(os.getenv("STATS_COLD_CACHE_TTL_SECONDS", "45.0") or "45.0"),
+)
+ANALYTICS_COLD_QUERY_TIMEOUT_SECONDS = max(
+    1.0,
+    float(os.getenv("ANALYTICS_COLD_QUERY_TIMEOUT_SECONDS", "4.0") or "4.0"),
+)
 
 GEO_KEY          = "fleet:geo"
 HASH_PREFIX      = "fleet:livreur:"
@@ -71,6 +88,14 @@ DELIVERING_STATUS_ALIASES = {
 }
 AVAILABLE_STATUS_ALIASES = {"available", "ready", "waiting_order"}
 IDLE_STATUS_ALIASES = {"idle", "offline", "paused"}
+
+_focus_trail_cache: OrderedDict[str, tuple[float, list[dict[str, Any]]]] = OrderedDict()
+_focus_trail_cache_lock = asyncio.Lock()
+_perf_bench_cache: dict[int, tuple[float, dict[str, Any]]] = {}
+_perf_bench_cache_lock = asyncio.Lock()
+_stats_cold_cache: dict[str, Any] = {"expires_at": 0.0, "payload": {}}
+_stats_cold_cache_lock = asyncio.Lock()
+_stats_cold_refresh_in_flight = False
 
 # ── Prometheus custom metrics ───────────────────────────────────────────────────
 gauge_active_livreurs = Gauge(
@@ -394,6 +419,14 @@ def _sql_quote_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def _path_exists_safe(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError as exc:
+        log.warning("path exists check failed for %s: %s", path, exc)
+        return False
+
+
 def _hour_partition_globs(
     window_start: datetime,
     window_end: datetime,
@@ -428,7 +461,7 @@ def _hour_partition_globs(
             / f"day={cur:%d}"
             / f"hour={cur:%H}"
         )
-        if partition_dir.exists():
+        if _path_exists_safe(partition_dir):
             glob = str(partition_dir / "*.parquet")
             if glob not in seen:
                 globs.append(glob)
@@ -438,20 +471,30 @@ def _hour_partition_globs(
 
 
 def _recent_hour_partition_globs(limit: int = 8) -> list[str]:
-    if not DATA_PATH.exists():
+    if not _path_exists_safe(DATA_PATH):
         return []
 
-    hour_dirs = sorted(
-        (
-            p for p in DATA_PATH.glob("year=*/month=*/day=*/hour=*")
-            if p.is_dir()
-        ),
-        key=lambda p: p.as_posix(),
-        reverse=True,
-    )
+    try:
+        raw_dirs = list(DATA_PATH.glob("year=*/month=*/day=*/hour=*"))
+    except OSError as exc:
+        log.warning("recent partition scan failed: %s", exc)
+        return []
+
+    hour_dirs: list[Path] = []
+    for p in raw_dirs:
+        try:
+            if p.is_dir():
+                hour_dirs.append(p)
+        except OSError:
+            continue
+    hour_dirs = sorted(hour_dirs, key=lambda p: p.as_posix(), reverse=True)
+
     out: list[str] = []
     for part in hour_dirs:
-        if next(part.glob("*.parquet"), None) is None:
+        try:
+            if next(part.glob("*.parquet"), None) is None:
+                continue
+        except OSError:
             continue
         out.append(str(part / "*.parquet"))
         if len(out) >= limit:
@@ -516,6 +559,104 @@ async def _run_redis(
         if strict:
             raise _redis_http_exception(exc) from exc
         return default
+
+
+def _focus_trail_cache_key(driver_id: str, trail_points: int, window_end: datetime) -> str:
+    # 5-second buckets are enough for a smooth focus animation while avoiding
+    # repeated DuckDB scans from multiple concurrent UI polls.
+    bucket = int(_coerce_datetime_utc(window_end).timestamp() // 5)
+    return f"{driver_id}:{int(trail_points)}:{bucket}"
+
+
+async def _focus_trail_cache_get(key: str) -> list[dict[str, Any]] | None:
+    now = time.time()
+    async with _focus_trail_cache_lock:
+        entry = _focus_trail_cache.get(key)
+        if not entry:
+            return None
+        expires_at, payload = entry
+        if expires_at <= now:
+            _focus_trail_cache.pop(key, None)
+            return None
+        _focus_trail_cache.move_to_end(key)
+        return payload
+
+
+async def _focus_trail_cache_set(key: str, payload: list[dict[str, Any]]) -> None:
+    expires_at = time.time() + FOCUS_TRAIL_CACHE_TTL_SECONDS
+    async with _focus_trail_cache_lock:
+        _focus_trail_cache[key] = (expires_at, payload)
+        _focus_trail_cache.move_to_end(key)
+        while len(_focus_trail_cache) > FOCUS_TRAIL_CACHE_MAX:
+            _focus_trail_cache.popitem(last=False)
+
+
+def _scan_cold_path_snapshot_sync() -> dict[str, Any]:
+    if not _path_exists_safe(DATA_PATH):
+        return {
+            "cold_parquet_files": 0,
+            "cold_parquet_total_mb": 0.0,
+        }
+    total_size = 0
+    counted = 0
+    try:
+        iterator = DATA_PATH.rglob("*.parquet")
+        for f in iterator:
+            try:
+                total_size += int(f.stat().st_size)
+                counted += 1
+            except OSError:
+                continue
+    except OSError as exc:
+        log.warning("cold path glob failed: %s", exc)
+        counted = 0
+        total_size = 0
+    parquet_total_mb = round(float(total_size) / 1_048_576, 2)
+    return {
+        "cold_parquet_files": counted,
+        "cold_parquet_total_mb": parquet_total_mb,
+    }
+
+
+async def _cold_path_snapshot_cached() -> dict[str, Any]:
+    global _stats_cold_refresh_in_flight
+    now = time.time()
+    cached_payload: dict[str, Any] = {}
+    async with _stats_cold_cache_lock:
+        cached_payload = _stats_cold_cache.get("payload", {}) or {}
+        if float(_stats_cold_cache.get("expires_at", 0.0)) > now and cached_payload:
+            return cached_payload
+        # Avoid thundering herd when many /stats calls hit the same refresh.
+        if _stats_cold_refresh_in_flight:
+            return cached_payload or {
+                "cold_parquet_files": 0,
+                "cold_parquet_total_mb": 0.0,
+            }
+        _stats_cold_refresh_in_flight = True
+
+    try:
+        payload = await asyncio.to_thread(_scan_cold_path_snapshot_sync)
+        async with _stats_cold_cache_lock:
+            _stats_cold_cache["payload"] = payload
+            _stats_cold_cache["expires_at"] = time.time() + STATS_COLD_CACHE_TTL_SECONDS
+            _stats_cold_refresh_in_flight = False
+        return payload
+    except Exception as exc:  # noqa: BLE001
+        log.warning("cold path snapshot refresh failed: %s", exc)
+        async with _stats_cold_cache_lock:
+            _stats_cold_refresh_in_flight = False
+            cached_payload = _stats_cold_cache.get("payload", {}) or {}
+            if cached_payload:
+                return cached_payload
+        return {
+            "cold_parquet_files": 0,
+            "cold_parquet_total_mb": 0.0,
+        }
+    finally:
+        # Defensive reset on cancellation/early exits.
+        if _stats_cold_refresh_in_flight:
+            async with _stats_cold_cache_lock:
+                _stats_cold_refresh_in_flight = False
 
 
 async def _latest_parquet_ts() -> datetime | None:
@@ -722,6 +863,8 @@ async def livreur_focus_status():
     return {
         "driver_id": raw.get("driver_id") or "",
         "state": raw.get("state") or "unknown",
+        "scenario": TLC_SCENARIO,
+        "focus_supported": TLC_SCENARIO == "single_driver",
         "virtual_time": raw.get("virtual_time") or "",
         "updated_at": updated_at_iso,
         "age_seconds": age_seconds,
@@ -797,37 +940,48 @@ async def livreur_focus(
         }
 
     trail: list[dict] = []
-    if trail_points > 0:
+    if trail_points > 0 and position is not None:
         window_end = now_utc
-        window_start = window_end - timedelta(hours=2)
-        scan_sql = _parquet_scan_sql(window_start, window_end, max_hours=4)
-        try:
-            rows = await _dq(
-                f"""
-                SELECT ts, lat, lon, speed_kmh, status
-                FROM {scan_sql}
-                WHERE livreur_id = ?
-                  AND ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
-                ORDER BY ts DESC
-                LIMIT ?
-                """,
-                [driver_id, _dt_to_iso(window_start), _dt_to_iso(window_end), int(trail_points)],
+        cache_key = _focus_trail_cache_key(driver_id, int(trail_points), window_end)
+        cached_trail = await _focus_trail_cache_get(cache_key)
+        if cached_trail is not None:
+            trail = cached_trail
+        else:
+            dynamic_lookback_min = max(
+                10,
+                min(FOCUS_TRAIL_LOOKBACK_MIN, int(math.ceil(float(trail_points) / 3.0))),
             )
-        except Exception as exc:
-            log.warning("focus trail failed for %s: %s", driver_id, exc)
-            rows = []
-        for ts_val, lat_v, lon_v, speed_v, status_v in reversed(rows):
-            if lat_v is None or lon_v is None:
-                continue
-            trail.append(
-                {
-                    "ts": ts_val.isoformat() if isinstance(ts_val, datetime) else str(ts_val),
-                    "lat": float(lat_v),
-                    "lon": float(lon_v),
-                    "speed_kmh": float(speed_v or 0.0),
-                    "status": _canonical_status(status_v),
-                }
-            )
+            window_start = window_end - timedelta(minutes=dynamic_lookback_min)
+            scan_sql = _parquet_scan_sql(window_start, window_end, max_hours=FOCUS_TRAIL_MAX_HOURS)
+            try:
+                rows = await _dq(
+                    f"""
+                    SELECT ts, lat, lon, speed_kmh, status
+                    FROM {scan_sql}
+                    WHERE livreur_id = ?
+                      AND ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
+                    ORDER BY ts DESC
+                    LIMIT ?
+                    """,
+                    [driver_id, _dt_to_iso(window_start), _dt_to_iso(window_end), int(trail_points)],
+                    timeout_sec=FOCUS_TRAIL_QUERY_TIMEOUT_SECONDS,
+                )
+            except Exception as exc:
+                log.warning("focus trail failed for %s: %s", driver_id, exc)
+                rows = []
+            for ts_val, lat_v, lon_v, speed_v, status_v in reversed(rows):
+                if lat_v is None or lon_v is None:
+                    continue
+                trail.append(
+                    {
+                        "ts": ts_val.isoformat() if isinstance(ts_val, datetime) else str(ts_val),
+                        "lat": float(lat_v),
+                        "lon": float(lon_v),
+                        "speed_kmh": float(speed_v or 0.0),
+                        "status": _canonical_status(status_v),
+                    }
+                )
+            await _focus_trail_cache_set(cache_key, trail)
 
     replay_status = await _run_redis(
         r.hgetall("copilot:replay:tlc:single:status"),
@@ -838,6 +992,8 @@ async def livreur_focus(
 
     return {
         "driver_id": driver_id,
+        "scenario": TLC_SCENARIO,
+        "focus_supported": TLC_SCENARIO == "single_driver",
         "position": position,
         "stale": stale,
         "age_seconds": age_seconds,
@@ -917,15 +1073,24 @@ async def stats():
     # Source de vérité : sorted set GEO (purgé par _purge_ghosts_loop côté hot path).
     # On évite KEYS HASH_PREFIX:* qui est O(N) bloquant sur Redis et inclut les hashes
     # éphémères pas encore expirés alors que le livreur a déjà disparu de la flotte.
-    livreur_ids = (
-        await _run_redis(
-            r.zrange(GEO_KEY, 0, -1),
-            op_name="zrange stats",
-            default=[],
-            strict=False,
-        ) or []
-    )
     status_counts: dict[str, int] = {"available": 0, "delivering": 0, "idle": 0}
+    status_sampled = 0
+    livreur_ids: list[str] = []
+    if redis_available and total_geo > 0:
+        zrange_end = total_geo - 1
+        if STATS_STATUS_SCAN_LIMIT > 0:
+            zrange_end = min(zrange_end, STATS_STATUS_SCAN_LIMIT - 1)
+        if zrange_end >= 0:
+            livreur_ids = (
+                await _run_redis(
+                    r.zrange(GEO_KEY, 0, zrange_end),
+                    op_name="zrange stats",
+                    default=[],
+                    strict=False,
+                ) or []
+            )
+            status_sampled = len(livreur_ids)
+
     if livreur_ids:
         pipe = r.pipeline(transaction=False)
         for lid in livreur_ids:
@@ -940,10 +1105,31 @@ async def stats():
             canonical = _canonical_status(s)
             if canonical in status_counts:
                 status_counts[canonical] += 1
+    if status_sampled > 0 and total_geo > status_sampled:
+        ratio = total_geo / max(status_sampled, 1)
+        estimated: dict[str, int] = {}
+        for key in ("available", "delivering", "idle"):
+            estimated[key] = int(round(status_counts[key] * ratio))
+        estimated_total = sum(estimated.values())
+        if estimated_total != total_geo:
+            delta = total_geo - estimated_total
+            # Keep totals coherent for dashboards.
+            estimated["available"] = max(0, estimated["available"] + delta)
+        status_counts = estimated
 
-    parquet_files = list(DATA_PATH.glob("**/*.parquet")) if DATA_PATH.exists() else []
+    cold_snapshot = await _cold_path_snapshot_cached()
+    parquet_files_count = int(cold_snapshot.get("cold_parquet_files", 0) or 0)
+    parquet_total_mb = float(cold_snapshot.get("cold_parquet_total_mb", 0.0) or 0.0)
 
     return {
+        # Backward-compatible top-level KPIs used by smoke/readiness scripts.
+        "active_couriers": total_geo,
+        "messages_processed": total_msgs,
+        "status_counts": status_counts,
+        "status_counts_sampled": status_sampled,
+        "redis_available": redis_available,
+        "cold_parquet_files": parquet_files_count,
+        "cold_parquet_total_mb": parquet_total_mb,
         "hot_path": {
             "livreurs_actifs":    total_geo,
             "messages_traites":   total_msgs,
@@ -953,10 +1139,8 @@ async def stats():
             "redis_available":    redis_available,
         },
         "cold_path": {
-            "fichiers_parquet":   len(parquet_files),
-            "taille_totale_mb":   round(
-                sum(f.stat().st_size for f in parquet_files) / 1_048_576, 2
-            ),
+            "fichiers_parquet":   parquet_files_count,
+            "taille_totale_mb":   parquet_total_mb,
             "backend":            "Apache Parquet (Snappy) + DuckDB",
         },
     }
@@ -1214,6 +1398,7 @@ async def heatmap(
             LIMIT  500
             """,
             [resolution, resolution, resolution, resolution, _dt_to_iso(window_start), _dt_to_iso(ref_ts)],
+            timeout_sec=ANALYTICS_COLD_QUERY_TIMEOUT_SECONDS,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Erreur DuckDB : {exc}")
@@ -1236,19 +1421,27 @@ async def heatmap(
 
 @app.get(
     "/health/performance",
-    summary="Benchmark Redis live — Preuve SLA <10ms",
+    summary="Benchmark Redis live - Preuve SLA <10ms",
     tags=["Monitoring"],
 )
 async def performance_check(
-    samples: int = Query(200, description="Nombre de GEOSEARCH à mesurer", ge=10, le=1000),
+    samples: int = Query(200, description="Nombre de GEOSEARCH a mesurer", ge=10, le=1000),
 ):
     """
-    Lance N requêtes GEOSEARCH contre Redis et retourne les percentiles.
-    Utilisé pour prouver que le Hot Path respecte le SLA <10ms (p99).
+    Lance N requetes GEOSEARCH contre Redis et retourne les percentiles.
+    Utilise pour prouver que le Hot Path respecte le SLA <10ms (p99).
     """
+    requested_samples = int(samples)
+    effective_samples = max(10, min(requested_samples, PERF_BENCH_MAX_SAMPLES))
+    now = time.time()
+    async with _perf_bench_cache_lock:
+        cached = _perf_bench_cache.get(effective_samples)
+        if cached and cached[0] > now:
+            return cached[1]
+
     r: aioredis.Redis = app.state.redis
 
-    # Warm-up (5 requêtes ignorées)
+    # Warm-up (5 requetes ignorees)
     for _ in range(5):
         await _run_redis(
             r.geosearch(
@@ -1263,21 +1456,23 @@ async def performance_check(
         )
 
     latencies_ms: list[float] = []
-    for _ in range(samples):
+    for _ in range(effective_samples):
         t0 = time.perf_counter()
         await _run_redis(
             r.geosearch(
                 GEO_KEY,
-                longitude=-73.9855, latitude=40.7580,
-                radius=20, unit="km",
-                withcoord=False, withdist=False,
+                longitude=-73.9855,
+                latitude=40.7580,
+                radius=20,
+                unit="km",
+                withcoord=False,
+                withdist=False,
                 count=100,
             ),
             op_name="geosearch performance sample",
         )
         latencies_ms.append((time.perf_counter() - t0) * 1000)
 
-    # Redis INFO
     info = await _run_redis(
         r.info("all"),
         op_name="info performance",
@@ -1285,28 +1480,36 @@ async def performance_check(
 
     sla_ok = _percentile(latencies_ms, 99) < 10.0
 
-    return {
+    result = {
         "sla_hot_path_ok": sla_ok,
-        "sla_target":      "<10ms (p99)",
+        "sla_target": "<10ms (p99)",
         "geosearch_benchmark": {
-            "samples":  samples,
-            "p50_ms":   _percentile(latencies_ms, 50),
-            "p95_ms":   _percentile(latencies_ms, 95),
-            "p99_ms":   _percentile(latencies_ms, 99),
-            "mean_ms":  round(statistics.mean(latencies_ms), 3),
-            "max_ms":   round(max(latencies_ms), 3),
+            "samples": effective_samples,
+            "samples_requested": requested_samples,
+            "p50_ms": _percentile(latencies_ms, 50),
+            "p95_ms": _percentile(latencies_ms, 95),
+            "p99_ms": _percentile(latencies_ms, 99),
+            "mean_ms": round(statistics.mean(latencies_ms), 3),
+            "max_ms": round(max(latencies_ms), 3),
         },
         "redis_info": {
-            "version":               info.get("redis_version"),
-            "connected_clients":     info.get("connected_clients"),
-            "used_memory_human":     info.get("used_memory_human"),
-            "ops_per_sec":           info.get("instantaneous_ops_per_sec"),
-            "total_commands":        info.get("total_commands_processed"),
-            "keyspace_hits":         info.get("keyspace_hits"),
-            "keyspace_misses":       info.get("keyspace_misses"),
+            "version": info.get("redis_version"),
+            "connected_clients": info.get("connected_clients"),
+            "used_memory_human": info.get("used_memory_human"),
+            "ops_per_sec": info.get("instantaneous_ops_per_sec"),
+            "total_commands": info.get("total_commands_processed"),
+            "keyspace_hits": info.get("keyspace_hits"),
+            "keyspace_misses": info.get("keyspace_misses"),
         },
         "architecture": "Lambda Architecture (Speed Layer + Batch Layer)",
     }
+
+    async with _perf_bench_cache_lock:
+        _perf_bench_cache[effective_samples] = (
+            time.time() + PERF_BENCH_CACHE_TTL_SECONDS,
+            result,
+        )
+    return result
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1440,6 +1643,7 @@ async def fleet_insights(
             WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
             """,
             [_dt_to_iso(window_start), _dt_to_iso(ref_ts)],
+            timeout_sec=ANALYTICS_COLD_QUERY_TIMEOUT_SECONDS,
         )
         row = rows[0] if rows else None
         if row:
@@ -1744,7 +1948,24 @@ async def zone_coverage(
         log.warning("zone-coverage cold path error: %s", exc)
 
     if not demand:
-        raise HTTPException(status_code=503, detail="Données historiques insuffisantes.")
+        return {
+            "periode_heures": heures,
+            "resolution_deg": resolution,
+            "nb_zones_analysees": 0,
+            "cold_path_available": False,
+            "resume": {
+                "zones_sous_couvertes": 0,
+                "zones_sur_couvertes": 0,
+                "zones_equilibrees": 0,
+            },
+            "alertes_dispatch": {
+                "zones_prioritaires": [],
+                "zones_saturees": [],
+            },
+            "toutes_zones": [],
+            "detail": "Données historiques indisponibles (fallback hot-path).",
+            "time_reference": _build_time_reference(ref_meta, ref_ts, window_start),
+        }
 
     # ── Calcul du ratio offre/demande par cellule ────────────────────────────
     max_demand = max(demand.values()) or 1
@@ -1783,6 +2004,7 @@ async def zone_coverage(
         "periode_heures":   heures,
         "resolution_deg":   resolution,
         "nb_zones_analysees": len(zones),
+        "cold_path_available": True,
         "resume": {
             "zones_sous_couvertes": len(sous_couvertes),
             "zones_sur_couvertes":  len(sur_couvertes),

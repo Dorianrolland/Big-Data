@@ -1,110 +1,110 @@
 # FleetStream
 
-> Suivi temps réel d'une flotte de livreurs — Architecture Lambda sur Redpanda, Redis Stack et Apache Parquet.
+> Suivi temps rel d'une flotte de livreurs  Architecture Lambda sur Redpanda, Redis Stack et Apache Parquet.
 
-**Cas d'usage** : Plateforme type Uber Eats gérant 100+ livreurs simultanément à New York City.
-**Problème adressé** : Le SQL classique ne peut pas ingérer des milliers de coordonnées GPS par seconde tout en servant des requêtes géospatiales à faible latence.
+**Cas d'usage** : Plateforme type Uber Eats grant 100+ livreurs simultanment  New York City.
+**Problme adress** : Le SQL classique ne peut pas ingrer des milliers de coordonnes GPS par seconde tout en servant des requtes gospatiales  faible latence.
 
 ---
 
-## Démarrage en une commande
+## Dmarrage en une commande
 
 ```bash
 git clone git@github.com:Dorianrolland/Big-Data.git FleetStream && cd FleetStream
 make up
 ```
 
-**Services disponibles immédiatement :**
+**Services disponibles immdiatement :**
 
 | Interface | URL | Description |
 |---|---|---|
-| 🗺️ **Carte live** | http://localhost:8001/map | Dashboard HTML/JS Leaflet — zéro clignotement |
-| 📊 **Analytics** | http://localhost:8501 | Streamlit — KPIs + trajectoires Cold Path |
-| 📖 **API Swagger** | http://localhost:8001/docs | Documentation interactive |
-| 📡 **Redpanda UI** | http://localhost:8080 | Visualisation topics Kafka en live |
-| 🔍 **RedisInsight** | http://localhost:5540 | GUI Redis — clés GEO + hashes |
-| 📈 **Grafana** | http://localhost:3000 | Dashboard Prometheus (admin / fleetstream) |
-| ⚙️ **Prometheus** | http://localhost:9090 | Métriques brutes |
+|  **Carte live** | http://localhost:8001/map | Dashboard HTML/JS Leaflet  zro clignotement |
+|  **Analytics** | http://localhost:8501 | Streamlit  KPIs + trajectoires Cold Path |
+|  **API Swagger** | http://localhost:8001/docs | Documentation interactive |
+|  **Redpanda UI** | http://localhost:8080 | Visualisation topics Kafka en live |
+|  **RedisInsight** | http://localhost:5540 | GUI Redis  cls GEO + hashes |
+|  **Grafana** | http://localhost:3000 | Dashboard Prometheus (admin / fleetstream) |
+|  **Prometheus** | http://localhost:9090 | Mtriques brutes |
 
 ---
 
 ## Architecture Lambda
 
 ```
-                      ┌─────────────────────────────────────────────────────┐
-                      │                    REDPANDA                         │
-  ┌──────────────┐    │          (Kafka-compatible, sans Zookeeper)         │
-  │   PRODUCER   │───▶│  Topic: livreurs-gps (3 partitions, LZ4, 24h TTL)  │
-  │ 100 livreurs │    └──────────────────┬──────────────────────────────────┘
-  │   asyncio    │                       │
-  └──────────────┘            ┌──────────┴──────────┐
-                              │                     │
-                    ┌─────────▼──────┐    ┌─────────▼──────┐
-                    │   HOT PATH     │    │   COLD PATH     │
-                    │  hot-consumer  │    │  cold-consumer  │
-                    │ group: hot     │    │ group: cold     │
-                    │ offset: latest │    │ offset: earliest│
-                    └─────────┬──────┘    └─────────┬──────┘
-                              │                     │
-                    ┌─────────▼──────┐    ┌─────────▼──────┐
-                    │  REDIS STACK   │    │  DATA LAKE      │
-                    │  GEOADD + TTL  │    │  Parquet/Snappy │
-                    │    30 sec      │    │  Hive-partition │
-                    │   < 10 ms      │    │  year/month/... │
-                    └─────────┬──────┘    └─────────┬──────┘
-                              │                     │
-                              └──────────┬──────────┘
-                                         │
-                               ┌─────────▼──────┐
-                               │   FASTAPI       │
-                               │  Serving Layer  │
-                               │                 │
-                               │ /map            ◀── Dashboard Leaflet (même origin)
-                               │ /livreurs-proches◀── GEOSEARCH Redis (<10ms)
-                               │ /analytics/*    ◀── DuckDB sur Parquet
-                               │ /metrics        ◀── Prometheus scrape
-                               └─────────────────┘
+                      
+                                          REDPANDA                         
+                (Kafka-compatible, sans Zookeeper)         
+     PRODUCER     Topic: livreurs-gps (3 partitions, LZ4, 24h TTL)  
+   100 livreurs     
+     asyncio                           
+              
+                                                   
+                        
+                       HOT PATH            COLD PATH     
+                      hot-consumer        cold-consumer  
+                     group: hot          group: cold     
+                     offset: latest      offset: earliest
+                        
+                                                   
+                        
+                      REDIS STACK         DATA LAKE      
+                      GEOADD + TTL        Parquet/Snappy 
+                        30 sec            Hive-partition 
+                       < 10 ms            year/month/... 
+                        
+                                                   
+                              
+                                         
+                               
+                                  FASTAPI       
+                                 Serving Layer  
+                                                
+                                /map             Dashboard Leaflet (mme origin)
+                                /livreurs-proches GEOSEARCH Redis (<10ms)
+                                /analytics/*     DuckDB sur Parquet
+                                /metrics         Prometheus scrape
+                               
 ```
 
 ### Pourquoi Lambda et pas Kappa ?
 
-| Critère | Lambda (ce projet) | Kappa |
+| Critre | Lambda (ce projet) | Kappa |
 |---|---|---|
 | Hot Path | Redis (TTL 30s, <10ms) | Stream processing continu |
-| Cold Path | Parquet (batch, analytics) | Même pipeline, fenêtres longues |
-| Complexité | 2 consumers distincts | 1 pipeline unifié |
-| ML-readiness | Parquet + DuckDB natif | Dépend du framework stream |
+| Cold Path | Parquet (batch, analytics) | Mme pipeline, fentres longues |
+| Complexit | 2 consumers distincts | 1 pipeline unifi |
+| ML-readiness | Parquet + DuckDB natif | Dpend du framework stream |
 
 ---
 
 ## Stack technique
 
-| Composant | Technologie | Rôle |
+| Composant | Technologie | Rle |
 |---|---|---|
 | Message Broker | **Redpanda v23.3** | Kafka-compatible, sans Zookeeper |
 | Speed Layer | **Redis Stack 7.2** | GEOADD + GEOSEARCH, TTL 30s |
-| Batch Layer | **Apache Parquet + PyArrow** | Snappy, hive-partitionné |
+| Batch Layer | **Apache Parquet + PyArrow** | Snappy, hive-partitionn |
 | Analytics | **DuckDB** | SQL sur Parquet, predicate pushdown |
 | API | **FastAPI + uvicorn** | Serving layer + `/metrics` Prometheus |
-| Carte Live | **Leaflet.js** | Marqueurs mis à jour en place (setLatLng) |
+| Carte Live | **Leaflet.js** | Marqueurs mis  jour en place (setLatLng) |
 | Analytics UI | **Streamlit** | KPIs + trajectoires Cold Path |
-| Monitoring | **Prometheus + Grafana** | Dashboard auto-provisionné |
-| Simulation | **asyncio + aiokafka** | 100 livreurs, mouvement réaliste |
+| Monitoring | **Prometheus + Grafana** | Dashboard auto-provisionn |
+| Simulation | **asyncio + aiokafka** | 100 livreurs, mouvement raliste |
 
 ---
 
-## API — Endpoints
+## API  Endpoints
 
-### Hot Path (Redis — <10ms)
+### Hot Path (Redis  <10ms)
 
 ```bash
 # Livreurs dans un rayon autour de Times Square
 curl "http://localhost:8001/livreurs-proches?lat=40.7580&lon=-73.9855&rayon=2"
 
-# Position d'un livreur précis
+# Position d'un livreur prcis
 curl "http://localhost:8001/livreurs/L007"
 
-# Métriques temps réel
+# Mtriques temps rel
 curl "http://localhost:8001/stats"
 
 # Benchmark SLA Redis (proof pour jury)
@@ -117,11 +117,11 @@ curl "http://localhost:8001/health/performance?samples=200"
 # Historique + stats de trajectoire (distance Haversine, vitesse moy/max)
 curl "http://localhost:8001/analytics/history/L042?heures=1"
 
-# Heatmap de densité (zones surge pricing)
+# Heatmap de densit (zones surge pricing)
 curl "http://localhost:8001/analytics/heatmap?heures=1&resolution=0.01"
 ```
 
-**Exemple — réponse `/analytics/history/L042` :**
+**Exemple  rponse `/analytics/history/L042` :**
 ```json
 {
   "livreur_id": "L042",
@@ -139,33 +139,33 @@ curl "http://localhost:8001/analytics/heatmap?heures=1&resolution=0.01"
 
 ---
 
-## Dashboard Carte Live — Zéro Clignotement
+## Dashboard Carte Live  Zro Clignotement
 
 **http://localhost:8001/map**
 
 La carte utilise Leaflet.js avec une technique anti-clignotement :
-- On maintient un `Map<livreur_id, marker>` en mémoire JavaScript
+- On maintient un `Map<livreur_id, marker>` en mmoire JavaScript
 - Toutes les 2 secondes : `fetch('/livreurs-proches')` silencieux
-- Les marqueurs existants sont **mis à jour en place** (`marker.setLatLng()`) — la carte ne se recharge jamais
-- Les nouveaux livreurs reçoivent un marqueur, les disparus (TTL expiré) sont supprimés
+- Les marqueurs existants sont **mis  jour en place** (`marker.setLatLng()`)  la carte ne se recharge jamais
+- Les nouveaux livreurs reoivent un marqueur, les disparus (TTL expir) sont supprims
 
 ```
-🟠 Orange  — En livraison
-🟢 Vert    — Disponible
-⚫ Gris    — Inactif
+ Orange   En livraison
+ Vert     Disponible
+ Gris     Inactif
 ```
 
 ---
 
-## Performances mesurées
+## Performances mesures
 
-| Métrique | Valeur |
+| Mtrique | Valeur |
 |---|---|
 | Throughput TLC replay | ~250-800 courses concurrentes (sample rate configurable) |
 | Latence GEOSEARCH p50 | ~0.8 ms |
-| Latence GEOSEARCH p99 | ~2.3 ms ✅ (SLA < 10ms) |
+| Latence GEOSEARCH p99 | ~2.3 ms  (SLA < 10ms) |
 | Taille Parquet (1h) | ~8-12 MB (Snappy) |
-| Requête DuckDB (1h) | <200 ms |
+| Requte DuckDB (1h) | <200 ms |
 
 ---
 
@@ -173,28 +173,28 @@ La carte utilise Leaflet.js avec une technique anti-clignotement :
 
 ```
 FleetStream/
-├── docker-compose.yml        # 11 services
-├── .env.example              # Variables configurables
-├── Makefile                  # make up / logs / demo / stress
-├── stress_test.py            # 1k–5k livreurs, benchmark p50/p95/p99
-│
-├── tlc_replay/               # NYC TLC HVFHV replay → positions + offers + events (100% vraies trips Uber)
-├── context_poller/           # Poll Citi Bike + Open-Meteo + NYC 311 + NYC Events → context-signals-v1
-├── hot_path/                 # Speed Layer → Redis GEOADD (TTL 30s)
-├── cold_path/                # Batch Layer → Parquet Snappy hive-partitionné
-│
-├── api/                      # FastAPI (Hot + Cold + /map + /metrics)
-│   └── static/index.html     # Dashboard Leaflet servi à /map
-│
-├── dashboard/                # Streamlit analytics (KPIs + Cold Path)
-│
-├── monitoring/
-│   ├── prometheus.yml        # Scrape API + Redpanda
-│   └── grafana/              # Dashboard JSON auto-provisionné
-│
-└── data/parquet/             # Data Lake local (gitignored)
-    └── year=YYYY/month=MM/day=DD/hour=HH/
-        └── batch_*.parquet
+ docker-compose.yml        # 11 services
+ .env.example              # Variables configurables
+ Makefile                  # make up / logs / demo / stress
+ stress_test.py            # 1k5k livreurs, benchmark p50/p95/p99
+
+ tlc_replay/               # NYC TLC HVFHV replay  positions + offers + events (100% vraies trips Uber)
+ context_poller/           # Poll Citi Bike + Open-Meteo + NYC 311 + NYC Events  context-signals-v1
+ hot_path/                 # Speed Layer  Redis GEOADD (TTL 30s)
+ cold_path/                # Batch Layer  Parquet Snappy hive-partitionn
+
+ api/                      # FastAPI (Hot + Cold + /map + /metrics)
+    static/index.html     # Dashboard Leaflet servi  /map
+
+ dashboard/                # Streamlit analytics (KPIs + Cold Path)
+
+ monitoring/
+    prometheus.yml        # Scrape API + Redpanda
+    grafana/              # Dashboard JSON auto-provisionn
+
+ data/parquet/             # Data Lake local (gitignored)
+     year=YYYY/month=MM/day=DD/hour=HH/
+         batch_*.parquet
 ```
 
 ---
@@ -208,18 +208,18 @@ make stress
 # 5 000 livreurs (5 000 msg/s) pendant 60s
 make stress-5k
 
-# Benchmark API uniquement (500 requêtes GEOSEARCH parallèles)
+# Benchmark API uniquement (500 requtes GEOSEARCH parallles)
 make stress-api
 ```
 
 Sortie typique :
 ```
 KAFKA / REDPANDA:
-  Messages envoyés    : 30 000
-  Débit moyen         : 998 msg/s
+  Messages envoys    : 30 000
+  Dbit moyen         : 998 msg/s
   Taux de perte       : 0.0%
 
-API — GEOSEARCH [✅ SLA OK (p99 < 10ms)]
+API  GEOSEARCH [ SLA OK (p99 < 10ms)]
   P50                 : 0.83 ms
   P95                 : 1.77 ms
   P99                 : 2.34 ms
@@ -227,19 +227,19 @@ API — GEOSEARCH [✅ SLA OK (p99 < 10ms)]
 
 ---
 
-## RedisInsight — Visualisation
+## RedisInsight  Visualisation
 
 1. Ouvrir http://localhost:5540
 2. Cliquer **+ Add Redis Database**
-3. Host: `redis` · Port: `6379` → **Add Database**
-4. Explorer les clés :
-   - `fleet:geo` — Sorted set géospatial (toutes les positions)
-   - `fleet:livreur:L042` — Hash avec métadonnées
-   - `fleet:stats:*` — Compteurs monitoring
+3. Host: `redis`  Port: `6379`  **Add Database**
+4. Explorer les cls :
+   - `fleet:geo`  Sorted set gospatial (toutes les positions)
+   - `fleet:livreur:L042`  Hash avec mtadonnes
+   - `fleet:stats:*`  Compteurs monitoring
 
 ---
 
-## Machine Learning — Cold Path
+## Machine Learning  Cold Path
 
 ```python
 import duckdb
@@ -264,26 +264,32 @@ df = conn.execute("""
 
 ## Variables d'environnement
 
-| Variable | Défaut | Description |
+| Variable | Dfaut | Description |
 |---|---|---|
 | `TLC_MONTH` | `2024-01` | Mois de depart du replay historique (format `YYYY-MM`) |
 | `TLC_MONTHS` | `` | Liste CSV explicite des mois a rejouer (prioritaire), ex: `2024-01,2024-02,...,2024-10` |
 | `TLC_MONTH_COUNT` | `0` | Nombre de mois consecutifs a rejouer a partir de `TLC_MONTH` (`10` pour 10 mois, `12` pour 1 an) |
-| `TLC_SPEED_FACTOR` | `1` | 1 = temps réel NYC, 6 = 6× accéléré |
-| `TLC_TRIP_SAMPLE_RATE` | `0.15` | Fraction de trips Uber rejouées (→ nb courses concurrentes) |
-| `TLC_MAX_ACTIVE_TRIPS` | `800` | Plafond dur de courses simultanées |
+| `TLC_SPEED_FACTOR` | `1` | 1 = temps rel NYC, 6 = 6 acclr |
+| `TLC_TRIP_SAMPLE_RATE` | `0.15` | Fraction de trips Uber rejoues ( nb courses concurrentes) |
+| `TLC_MAX_ACTIVE_TRIPS` | `800` | Plafond dur de courses simultanes |
+| `TLC_COURIER_ID_MODE` | `trip` | Strategie d'identite chauffeur synthetique: `trip` (1 ID par course, evite les teleports inter-courses) ou `legacy_zone_day` (mode historique) |
 | `TLC_ROUTE_MODE` | `osrm` | Mode trajectoire pour le replay TLC: `osrm` (route-aware) ou `linear` (fallback legacy) |
-| `TLC_ROUTE_OSRM_URL` | `http://osrm:5000` | Endpoint OSRM utilisé par le replay TLC pour router pickup→dropoff |
+| `TLC_ROUTE_OSRM_URL` | `http://osrm:5000` | Endpoint OSRM utilis par le replay TLC pour router pickupdropoff |
+| `TLC_ROUTE_OSRM_FALLBACK_URL` | `https://router.project-osrm.org` | Fallback OSRM public si le serveur local est indisponible (route-aware prioritaire) |
+| `TLC_ROUTE_FETCH_TIMEOUT_S` | `0.7` | Budget max (s) du fetch route bloquant par course; au-del, fallback linear + prfetch async |
+| `TLC_ROUTE_PREFETCH_ENABLED` | `true` | Active le prchargement asynchrone des routes sur les zone-pairs manquants |
+| `TLC_ROUTE_PREFETCH_MAX_PENDING` | `256` | Nombre max de prefetch routes en attente |
+| `TLC_ROUTE_PREFETCH_MAX_CONCURRENCY` | `8` | Concurrence max des requtes de prefetch route |
 | `TLC_ROUTE_OSRM_TIMEOUT_S` | `4.0` | Timeout HTTP OSRM (secondes) |
-| `TLC_ROUTE_CACHE_MAX` | `4096` | Taille max du cache de routes TLC (clé `pickup_zone + dropoff_zone`) |
+| `TLC_ROUTE_CACHE_MAX` | `4096` | Taille max du cache de routes TLC (cl `pickup_zone + dropoff_zone`) |
 | `DRIVER_INGEST_TOKEN` | `dev-insecure-token` | Token du gateway mobile `driver-ingest` |
-| `CONTEXT_TICK_SECONDS` | `30` | Fréquence de publication des signaux de contexte (263 zones) |
-| `EVENTS_POLL_SECONDS` | `600` | Fréquence de polling de la source NYC events (`tvpp-9vvx`) |
-| `EVENT_RADIUS_KM` | `4.5` | Rayon zone/event utilisé pour `event_pressure` |
-| `EVENT_LOOKAHEAD_HOURS` | `6` | Fenêtre de prise en compte des événements à venir |
+| `CONTEXT_TICK_SECONDS` | `30` | Frquence de publication des signaux de contexte (263 zones) |
+| `EVENTS_POLL_SECONDS` | `600` | Frquence de polling de la source NYC events (`tvpp-9vvx`) |
+| `EVENT_RADIUS_KM` | `4.5` | Rayon zone/event utilis pour `event_pressure` |
+| `EVENT_LOOKAHEAD_HOURS` | `6` | Fentre de prise en compte des vnements  venir |
 | `EVENT_PRESSURE_CAP` | `0.75` | Cap de contribution events dans `demand_index` |
 | `GPS_TTL_SECONDS` | `30` | TTL Redis |
-| `BATCH_INTERVAL_SECONDS` | `60` | Fréquence flush Parquet |
+| `BATCH_INTERVAL_SECONDS` | `60` | Frquence flush Parquet |
 | `MAX_BATCH_RECORDS` | `50000` | Taille max buffer cold path |
 
 ---
@@ -293,23 +299,23 @@ df = conn.execute("""
 ```bash
 make up              # Lance tout le stack
 make down            # Stoppe tout
-make logs            # Logs en temps réel
+make logs            # Logs en temps rel
 make logs-api        # Logs API uniquement
-make demo            # Requêtes de démonstration + benchmark
+make demo            # Requtes de dmonstration + benchmark
 make stress          # Stress test 1000 livreurs
 make stress-5k       # Stress test 5000 livreurs
-make redis-cli       # Accès Redis CLI interactif
+make redis-cli       # Accs Redis CLI interactif
 make clean           # Supprime containers + volumes + Parquet
 
-# ── Demo & Jury ─────────────────────────────────────────────────
+#  Demo & Jury 
 make demo-scoreboard # Backtest Copilot vs baselines (CSV + table)
-make demo-scenarios  # 5 scénarios de démo (pluie, trafic, fuel, event, baseline)
+make demo-scenarios  # 5 scnarios de dmo (pluie, trafic, fuel, event, baseline)
 make build-mart      # Construit le Data Mart analytique (DuckDB + Parquet)
 make query-kpis      # 10 KPIs en < 300ms depuis le Data Mart
 
 # Mode flotte multi-chauffeurs (250 drivers)
 make fleet-demo-up   # Lance le stack en mode fleet_demo.env
-make fleet-demo-check # Vérifie la readiness (chauffeurs actifs, KPIs)
+make fleet-demo-check # Vrifie la readiness (chauffeurs actifs, KPIs)
 make fleet-demo-down  # Stoppe
 
 # Script jury one-click (Windows PowerShell)
@@ -321,8 +327,8 @@ make fleet-demo-down  # Stoppe
 
 ## Auteur
 
-Projet académique **CY Tech — ING3 Big Data**.
-Architecture Lambda/Kappa appliquée au suivi de flotte en temps réel.
+Projet acadmique **CY Tech  ING3 Big Data**.
+Architecture Lambda/Kappa applique au suivi de flotte en temps rel.
 
 ---
 
@@ -520,6 +526,29 @@ $env:TLC_ROUTE_MODE="linear"; docker compose up -d --force-recreate tlc-replay
 $env:TLC_ROUTE_MODE="osrm"; $env:TLC_ROUTE_OSRM_URL="http://osrm:5000"; docker compose up -d --force-recreate tlc-replay
 ```
 
+For true local OSRM routing (recommended for demos with many drivers), you must prepare
+the OSRM files once under `data/osrm/` and run the routing profile:
+
+```powershell
+New-Item -ItemType Directory -Force data\osrm | Out-Null
+Invoke-WebRequest `
+  -Uri "https://download.geofabrik.de/north-america/us/new-york-latest.osm.pbf" `
+  -OutFile "data/osrm/new-york-latest.osm.pbf"
+
+docker run --rm -t -v "${PWD}\data\osrm:/data" ghcr.io/project-osrm/osrm-backend:v5.27.1 `
+  osrm-extract -p /opt/car.lua /data/new-york-latest.osm.pbf
+docker run --rm -t -v "${PWD}\data\osrm:/data" ghcr.io/project-osrm/osrm-backend:v5.27.1 `
+  osrm-partition /data/new-york-latest.osrm
+docker run --rm -t -v "${PWD}\data\osrm:/data" ghcr.io/project-osrm/osrm-backend:v5.27.1 `
+  osrm-customize /data/new-york-latest.osrm
+
+docker compose --profile routing up -d osrm
+```
+
+If local OSRM is down or files are missing, replay now falls back to a non-blocking
+mode (`linear` with orthogonal path + smooth front interpolation) so the demo keeps
+running without teleports/crashes.
+
 Open `http://localhost:8001/map` and compare trajectory realism on the same pickup/dropoff zones.
 
 Lat/lon come from the 263 NYC taxi zone centroids (pre-computed once with DuckDB
@@ -548,22 +577,22 @@ Quick ingest check:
 make demo-ingest
 ```
 
-### Context streaming — real public APIs
+### Context streaming  real public APIs
 
 The `context-poller` service streams `ContextSignalV1` events for each of the 263
 NYC taxi zones every `CONTEXT_TICK_SECONDS`, using only public API data:
 
-- **Citi Bike GBFS** (`gbfs.lyft.com/gbfs/2.3/bkn/…`) → `demand_index`
-- **Open-Meteo** (`api.open-meteo.com`) → `weather_factor`
-- **NYC 311 Socrata** (`data.cityofnewyork.us/resource/erm2-nwe9.json`) → `traffic_factor`
-- **NYC DOT Weekly Traffic Advisory** (`nyc.gov/.../motorist/weektraf.shtml`) → `closure_pressure` (planned closures)
-- **NYC DOT Traffic Speeds Feed** (`linkdata.nyctmc.org/.../LinkSpeedQuery.txt`) → `speed_pressure` (real-time slowdown)
+- **Citi Bike GBFS** (`gbfs.lyft.com/gbfs/2.3/bkn/`)  `demand_index`
+- **Open-Meteo** (`api.open-meteo.com`)  `weather_factor`
+- **NYC 311 Socrata** (`data.cityofnewyork.us/resource/erm2-nwe9.json`)  `traffic_factor`
+- **NYC DOT Weekly Traffic Advisory** (`nyc.gov/.../motorist/weektraf.shtml`)  `closure_pressure` (planned closures)
+- **NYC DOT Traffic Speeds Feed** (`linkdata.nyctmc.org/.../LinkSpeedQuery.txt`)  `speed_pressure` (real-time slowdown)
   - unit conversion behavior is configurable via `TRAFFIC_SPEED_INPUT_UNIT` (`mph` by default)
-- **NYC Permitted Event Information** (`data.cityofnewyork.us/resource/tvpp-9vvx.json`) → `event_pressure` injecté dans `demand_index` (capé)
-- **Redis GEO** (`fleet:geo`, populated by `hot-consumer` from TLC positions) → `supply_index`
+- **NYC Permitted Event Information** (`data.cityofnewyork.us/resource/tvpp-9vvx.json`)  `event_pressure` inject dans `demand_index` (cap)
+- **Redis GEO** (`fleet:geo`, populated by `hot-consumer` from TLC positions)  `supply_index`
 
 There is no synthetic context anywhere in the platform.
-`GET /copilot/health` expose aussi `events_context` (source, statut, fenêtre, volumétrie) et les KPI de diffusion `event_pressure_*`.
+`GET /copilot/health` expose aussi `events_context` (source, statut, fentre, volumtrie) et les KPI de diffusion `event_pressure_*`.
 
 ### Developer checks
 
@@ -590,3 +619,4 @@ make proof-lot4
 - `events-sample`
 
 for `copilot_events` view.
+

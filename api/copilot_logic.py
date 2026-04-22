@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Any, Mapping
 
 FEATURE_COLUMNS = [
@@ -1046,7 +1047,16 @@ def model_score(model_payload: dict[str, Any] | None, features: dict[str, float]
         return None, "heuristic"
 
     row = [[features.get(col, 0.0) for col in columns]]
-    prob = float(model.predict_proba(row)[0][1])
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="X does not have valid feature names*",
+                category=UserWarning,
+            )
+            prob = float(model.predict_proba(row)[0][1])
+    except Exception:
+        return None, "heuristic"
     if not math.isfinite(prob):
         return None, "heuristic"
     return max(0.01, min(prob, 0.99)), "ml"

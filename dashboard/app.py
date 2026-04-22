@@ -12,8 +12,17 @@ import pydeck as pdk
 import requests
 import streamlit as st
 
-API_URL         = os.getenv("API_URL", "http://api:8000")
-REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", "4"))
+API_URL = os.getenv("API_URL", "http://api:8000")
+_refresh_raw = os.getenv("REFRESH_SECONDS", os.getenv("DASHBOARD_REFRESH_SECONDS", "8"))
+REFRESH_SECONDS = max(5, int(_refresh_raw or "8"))
+ANALYTICS_TTL_SECONDS = max(
+    30,
+    int(os.getenv("DASHBOARD_ANALYTICS_TTL_SECONDS", "90") or "90"),
+)
+ZONE_COVERAGE_TTL_SECONDS = max(
+    ANALYTICS_TTL_SECONDS,
+    int(os.getenv("DASHBOARD_ZONE_COVERAGE_TTL_SECONDS", str(ANALYTICS_TTL_SECONDS + 30)) or str(ANALYTICS_TTL_SECONDS + 30)),
+)
 
 STATUS_COLOR_RGB = {
     "delivering": [251, 146,  60, 220],
@@ -530,6 +539,33 @@ def fetch(path: str, params: dict | None = None) -> dict:
         return {}
 
 
+def cached_fetch(
+    cache_key: str,
+    path: str,
+    params: dict | None = None,
+    *,
+    ttl_seconds: float = 15.0,
+    force: bool = False,
+) -> dict:
+    """
+    Soft cache per Streamlit session to avoid hammering heavy endpoints on every
+    UI refresh tick. On transient failures, keep the last known payload.
+    """
+    now = time.time()
+    cache = st.session_state.setdefault("_api_cache", {})
+    entry = cache.get(cache_key)
+    if (not force) and entry and (now - float(entry.get("ts", 0.0)) < ttl_seconds):
+        return entry.get("data", {})
+
+    data = fetch(path, params)
+    if data:
+        cache[cache_key] = {"ts": now, "data": data}
+        return data
+    if entry:
+        return entry.get("data", {})
+    return {}
+
+
 def bento(color: str, icon: str, label: str, value: str, sub: str = "", glyph: str = "") -> str:
     sub_html  = f'<div class="bento-sub">{sub}</div>' if sub else ""
     glph_html = f'<div class="bento-glyph">{glyph}</div>' if glyph else ""
@@ -665,6 +701,37 @@ const STATUS_COLORS = {{
   available:  [52,211,153,220],
   idle:       [148,163,184,150],
 }};
+const MAP_QUERY = '/livreurs-proches?lat=40.7580&lon=-73.9855&rayon=20&limit=250';
+const MAP_POLL_BASE_MS = 3000;
+const MAP_POLL_MAX_MS = 20000;
+const MAP_REQUEST_TIMEOUT_MS = 3500;
+let mapPollInFlight = false;
+let mapPollFailures = 0;
+let mapPollDelayMs = MAP_POLL_BASE_MS;
+let mapPollTimer = null;
+let mapHidden = document.hidden === true;
+
+document.addEventListener('visibilitychange', () => {{
+  mapHidden = document.hidden === true;
+}});
+
+function isAbortLike(err) {{
+  if (!err) return false;
+  const name = String(err.name || '').toLowerCase();
+  const msg = String(err.message || '').toLowerCase();
+  return name.includes('abort') || msg.includes('abort');
+}}
+
+function scheduleRefresh(delayMs) {{
+  const nextDelay = Number.isFinite(delayMs) ? Math.max(900, delayMs) : MAP_POLL_BASE_MS;
+  if (mapPollTimer) clearTimeout(mapPollTimer);
+  mapPollTimer = setTimeout(refresh, nextDelay);
+}}
+
+function computeMapBackoffMs() {{
+  if (mapPollFailures <= 0) return MAP_POLL_BASE_MS;
+  return Math.min(MAP_POLL_MAX_MS, MAP_POLL_BASE_MS * Math.pow(2, Math.min(mapPollFailures, 4)));
+}}
 
 const deckgl = new deck.DeckGL({{
   container: 'map',
@@ -692,8 +759,24 @@ const deckgl = new deck.DeckGL({{
 }});
 
 async function refresh() {{
+  if (mapHidden) {{
+    scheduleRefresh(Math.max(1000, MAP_POLL_BASE_MS * 2));
+    return;
+  }}
+  if (mapPollInFlight) {{
+    scheduleRefresh(mapPollDelayMs);
+    return;
+  }}
+  mapPollInFlight = true;
+  const startedAt = performance.now();
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), MAP_REQUEST_TIMEOUT_MS);
   try {{
-    const r = await fetch(API + '/livreurs-proches?lat=40.7580&lon=-73.9855&rayon=20&limit=500');
+    const r = await fetch(API + MAP_QUERY, {{
+      cache: 'no-store',
+      signal: controller.signal,
+    }});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
     const data = await r.json();
     const livreurs = (data.livreurs || []).map(lv => ({{
       position: [lv.lon, lv.lat],
@@ -742,11 +825,24 @@ async function refresh() {{
     document.getElementById('n-del').textContent = nd;
     document.getElementById('n-av').textContent  = na;
     document.getElementById('n-idl').textContent = ni;
-  }} catch(e) {{ console.warn('Fleet refresh error:', e); }}
+    mapPollFailures = 0;
+    mapPollDelayMs = MAP_POLL_BASE_MS;
+  }} catch(e) {{
+    if (!isAbortLike(e)) {{
+      console.warn('Fleet refresh error:', e);
+    }}
+    mapPollFailures = Math.min(mapPollFailures + 1, 6);
+    mapPollDelayMs = computeMapBackoffMs();
+  }} finally {{
+    clearTimeout(timeoutId);
+    mapPollInFlight = false;
+    const elapsedMs = performance.now() - startedAt;
+    const jitterMs = Math.random() * 250;
+    scheduleRefresh(Math.max(900, mapPollDelayMs - elapsedMs + jitterMs));
+  }}
 }}
 
-refresh();
-setInterval(refresh, 3000);
+scheduleRefresh(0);
 </script>
 </body>
 </html>
@@ -1070,7 +1166,7 @@ ph_ts = st.empty()
 #  BOUCLE — met à jour uniquement les placeholders
 # ════════════════════════════════════════════════════════════════════════════
 while True:
-    stats = fetch("/stats")
+    stats = cached_fetch("stats", "/stats", ttl_seconds=max(2.0, float(REFRESH_SECONDS)))
     hp    = stats.get("hot_path", {})
     cp    = stats.get("cold_path", {})
     cts   = hp.get("statuts", {})
@@ -1108,7 +1204,7 @@ while True:
         )
 
     # ── SLA GEOSEARCH ─────────────────────────────────────────────────────
-    perf  = fetch("/health/performance", {"samples": 100})
+    perf  = cached_fetch("perf", "/health/performance", {"samples": 20}, ttl_seconds=90.0)
     bench = perf.get("geosearch_benchmark", {})
     rinfo = perf.get("redis_info", {})
     p99   = bench.get("p99_ms")
@@ -1244,7 +1340,7 @@ while True:
             st.info(f"ℹ️ {ds['detail']}")
 
     # ── Fleet Insights (auto-refresh) ─────────────────────────────────────
-    insights = fetch("/analytics/fleet-insights")
+    insights = cached_fetch("fleet_insights", "/analytics/fleet-insights", ttl_seconds=float(ANALYTICS_TTL_SECONDS))
     with ph_insights.container():
         if insights and "sante_operationnelle" in insights:
             sante = insights.get("sante_operationnelle", {})
@@ -1305,7 +1401,12 @@ while True:
             )
 
     # ── Anomalies (auto-refresh) ──────────────────────────────────────────
-    anomalies_data = fetch("/analytics/anomalies", {"fenetre_minutes": 10})
+    anomalies_data = cached_fetch(
+        "analytics_anomalies",
+        "/analytics/anomalies",
+        {"fenetre_minutes": 10},
+        ttl_seconds=float(ANALYTICS_TTL_SECONDS),
+    )
     with ph_anomalies.container():
         if anomalies_data:
             resume = anomalies_data.get("resume", {})
@@ -1358,7 +1459,12 @@ while True:
             )
 
     # ── Predict Demand (auto-refresh) ─────────────────────────────────────
-    demand_data = fetch("/analytics/predict-demand", {"horizon_minutes": 30})
+    demand_data = cached_fetch(
+        "analytics_predict_demand",
+        "/analytics/predict-demand",
+        {"horizon_minutes": 30},
+        ttl_seconds=float(ANALYTICS_TTL_SECONDS),
+    )
     with ph_predict.container():
         if demand_data and "resume" in demand_data:
             d_resume = demand_data.get("resume", {})
@@ -1410,7 +1516,12 @@ while True:
             )
 
     # ── GPS Fraud Detection (auto-refresh) ───────────────────────────────
-    fraud_data = fetch("/analytics/gps-fraud", {"fenetre_minutes": 15})
+    fraud_data = cached_fetch(
+        "analytics_gps_fraud",
+        "/analytics/gps-fraud",
+        {"fenetre_minutes": 15},
+        ttl_seconds=float(ANALYTICS_TTL_SECONDS),
+    )
     with ph_fraud.container():
         if fraud_data and "resume" in fraud_data:
             f_resume = fraud_data.get("resume", {})
@@ -1487,7 +1598,11 @@ while True:
             )
 
     # ── Zone Coverage (auto-refresh) ──────────────────────────────────────
-    zones_data = fetch("/analytics/zone-coverage")
+    zones_data = cached_fetch(
+        "analytics_zone_coverage",
+        "/analytics/zone-coverage",
+        ttl_seconds=float(ZONE_COVERAGE_TTL_SECONDS),
+    )
     with ph_zones.container():
         if zones_data and "alertes_dispatch" in zones_data:
             res = zones_data.get("resume", {})
@@ -1626,7 +1741,7 @@ while True:
             )
 
     # ── GBFS / IRVE context cards ────────────────────────────────────────
-    gbfs_data = fetch("/copilot/gbfs/zones", {"top_k": 8})
+    gbfs_data = cached_fetch("copilot_gbfs_zones", "/copilot/gbfs/zones", {"top_k": 8}, ttl_seconds=30.0)
     with ph_gbfs.container():
         if gbfs_data and gbfs_data.get("zones"):
             zones_g = gbfs_data["zones"][:8]
@@ -1657,7 +1772,7 @@ while True:
                 unsafe_allow_html=True,
             )
 
-    irve_health = fetch("/copilot/health")
+    irve_health = cached_fetch("copilot_health", "/copilot/health", ttl_seconds=30.0)
     with ph_irve.container():
         irve_ctx = (irve_health or {}).get("irve_context", {})
         tlc_ctx = (irve_health or {}).get("tlc_replay", {})
