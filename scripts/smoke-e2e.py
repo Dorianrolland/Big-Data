@@ -557,6 +557,15 @@ def compose_up(build: bool, compose_env_file: str | None = None) -> None:
     resolved_env = resolve_compose_env_file(compose_env_file)
     if resolved_env:
         cmd.extend(["--env-file", resolved_env])
+    osrm_artifact = PROJECT_ROOT / "data" / "osrm" / "new-york-latest.osrm"
+    force_routing_profile = str(os.getenv("COPILOT_FORCE_ROUTING_PROFILE", "0")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if force_routing_profile or osrm_artifact.exists():
+        cmd.extend(["--profile", "routing"])
     cmd.extend(["up", "-d"])
     if build:
         cmd.append("--build")

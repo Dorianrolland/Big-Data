@@ -24,3 +24,10 @@ def test_fleet_poll_uses_motion_upsert_not_direct_jump():
     src = _live_map_source()
     assert "upsertFleetMotion(lv, now);" in src
     assert "m.setLatLng(ll);" not in src
+
+
+def test_focus_mode_has_interpolated_glide_not_fixed_step():
+    src = _live_map_source()
+    assert "function focusDurationMs(" in src
+    assert "function currentFocusInterpolated(now)" in src
+    assert "focusState.targetUpdateWall = now + focusDurationMs(" in src

@@ -47,10 +47,16 @@ Write-Host ""
 
 Write-Host "[1/5] Start Docker stack..." -ForegroundColor Yellow
 Set-Location $Root
+$routingArgs = @()
+$osrmData = Join-Path $Root "data\osrm\new-york-latest.osrm"
+if (Test-Path $osrmData) {
+    $routingArgs = @("--profile", "routing")
+    Write-Host "  routing profile enabled (local OSRM data found)" -ForegroundColor DarkGray
+}
 if ($SkipBuild) {
-    docker compose up -d
+    docker compose @routingArgs up -d
 } else {
-    docker compose up --build -d
+    docker compose @routingArgs up --build -d
 }
 if ($LASTEXITCODE -ne 0) {
     Write-Error "docker compose up failed"

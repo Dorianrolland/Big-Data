@@ -68,9 +68,11 @@ def test_decode_polyline_known_shape():
 def test_source_platform_for_route_replaces_existing_route_suffix():
     tagged = replay_main.source_platform_for_route("tlc_hvfhv|route=linear", "osrm")
     tagged_public = replay_main.source_platform_for_route("tlc_hvfhv", "osrm_public")
+    tagged_valhalla = replay_main.source_platform_for_route("tlc_hvfhv", "valhalla_public")
 
     assert tagged == "tlc_hvfhv|route=osrm"
     assert tagged_public == "tlc_hvfhv|route=osrm"
+    assert tagged_valhalla == "tlc_hvfhv|route=osrm"
 
 
 def test_prepare_trip_route_falls_back_to_linear_when_osrm_fails(monkeypatch):
@@ -104,6 +106,19 @@ def test_synthetic_grid_geometry_uses_turn_for_long_segments():
     assert len(geometry) >= 4
     assert geometry[0] == (40.7580, -73.9855)
     assert geometry[-1] == (40.7420, -73.9730)
+
+
+def test_synthetic_grid_geometry_east_river_crossing_uses_bridge_waypoints():
+    geometry = replay_main.synthetic_grid_geometry(
+        origin_lat=40.7180,
+        origin_lon=-74.0080,   # Lower Manhattan side
+        dest_lat=40.7120,
+        dest_lon=-73.9530,     # Brooklyn/Queens side
+    )
+
+    assert len(geometry) >= 6
+    assert any(point[1] < -73.99 for point in geometry)  # west side present
+    assert any(point[1] > -73.98 for point in geometry)  # east side present
 
 
 def test_densify_geometry_inserts_intermediate_points():
@@ -194,6 +209,44 @@ def test_fetch_osrm_geometry_falls_back_to_public_provider():
     assert replay._last_osrm_provider == "osrm_public"
 
 
+def test_fetch_osrm_geometry_supports_valhalla_public_provider():
+    replay = replay_main.TLCReplay("2024-01")
+    replay.route_osrm_targets = [("valhalla_public", "https://valhalla1.openstreetmap.de")]
+
+    class _FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "trip": {
+                    "legs": [
+                        {
+                            "shape": "_izlhA~rlgdF_{geC~ywl@_kwzCn`{nI",
+                        }
+                    ]
+                }
+            }
+
+    class _FakeClient:
+        async def get(self, *_args, **_kwargs):  # noqa: ANN001
+            return _FakeResponse()
+
+    replay.osrm_client = _FakeClient()
+    source, geometry = asyncio.run(
+        replay._fetch_osrm_geometry(
+            origin_lat=40.7580,
+            origin_lon=-73.9855,
+            dest_lat=40.7420,
+            dest_lon=-73.9730,
+        )
+    )
+
+    assert source == "valhalla_public"
+    assert len(geometry) >= 2
+    assert replay._last_osrm_provider == "valhalla_public"
+
+
 def test_prepare_trip_route_tracks_public_osrm_source(monkeypatch):
     replay = replay_main.TLCReplay("2024-01")
     trip = _make_trip(trip_key="public_osrm_case")
@@ -221,7 +274,7 @@ def test_prepare_trip_route_timeout_triggers_prefetch_schedule(monkeypatch):
     called: dict[str, int] = {"count": 0}
 
     async def _slow_fetch(*_args, **_kwargs):
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.35)
         return "osrm_public", [
             (40.7580, -73.9855),
             (40.7500, -73.9790),
@@ -233,6 +286,7 @@ def test_prepare_trip_route_timeout_triggers_prefetch_schedule(monkeypatch):
 
     monkeypatch.setattr(replay_main, "TLC_ROUTE_MODE", "osrm")
     monkeypatch.setattr(replay_main, "TLC_ROUTE_FETCH_TIMEOUT_S", 0.001)
+    monkeypatch.setattr(replay_main, "TLC_ROUTE_OSRM_TIMEOUT_S", 0.1)
     monkeypatch.setattr(replay, "_fetch_osrm_geometry", _slow_fetch)
     monkeypatch.setattr(replay, "_schedule_route_prefetch", _fake_schedule)
 
@@ -292,3 +346,211 @@ def test_prepare_trip_route_respects_cache_max(monkeypatch):
     # cache max=1 so key(10,20) is evicted by key(11,21), then misses again on trip_c
     assert replay.stats_route_cache_hits == 0
     assert replay.stats_route_cache_misses == 3
+
+
+def test_prefetch_can_upgrade_linear_cache_to_osrm(monkeypatch):
+    replay = replay_main.TLCReplay("2024-01")
+    trip = _make_trip(trip_key="prefetch_upgrade_case", pu_loc=70, do_loc=71)
+    key = (int(trip.pu_loc), int(trip.do_loc))
+
+    # Existing fallback cache entry from a previous timeout.
+    replay.route_cache[key] = (
+        "linear",
+        [(trip.pickup_lat, trip.pickup_lon), (trip.dropoff_lat, trip.dropoff_lon)],
+        replay_main.cumulative_route_distances_km([(trip.pickup_lat, trip.pickup_lon), (trip.dropoff_lat, trip.dropoff_lon)]),
+    )
+    replay.route_cache_order.append(key)
+
+    async def _fake_fetch(*_args, **_kwargs):
+        return "osrm_public", [
+            (40.7580, -73.9855),
+            (40.7525, -73.9810),
+            (40.7460, -73.9765),
+            (40.7420, -73.9730),
+        ]
+
+    monkeypatch.setattr(replay_main, "TLC_ROUTE_MODE", "osrm")
+    monkeypatch.setattr(replay_main, "TLC_ROUTE_PREFETCH_ENABLED", True)
+    replay.osrm_client = object()
+    monkeypatch.setattr(replay, "_fetch_osrm_geometry", _fake_fetch)
+
+    async def _run_prefetch():
+        replay._schedule_route_prefetch(trip, key)
+        while replay.route_prefetch_tasks:
+            await asyncio.sleep(0.01)
+
+    asyncio.run(_run_prefetch())
+
+    source, geometry, cumulative = replay.route_cache[key]
+    assert source == "osrm_public"
+    assert len(geometry) >= 3
+    assert cumulative[-1] > 0
+
+
+def test_row_to_trip_infers_missing_zone_centroid_without_times_square_collapse():
+    replay = replay_main.TLCReplay("2024-01")
+    request_ts = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
+    pickup_ts = request_ts + timedelta(minutes=2)
+    dropoff_ts = pickup_ts + timedelta(minutes=10)
+    row = {
+        "dispatching_base_num": "B02764",
+        "request_datetime": request_ts,
+        "pickup_datetime": pickup_ts,
+        "dropoff_datetime": dropoff_ts,
+        "PULocationID": 161,  # known centroid
+        "DOLocationID": 265,  # unknown in local centroid file
+        "trip_miles": 2.4,
+        "trip_time": 600,
+        "base_passenger_fare": 12.0,
+        "tolls": 0.0,
+        "bcf": 0.0,
+        "sales_tax": 0.0,
+        "congestion_surcharge": 0.0,
+        "airport_fee": 0.0,
+        "tips": 0.0,
+        "driver_pay": 0.0,
+    }
+
+    trip = replay._row_to_trip(row)
+    assert trip is not None
+    # Should not collapse to the legacy hardcoded fallback center.
+    assert (round(trip.dropoff_lat, 6), round(trip.dropoff_lon, 6)) != (40.758000, -73.985500)
+    # Keep a plausible local leg.
+    inferred_km = replay_main.haversine_km(trip.pickup_lat, trip.pickup_lon, trip.dropoff_lat, trip.dropoff_lon)
+    assert inferred_km > 0.3
+
+
+def test_build_position_available_has_zero_speed():
+    replay = replay_main.TLCReplay("2024-01")
+    trip = _make_trip(trip_key="available_speed_zero_case")
+    pos = replay._build_position(
+        trip,
+        lat=trip.dropoff_lat,
+        lon=trip.dropoff_lon,
+        ts=trip.dropoff_ts,
+        status="available",
+    )
+
+    assert pos.speed_kmh == 0.0
+
+
+def test_prepare_fleet_reposition_uses_previous_driver_position(monkeypatch):
+    replay = replay_main.TLCReplay("2024-01")
+    replay.fleet_pool_enabled = True
+    trip = _make_trip(trip_key="fleet_reposition_prepare")
+    trip.courier_id = "drv_demo_001"
+    replay.fleet_driver_state = {
+        "drv_demo_001": (
+            trip.request_ts - timedelta(minutes=5),
+            40.7485,
+            -74.0020,
+            161,
+        )
+    }
+
+    async def _fake_osrm(*_args, **_kwargs):
+        return "osrm_public", [
+            (40.7485, -74.0020),
+            (40.7520, -73.9940),
+            (trip.pickup_lat, trip.pickup_lon),
+        ]
+
+    monkeypatch.setattr(replay_main, "TLC_ROUTE_MODE", "osrm")
+    replay.osrm_client = object()
+    monkeypatch.setattr(replay, "_fetch_osrm_geometry", _fake_osrm)
+
+    asyncio.run(replay._prepare_fleet_reposition(trip))
+
+    assert trip.reposition_start_lat == 40.7485
+    assert trip.reposition_start_lon == -74.0020
+    assert trip.reposition_source == "osrm_public"
+    assert trip.reposition_geometry[0] == (40.7485, -74.0020)
+    assert trip.reposition_geometry[-1] == (trip.pickup_lat, trip.pickup_lon)
+
+
+def test_emit_trip_start_uses_reposition_origin_for_fleet_driver(monkeypatch):
+    replay = replay_main.TLCReplay("2024-01")
+    trip = _make_trip(trip_key="fleet_reposition_start")
+    trip.courier_id = "drv_demo_001"
+    trip.reposition_start_ts = trip.request_ts
+    trip.reposition_start_lat = 40.7485
+    trip.reposition_start_lon = -74.0020
+    trip.reposition_source = "osrm_public"
+    trip.reposition_geometry = [
+        (40.7485, -74.0020),
+        (40.7520, -73.9940),
+        (trip.pickup_lat, trip.pickup_lon),
+    ]
+    trip.reposition_cumulative_km = replay_main.cumulative_route_distances_km(trip.reposition_geometry)
+
+    sent: list[bytes] = []
+
+    async def _capture(_topic, _key, value):  # noqa: ANN001
+        sent.append(value)
+
+    monkeypatch.setattr(replay, "_send", _capture)
+    asyncio.run(replay._emit_trip_start(trip))
+
+    pos = replay_main.CourierPositionV1()
+    pos.ParseFromString(sent[-1])
+
+    assert pos.status == "repositioning"
+    assert pos.lat == round(trip.reposition_start_lat, 6)
+    assert pos.lon == round(trip.reposition_start_lon, 6)
+
+
+def test_emit_trip_progress_uses_reposition_route_before_pickup(monkeypatch):
+    replay = replay_main.TLCReplay("2024-01")
+    trip = _make_trip(trip_key="fleet_reposition_progress")
+    trip.reposition_start_ts = trip.request_ts
+    trip.reposition_start_lat = 40.7485
+    trip.reposition_start_lon = -74.0020
+    trip.reposition_source = "osrm_public"
+    trip.reposition_geometry = [
+        (40.7485, -74.0020),
+        (40.7520, -73.9940),
+        (trip.pickup_lat, trip.pickup_lon),
+    ]
+    trip.reposition_cumulative_km = replay_main.cumulative_route_distances_km(trip.reposition_geometry)
+
+    sent: list[bytes] = []
+
+    async def _capture(_topic, _key, value):  # noqa: ANN001
+        sent.append(value)
+
+    monkeypatch.setattr(replay, "_send", _capture)
+    mid = trip.request_ts + (trip.pickup_ts - trip.request_ts) / 2
+    asyncio.run(replay._emit_trip_progress(trip, mid))
+
+    pos = replay_main.CourierPositionV1()
+    pos.ParseFromString(sent[-1])
+
+    assert pos.status == "repositioning"
+    assert round(pos.lat, 4) != round(trip.pickup_lat, 4)
+    assert round(pos.lon, 4) != round(trip.pickup_lon, 4)
+    assert round(pos.lat, 4) != round(trip.dropoff_lat, 4)
+
+
+def test_prefer_working_route_provider_moves_public_first_when_local_down():
+    replay = replay_main.TLCReplay("2024-01")
+    replay.route_osrm_targets = [
+        ("osrm", "http://osrm:5000"),
+        ("osrm_public", "https://router.project-osrm.org"),
+    ]
+
+    class _MixedClient:
+        async def get(self, url: str, *_args, **_kwargs):  # noqa: ANN001
+            if "osrm:5000" in url:
+                raise RuntimeError("local_osrm_down")
+
+            class _OkResponse:
+                status_code = 200
+
+                def json(self):  # noqa: ANN201
+                    return {"code": "Ok", "waypoints": [{"location": [-73.9855, 40.758]}]}
+
+            return _OkResponse()
+
+    replay.osrm_client = _MixedClient()
+    asyncio.run(replay._prefer_working_route_provider())
+    assert replay.route_osrm_targets[0][0] == "osrm_public"

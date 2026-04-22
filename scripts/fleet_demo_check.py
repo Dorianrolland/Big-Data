@@ -325,8 +325,11 @@ def print_fleet_kpis(api_base: str) -> None:
         trajectory_mode = str(replay.get("trajectory_mode", "") or "").strip().lower()
         osrm_success = int(replay.get("route_osrm_success", 0) or 0)
         osrm_public_success = int(replay.get("route_osrm_public_success", 0) or 0)
+        valhalla_success = int(replay.get("route_valhalla_public_success", 0) or 0)
+        prefetch_success = int(replay.get("route_prefetch_success", 0) or 0)
         linear_fallback = int(replay.get("route_linear_fallback", 0) or 0)
-        if trajectory_mode == "osrm" and (osrm_success + osrm_public_success) == 0 and linear_fallback >= 50:
+        routed_success = osrm_success + osrm_public_success + valhalla_success
+        if trajectory_mode == "osrm" and routed_success == 0 and prefetch_success == 0 and linear_fallback >= 50:
             _safe_print("\n[warn] replay route_mode=osrm but no routed segments succeeded yet.")
             _safe_print("       Most trips are currently using fallback geometry (check local OSRM profile/data).")
     _safe_print("------------------------------------------------------------------------")

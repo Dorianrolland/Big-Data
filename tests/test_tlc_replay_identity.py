@@ -86,6 +86,35 @@ def test_synth_courier_id_legacy_zone_day_keeps_historical_collision_behavior():
     assert cid_a == cid_b
 
 
+def test_synth_courier_id_fleet_pool_returns_stable_demo_driver_id(monkeypatch):
+    monkeypatch.setattr(replay_main, "TLC_FLEET_DEMO_N_DRIVERS", 360)
+    req_a = datetime(2024, 1, 2, 12, 0, tzinfo=timezone.utc)
+    req_b = req_a + timedelta(minutes=15)
+
+    cid_a = replay_main.synth_courier_id(
+        "B02764",
+        132,
+        238,
+        req_a,
+        req_a + timedelta(minutes=1),
+        req_a + timedelta(minutes=12),
+        mode="fleet_pool",
+    )
+    cid_b = replay_main.synth_courier_id(
+        "B02764",
+        132,
+        238,
+        req_b,
+        req_b + timedelta(minutes=1),
+        req_b + timedelta(minutes=12),
+        mode="fleet_pool",
+    )
+
+    assert cid_a.startswith("drv_demo_")
+    assert cid_b.startswith("drv_demo_")
+    assert cid_a == cid_b
+
+
 def test_row_to_trip_uses_trip_mode_to_avoid_overlapping_identity_collisions(monkeypatch):
     replay = replay_main.TLCReplay("2024-01")
     monkeypatch.setattr(replay_main, "TLC_COURIER_ID_MODE", "trip")
@@ -112,3 +141,77 @@ def test_row_to_trip_uses_trip_mode_to_avoid_overlapping_identity_collisions(mon
     assert trip_a is not None
     assert trip_b is not None
     assert trip_a.courier_id != trip_b.courier_id
+
+
+def test_pick_fleet_driver_prefers_nearby_available_driver(monkeypatch):
+    replay = replay_main.TLCReplay("2024-01")
+    monkeypatch.setattr(replay_main, "TLC_COURIER_ID_MODE", "fleet_pool")
+    monkeypatch.setattr(replay_main, "TLC_FLEET_DEMO_N_DRIVERS", 2)
+    monkeypatch.setattr(replay_main, "TLC_FLEET_REPOSITION_KMH", 22.0)
+    monkeypatch.setattr(replay_main, "TLC_FLEET_MAX_REPOSITION_MIN", 30.0)
+    monkeypatch.setattr(replay_main, "TLC_FLEET_PICKUP_GRACE_MIN", 2.0)
+    replay.fleet_pool_enabled = True
+    replay.fleet_driver_ids = ["drv_demo_001", "drv_demo_002"]
+    base_ts = datetime(2024, 1, 2, 11, 55, tzinfo=timezone.utc)
+    replay.fleet_driver_state = {
+        "drv_demo_001": (base_ts, 40.7579, -73.9854),  # near pickup
+        "drv_demo_002": (base_ts, 40.6892, -74.0445),  # far away
+    }
+
+    trip = replay_main.Trip(
+        trip_key="fleet_pick",
+        courier_id="drv_demo_002",
+        offer_id="offer_fleet_pick",
+        order_id="order_fleet_pick",
+        request_ts=datetime(2024, 1, 2, 12, 0, tzinfo=timezone.utc),
+        pickup_ts=datetime(2024, 1, 2, 12, 1, tzinfo=timezone.utc),
+        dropoff_ts=datetime(2024, 1, 2, 12, 12, tzinfo=timezone.utc),
+        pu_loc=132,
+        do_loc=238,
+        pickup_lat=40.7580,
+        pickup_lon=-73.9855,
+        dropoff_lat=40.7420,
+        dropoff_lon=-73.9730,
+        trip_km=3.2,
+        trip_min=12.0,
+        fare_usd=12.0,
+    )
+
+    picked = replay._pick_fleet_driver(trip)
+    assert picked == "drv_demo_001"
+
+
+def test_pick_fleet_driver_returns_none_when_pickup_is_unreachable(monkeypatch):
+    replay = replay_main.TLCReplay("2024-01")
+    monkeypatch.setattr(replay_main, "TLC_COURIER_ID_MODE", "fleet_pool")
+    monkeypatch.setattr(replay_main, "TLC_FLEET_DEMO_N_DRIVERS", 1)
+    monkeypatch.setattr(replay_main, "TLC_FLEET_REPOSITION_KMH", 18.0)
+    monkeypatch.setattr(replay_main, "TLC_FLEET_MAX_REPOSITION_MIN", 20.0)
+    monkeypatch.setattr(replay_main, "TLC_FLEET_PICKUP_GRACE_MIN", 1.0)
+    replay.fleet_pool_enabled = True
+    replay.fleet_driver_ids = ["drv_demo_001"]
+    base_ts = datetime(2024, 1, 2, 11, 59, tzinfo=timezone.utc)
+    replay.fleet_driver_state = {
+        "drv_demo_001": (base_ts, 40.6413, -73.7781),  # JFK -> too far for a 1 min pickup window
+    }
+
+    trip = replay_main.Trip(
+        trip_key="fleet_unreachable",
+        courier_id="drv_demo_001",
+        offer_id="offer_fleet_unreachable",
+        order_id="order_fleet_unreachable",
+        request_ts=datetime(2024, 1, 2, 12, 0, tzinfo=timezone.utc),
+        pickup_ts=datetime(2024, 1, 2, 12, 1, tzinfo=timezone.utc),
+        dropoff_ts=datetime(2024, 1, 2, 12, 16, tzinfo=timezone.utc),
+        pu_loc=132,
+        do_loc=238,
+        pickup_lat=40.7580,
+        pickup_lon=-73.9855,
+        dropoff_lat=40.7420,
+        dropoff_lon=-73.9730,
+        trip_km=3.2,
+        trip_min=12.0,
+        fare_usd=12.0,
+    )
+
+    assert replay._pick_fleet_driver(trip) is None

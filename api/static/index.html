@@ -326,7 +326,9 @@ const FOCUS_ENABLED = FOCUS_DRIVER.length > 0;
 const FOCUS_TRAIL_POINTS = Number(_urlParams.get('trail') || '36');
 const FOCUS_POLL_MS = Number(_urlParams.get('focusPoll') || '2000');
 const FOCUS_STATUS_POLL_MS = Number(_urlParams.get('focusStatusPoll') || '10000');
-const FOCUS_INTERP_MS = 60;
+const FOCUS_INTERP_MIN_MS = 900;
+const FOCUS_INTERP_MAX_MS = 16000;
+const FOCUS_INTERP_TARGET_KMH = Number(_urlParams.get('focusKmh') || '22');
 const PERF_POLL_ENABLED = (_urlParams.get('perf') || (FOCUS_ENABLED ? '0' : '1')) === '1';
 const FLEET_QUERY_LIMIT = Math.max(50, Number(_urlParams.get('fleetLimit') || '500'));
 const FLEET_INTERP_MIN_MS = 550;
@@ -554,6 +556,18 @@ function fleetDurationMs(fromLat, fromLon, toLat, toLon, sourceDeltaMs) {
   return Math.max(FLEET_INTERP_MIN_MS, Math.min(dynamicMax, budgetMs));
 }
 
+function focusDurationMs(fromLat, fromLon, toLat, toLon, sourceDeltaMs) {
+  const distanceKm = haversineKm(fromLat, fromLon, toLat, toLon);
+  const speed = Math.max(8, FOCUS_INTERP_TARGET_KMH || 22);
+  const travelMs = (distanceKm / speed) * 3600 * 1000;
+  const observedMs = Number.isFinite(sourceDeltaMs) && sourceDeltaMs > 250
+    ? sourceDeltaMs
+    : FOCUS_POLL_MS;
+  const budgetMs = Math.max(observedMs * 0.95, travelMs);
+  const dynamicMax = Math.max(FOCUS_INTERP_MAX_MS, observedMs * 2.2);
+  return Math.max(FOCUS_INTERP_MIN_MS, Math.min(dynamicMax, budgetMs));
+}
+
 function upsertFleetMotion(lv, now) {
   const marker = markers.get(lv.livreur_id);
   if (!marker) return;
@@ -750,6 +764,7 @@ const focusState = {
   targetLon: null,
   lastUpdateWall: 0,
   targetUpdateWall: 0,
+  lastServerTsMs: null,
   inflight: false,
   lastAge: null,
   statusPillEl: null,
@@ -918,6 +933,15 @@ function renderTrail(points) {
   }
 }
 
+function currentFocusInterpolated(now) {
+  if (focusState.targetLat == null || focusState.targetLon == null) return null;
+  const span = Math.max(100, focusState.targetUpdateWall - focusState.lastUpdateWall);
+  const t = Math.max(0, Math.min(1, (now - focusState.lastUpdateWall) / span));
+  const lat = focusState.lastLat + (focusState.targetLat - focusState.lastLat) * t;
+  const lon = focusState.lastLon + (focusState.targetLon - focusState.lastLon) * t;
+  return { lat, lon };
+}
+
 async function pollFocus() {
   if (pageHidden) return;
   if (!pollReady('focus')) return;
@@ -939,20 +963,44 @@ async function pollFocus() {
       focusState.missingPositionStreak = 0;
       ensureFocusMarker(pos.lat, pos.lon, pos.status);
       const now = performance.now();
+      const nextServerTsMs = parseIsoTimestampMs(pos.ts);
       if (focusState.lastLat == null) {
         focusState.lastLat = pos.lat;
         focusState.lastLon = pos.lon;
         focusState.marker.setLatLng([pos.lat, pos.lon]);
         focusState.halo.setLatLng([pos.lat, pos.lon]);
+        focusState.targetLat = pos.lat;
+        focusState.targetLon = pos.lon;
+        focusState.lastUpdateWall = now;
+        focusState.targetUpdateWall = now + FOCUS_INTERP_MIN_MS;
+        focusState.lastServerTsMs = nextServerTsMs;
       } else {
-        // set new target; renderTick() will interpolate towards it
-        focusState.lastLat = focusState.targetLat != null ? focusState.targetLat : focusState.lastLat;
-        focusState.lastLon = focusState.targetLon != null ? focusState.targetLon : focusState.lastLon;
+        // Keep interpolation continuous even if polls are jittery.
+        const current = currentFocusInterpolated(now);
+        if (current) {
+          focusState.lastLat = current.lat;
+          focusState.lastLon = current.lon;
+        } else {
+          focusState.lastLat = focusState.targetLat != null ? focusState.targetLat : focusState.lastLat;
+          focusState.lastLon = focusState.targetLon != null ? focusState.targetLon : focusState.lastLon;
+        }
+        const sourceDeltaMs = (
+          nextServerTsMs != null
+          && focusState.lastServerTsMs != null
+          && nextServerTsMs > focusState.lastServerTsMs
+        ) ? (nextServerTsMs - focusState.lastServerTsMs) : null;
+        focusState.lastUpdateWall = now;
+        focusState.targetUpdateWall = now + focusDurationMs(
+          focusState.lastLat,
+          focusState.lastLon,
+          pos.lat,
+          pos.lon,
+          sourceDeltaMs,
+        );
+        if (nextServerTsMs != null) focusState.lastServerTsMs = nextServerTsMs;
       }
       focusState.targetLat = pos.lat;
       focusState.targetLon = pos.lon;
-      focusState.lastUpdateWall = now;
-      focusState.targetUpdateWall = now + FOCUS_POLL_MS;
       if (focusState.firstFit !== true) {
         map.setView([pos.lat, pos.lon], 14, { animate: false });
         focusState.firstFit = true;
@@ -984,12 +1032,11 @@ async function pollFocus() {
 function focusRenderTick() {
   if (focusState.marker && focusState.targetLat != null) {
     const now = performance.now();
-    const span = Math.max(100, focusState.targetUpdateWall - focusState.lastUpdateWall);
-    const t = Math.max(0, Math.min(1, (now - focusState.lastUpdateWall) / span));
-    const lat = focusState.lastLat + (focusState.targetLat - focusState.lastLat) * t;
-    const lon = focusState.lastLon + (focusState.targetLon - focusState.lastLon) * t;
-    focusState.marker.setLatLng([lat, lon]);
-    focusState.halo.setLatLng([lat, lon]);
+    const pos = currentFocusInterpolated(now);
+    if (pos) {
+      focusState.marker.setLatLng([pos.lat, pos.lon]);
+      focusState.halo.setLatLng([pos.lat, pos.lon]);
+    }
   }
   requestAnimationFrame(focusRenderTick);
 }

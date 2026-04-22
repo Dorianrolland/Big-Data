@@ -525,6 +525,18 @@ iframe { border: none !important; border-radius: 12px !important; }
     background: #EFF6FF !important; border: 1.5px solid #BFDBFE !important;
     border-radius: 12px !important; color: #1E3A8A !important; font-weight: 500 !important;
 }
+
+/* Force readable foreground on light cards (prevents white-on-white in dark theme inheritance). */
+.bi-card, .cold-card, .sla-card, .map-card, .spotlight-container, .bento-card,
+.zone-item, .demand-zone, .score-detail-item, .reco-item {
+    color: #0F172A !important;
+}
+.bi-card *:not([style*="color:"]),
+.cold-card *:not([style*="color:"]),
+.sla-card *:not([style*="color:"]),
+.spotlight-container *:not([style*="color:"]) {
+    color: inherit;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -699,10 +711,11 @@ const STATUS_COLORS = {{
   available:  [52,211,153,220],
   idle:       [148,163,184,150],
 }};
-const MAP_QUERY = '/livreurs-proches?lat=40.7580&lon=-73.9855&rayon=20&limit=250';
-const MAP_POLL_BASE_MS = 3000;
+const MAP_QUERY = '/livreurs-proches?lat=40.7580&lon=-73.9855&rayon=28&limit=500';
+const MAP_POLL_BASE_MS = 2000;
 const MAP_POLL_MAX_MS = 20000;
-const MAP_REQUEST_TIMEOUT_MS = 3500;
+const MAP_REQUEST_TIMEOUT_MS = 4500;
+const MAP_TRANSITION_MS = 2200;
 let mapPollInFlight = false;
 let mapPollFailures = 0;
 let mapPollDelayMs = MAP_POLL_BASE_MS;
@@ -805,6 +818,7 @@ async function refresh() {{
       heading: lv.heading_deg || 0,
       battery: lv.battery_pct || 0,
     }}));
+    livreurs.sort((a, b) => String(a.id || '').localeCompare(String(b.id || '')));
 
     deckgl.setProps({{
       layers: [
@@ -817,7 +831,7 @@ async function refresh() {{
           getRadius: 300,
           radiusMinPixels: 10,
           radiusMaxPixels: 30,
-          transitions: {{ getPosition: 1500 }},
+          transitions: {{ getPosition: MAP_TRANSITION_MS }},
         }}),
         new deck.ScatterplotLayer({{
           id: 'fleet',
@@ -830,7 +844,7 @@ async function refresh() {{
           pickable: true,
           autoHighlight: true,
           highlightColor: [99,102,241,255],
-          transitions: {{ getPosition: 1500 }},
+          transitions: {{ getPosition: MAP_TRANSITION_MS }},
         }}),
       ]
     }});
@@ -871,7 +885,7 @@ st.markdown("""
 <div class="map-card">
     <div class="map-card-header">
         <span>🗺️</span>
-        <span>Flotte en temps réel — New York City · Auto-refresh 3s</span>
+        <span>Flotte en temps réel — New York City · Auto-refresh 2s</span>
     </div>
 """, unsafe_allow_html=True)
 components.html(_FLEET_MAP_HTML, height=460, scrolling=False)

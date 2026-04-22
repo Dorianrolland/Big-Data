@@ -90,10 +90,16 @@ $TotalSteps = 6
 Write-Step 1 $TotalSteps "Start Docker stack"
 Set-Location $Root
 $envArgs = if ($Fleet) { @("--env-file", "env/fleet_demo.env") } else { @() }
+$routingArgs = @()
+$osrmData = Join-Path $Root "data\osrm\new-york-latest.osrm"
+if (Test-Path $osrmData) {
+    $routingArgs = @("--profile", "routing")
+    Write-Info "routing profile enabled (local OSRM data found)"
+}
 if ($SkipBuild) {
-    docker compose @envArgs up -d
+    docker compose @envArgs @routingArgs up -d
 } else {
-    docker compose @envArgs up --build -d
+    docker compose @envArgs @routingArgs up --build -d
 }
 if ($LASTEXITCODE -ne 0) {
     Write-Fail "docker compose up failed"
