@@ -6,6 +6,8 @@ import importlib.util
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 
 _TLC_MAIN_PATH = Path(__file__).resolve().parent.parent / "tlc_replay" / "main.py"
 _SPEC = importlib.util.spec_from_file_location("tlc_replay_main", _TLC_MAIN_PATH)
@@ -95,6 +97,25 @@ def test_prepare_trip_route_falls_back_to_linear_when_osrm_fails(monkeypatch):
     assert replay.stats_route_osrm_errors == 1
 
 
+def test_prepare_trip_route_holds_position_when_linear_fallback_disabled(monkeypatch):
+    replay = replay_main.TLCReplay("2024-01")
+    trip = _make_trip(trip_key="hold_case")
+
+    async def _raise_osrm(*_args, **_kwargs):
+        raise RuntimeError("osrm_down")
+
+    monkeypatch.setattr(replay_main, "TLC_ROUTE_MODE", "osrm")
+    monkeypatch.setattr(replay_main, "TLC_ROUTE_LINEAR_FALLBACK_ALLOWED", False)
+    monkeypatch.setattr(replay, "_fetch_osrm_geometry", _raise_osrm)
+
+    asyncio.run(replay._prepare_trip_route(trip))
+
+    assert trip.route_source == "hold"
+    assert trip.route_geometry == [(trip.pickup_lat, trip.pickup_lon)]
+    assert trip.route_cumulative_km == [0.0]
+    assert replay.stats_route_hold_fallback == 1
+
+
 def test_synthetic_grid_geometry_uses_turn_for_long_segments():
     geometry = replay_main.synthetic_grid_geometry(
         origin_lat=40.7580,
@@ -166,6 +187,25 @@ def test_prepare_trip_route_uses_zone_pair_cache(monkeypatch):
     assert trip_b.route_source == "osrm"
 
 
+def test_init_fleet_driver_pool_prefers_road_safe_zone_anchors():
+    replay = replay_main.TLCReplay("2024-01")
+    replay.fleet_pool_enabled = True
+    replay.centroids = {
+        10: (40.7001, -73.9001),
+        20: (40.7002, -73.9002),
+    }
+    replay.zone_road_anchors = {
+        10: (40.7101, -73.9101),
+        20: (40.7102, -73.9102),
+    }
+
+    replay._init_fleet_driver_pool()
+
+    first_state = replay.fleet_driver_state[replay.fleet_driver_ids[0]]
+    assert first_state[1] == pytest.approx(40.7101, abs=1e-6)
+    assert first_state[2] == pytest.approx(-73.9101, abs=1e-6)
+
+
 def test_fetch_osrm_geometry_falls_back_to_public_provider():
     replay = replay_main.TLCReplay("2024-01")
     replay.route_osrm_targets = [
@@ -195,7 +235,7 @@ def test_fetch_osrm_geometry_falls_back_to_public_provider():
             return _FakeResponse()
 
     replay.osrm_client = _FakeClient()
-    source, geometry = asyncio.run(
+    source, geometry, snap_meta = asyncio.run(
         replay._fetch_osrm_geometry(
             origin_lat=40.7580,
             origin_lon=-73.9855,
@@ -207,6 +247,8 @@ def test_fetch_osrm_geometry_falls_back_to_public_provider():
     assert source == "osrm_public"
     assert len(geometry) >= 2
     assert replay._last_osrm_provider == "osrm_public"
+    assert snap_meta["origin_snap_km"] >= 0
+    assert snap_meta["dest_snap_km"] >= 0
 
 
 def test_fetch_osrm_geometry_supports_valhalla_public_provider():
@@ -233,7 +275,7 @@ def test_fetch_osrm_geometry_supports_valhalla_public_provider():
             return _FakeResponse()
 
     replay.osrm_client = _FakeClient()
-    source, geometry = asyncio.run(
+    source, geometry, snap_meta = asyncio.run(
         replay._fetch_osrm_geometry(
             origin_lat=40.7580,
             origin_lon=-73.9855,
@@ -245,6 +287,8 @@ def test_fetch_osrm_geometry_supports_valhalla_public_provider():
     assert source == "valhalla_public"
     assert len(geometry) >= 2
     assert replay._last_osrm_provider == "valhalla_public"
+    assert snap_meta["origin_snap_km"] >= 0
+    assert snap_meta["dest_snap_km"] >= 0
 
 
 def test_prepare_trip_route_tracks_public_osrm_source(monkeypatch):
@@ -420,6 +464,46 @@ def test_row_to_trip_infers_missing_zone_centroid_without_times_square_collapse(
     assert inferred_km > 0.3
 
 
+def test_row_to_trip_prefers_road_safe_zone_anchor_when_available():
+    replay = replay_main.TLCReplay("2024-01")
+    replay.centroids = {
+        161: (40.7580, -73.9855),
+        238: (40.7420, -73.9730),
+    }
+    replay.zone_road_anchors = {
+        161: (40.7571, -73.9844),
+        238: (40.7415, -73.9722),
+    }
+    request_ts = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
+    pickup_ts = request_ts + timedelta(minutes=2)
+    dropoff_ts = pickup_ts + timedelta(minutes=10)
+    row = {
+        "dispatching_base_num": "B02764",
+        "request_datetime": request_ts,
+        "pickup_datetime": pickup_ts,
+        "dropoff_datetime": dropoff_ts,
+        "PULocationID": 161,
+        "DOLocationID": 238,
+        "trip_miles": 2.4,
+        "trip_time": 600,
+        "base_passenger_fare": 12.0,
+        "tolls": 0.0,
+        "bcf": 0.0,
+        "sales_tax": 0.0,
+        "congestion_surcharge": 0.0,
+        "airport_fee": 0.0,
+        "tips": 0.0,
+        "driver_pay": 0.0,
+    }
+
+    trip = replay._row_to_trip(row)
+    assert trip is not None
+    assert trip.pickup_lat == pytest.approx(40.7571, abs=1e-6)
+    assert trip.pickup_lon == pytest.approx(-73.9844, abs=1e-6)
+    assert trip.dropoff_lat == pytest.approx(40.7415, abs=1e-6)
+    assert trip.dropoff_lon == pytest.approx(-73.9722, abs=1e-6)
+
+
 def test_build_position_available_has_zero_speed():
     replay = replay_main.TLCReplay("2024-01")
     trip = _make_trip(trip_key="available_speed_zero_case")
@@ -432,6 +516,94 @@ def test_build_position_available_has_zero_speed():
     )
 
     assert pos.speed_kmh == 0.0
+
+
+def test_emit_trip_start_and_finish_use_routed_endpoints(monkeypatch):
+    replay = replay_main.TLCReplay("2024-01")
+    trip = _make_trip(trip_key="routed_anchor_case")
+
+    async def _fake_osrm(*_args, **_kwargs):
+        return "osrm_public", [
+            (40.7571, -73.9844),
+            (40.7500, -73.9790),
+            (40.7415, -73.9722),
+        ]
+
+    monkeypatch.setattr(replay_main, "TLC_ROUTE_MODE", "osrm")
+    monkeypatch.setattr(replay, "_fetch_osrm_geometry", _fake_osrm)
+    asyncio.run(replay._prepare_trip_route(trip))
+
+    sent: list[tuple[str, bytes]] = []
+
+    async def _capture(topic, _key, value):  # noqa: ANN001
+        sent.append((topic, value))
+
+    monkeypatch.setattr(replay, "_send", _capture)
+    asyncio.run(replay._emit_trip_start(trip))
+    asyncio.run(replay._emit_trip_finish(trip))
+
+    offer = replay_main.OrderOfferV1()
+    offer.ParseFromString(sent[0][1])
+
+    courier_payloads = [value for topic, value in sent if topic == replay_main.COURIER_TOPIC]
+    pickup_pos = replay_main.CourierPositionV1()
+    pickup_pos.ParseFromString(courier_payloads[0])
+    available_pos = replay_main.CourierPositionV1()
+    available_pos.ParseFromString(courier_payloads[1])
+
+    assert pickup_pos.status == "pickup_arrived"
+    assert pickup_pos.lat == pytest.approx(40.7571, abs=1e-6)
+    assert pickup_pos.lon == pytest.approx(-73.9844, abs=1e-6)
+    assert available_pos.status == "available"
+    assert available_pos.lat == pytest.approx(40.7415, abs=1e-6)
+    assert available_pos.lon == pytest.approx(-73.9722, abs=1e-6)
+    assert offer.pickup_lat == pytest.approx(40.7571, abs=1e-6)
+    assert offer.dropoff_lat == pytest.approx(40.7415, abs=1e-6)
+
+
+def test_prepare_trip_route_rejects_waypoint_snaps_that_are_too_far(monkeypatch):
+    replay = replay_main.TLCReplay("2024-01")
+    trip = _make_trip(trip_key="bad_waypoint_snap")
+
+    async def _fake_osrm(*_args, **_kwargs):
+        return "osrm", [
+            (40.7000, -73.9500),
+            (40.6900, -73.9400),
+        ], {
+            "snapped_origin": (40.7000, -73.9500),
+            "snapped_dest": (40.6900, -73.9400),
+            "origin_snap_km": 2.4,
+            "dest_snap_km": 2.1,
+        }
+
+    monkeypatch.setattr(replay_main, "TLC_ROUTE_MODE", "osrm")
+    monkeypatch.setattr(replay_main, "TLC_ROUTE_LINEAR_FALLBACK_ALLOWED", False)
+    monkeypatch.setattr(replay_main, "TLC_ROUTE_WAYPOINT_MAX_SNAP_KM", 0.4)
+    monkeypatch.setattr(replay, "_fetch_osrm_geometry", _fake_osrm)
+
+    asyncio.run(replay._prepare_trip_route(trip))
+
+    assert trip.route_source == "hold"
+    assert trip.route_geometry == [(trip.pickup_lat, trip.pickup_lon)]
+    assert replay.stats_route_hold_fallback == 1
+
+
+def test_mark_fleet_driver_available_uses_route_endpoint():
+    replay = replay_main.TLCReplay("2024-01")
+    replay.fleet_pool_enabled = True
+    trip = _make_trip(trip_key="fleet_available_anchor")
+    trip.route_geometry = [
+        (40.7571, -73.9844),
+        (40.7500, -73.9790),
+        (40.7415, -73.9722),
+    ]
+    trip.route_cumulative_km = replay_main.cumulative_route_distances_km(trip.route_geometry)
+
+    replay._mark_fleet_driver_available(trip)
+
+    state = replay.fleet_driver_state[str(trip.courier_id)]
+    assert state[1] == pytest.approx(40.7415, abs=1e-6)
+    assert state[2] == pytest.approx(-73.9722, abs=1e-6)
 
 
 def test_prepare_fleet_reposition_uses_previous_driver_position(monkeypatch):
@@ -466,6 +638,37 @@ def test_prepare_fleet_reposition_uses_previous_driver_position(monkeypatch):
     assert trip.reposition_source == "osrm_public"
     assert trip.reposition_geometry[0] == (40.7485, -74.0020)
     assert trip.reposition_geometry[-1] == (trip.pickup_lat, trip.pickup_lon)
+
+
+def test_prepare_fleet_reposition_uses_snapped_route_origin(monkeypatch):
+    replay = replay_main.TLCReplay("2024-01")
+    replay.fleet_pool_enabled = True
+    trip = _make_trip(trip_key="fleet_reposition_snap_origin")
+    trip.courier_id = "drv_demo_001"
+    replay.fleet_driver_state = {
+        "drv_demo_001": (
+            trip.request_ts - timedelta(minutes=5),
+            40.7485,
+            -74.0020,
+            161,
+        )
+    }
+
+    async def _fake_osrm(*_args, **_kwargs):
+        return "osrm_public", [
+            (40.7489, -74.0016),
+            (40.7520, -73.9940),
+            (trip.pickup_lat, trip.pickup_lon),
+        ]
+
+    monkeypatch.setattr(replay_main, "TLC_ROUTE_MODE", "osrm")
+    replay.osrm_client = object()
+    monkeypatch.setattr(replay, "_fetch_osrm_geometry", _fake_osrm)
+
+    asyncio.run(replay._prepare_fleet_reposition(trip))
+
+    assert trip.reposition_start_lat == pytest.approx(40.7489, abs=1e-6)
+    assert trip.reposition_start_lon == pytest.approx(-74.0016, abs=1e-6)
 
 
 def test_emit_trip_start_uses_reposition_origin_for_fleet_driver(monkeypatch):
@@ -531,6 +734,42 @@ def test_emit_trip_progress_uses_reposition_route_before_pickup(monkeypatch):
     assert round(pos.lat, 4) != round(trip.dropoff_lat, 4)
 
 
+def test_emit_trip_progress_emits_dense_samples_along_geometry(monkeypatch):
+    replay = replay_main.TLCReplay("2024-01")
+    trip = _make_trip(trip_key="dense_progress_case")
+    trip.route_geometry = [
+        (40.7580, -73.9855),
+        (40.7580, -73.9820),
+        (40.7550, -73.9820),
+    ]
+    trip.route_cumulative_km = replay_main.cumulative_route_distances_km(trip.route_geometry)
+    trip.last_position_ts = trip.pickup_ts
+
+    sent: list[bytes] = []
+
+    async def _capture(_topic, _key, value):  # noqa: ANN001
+        sent.append(value)
+
+    monkeypatch.setattr(replay_main, "TLC_LIVE_ROUTE_MAX_STEP_KM", 0.05)
+    monkeypatch.setattr(replay_main, "TLC_LIVE_ROUTE_MAX_POINTS_PER_TICK", 16)
+    monkeypatch.setattr(replay, "_send", _capture)
+
+    now = trip.pickup_ts + timedelta(minutes=8)
+    asyncio.run(replay._emit_trip_progress(trip, now))
+
+    decoded = []
+    for raw in sent:
+        pos = replay_main.CourierPositionV1()
+        pos.ParseFromString(raw)
+        decoded.append(pos)
+
+    assert len(decoded) >= 3
+    assert all(pos.status == "delivering" for pos in decoded)
+    assert any(abs(pos.lon - (-73.9820)) < 0.0008 for pos in decoded)
+    assert any(abs(pos.lat - 40.7580) < 0.0008 for pos in decoded)
+    assert decoded[-1].ts == replay_main.iso_from_dt(now)
+
+
 def test_prefer_working_route_provider_moves_public_first_when_local_down():
     replay = replay_main.TLCReplay("2024-01")
     replay.route_osrm_targets = [
@@ -554,3 +793,15 @@ def test_prefer_working_route_provider_moves_public_first_when_local_down():
     replay.osrm_client = _MixedClient()
     asyncio.run(replay._prefer_working_route_provider())
     assert replay.route_osrm_targets[0][0] == "osrm_public"
+
+
+def test_routing_preflight_requires_local_osrm_dataset(monkeypatch, tmp_path):
+    replay = replay_main.TLCReplay("2024-01")
+    missing = tmp_path / "missing.osrm"
+    monkeypatch.setattr(replay_main, "TLC_ROUTE_MODE", "osrm")
+    monkeypatch.setattr(replay_main, "TLC_REQUIRE_LOCAL_OSRM_DATA", True)
+    monkeypatch.setattr(replay_main, "TLC_ROUTE_SYNC_ON_CACHE_MISS", True)
+    monkeypatch.setattr(replay_main, "TLC_LOCAL_OSRM_DATA_FILE", missing)
+
+    with pytest.raises(RuntimeError):
+        replay._routing_preflight()

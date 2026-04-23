@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import Any
 
 _ROOT = Path(__file__).resolve().parent.parent
-_ENV_PATH = _ROOT / "env" / "fleet_demo.env"
+_ENV_FILE_RAW = (os.getenv("FLEET_DEMO_ENV_FILE", "env/fleet_demo.env") or "env/fleet_demo.env").strip()
+_ENV_PATH = (_ROOT / _ENV_FILE_RAW).resolve() if not Path(_ENV_FILE_RAW).is_absolute() else Path(_ENV_FILE_RAW)
 _LOCAL_HTTP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 _REQUIRED_DEMO_SERVICES = {"api", "hot-consumer", "tlc-replay", "redis", "redpanda"}
 
@@ -53,7 +54,7 @@ FLEET_DEMO_PARAMS = {
     "speed_factor": float(_ENV.get("TLC_SPEED_FACTOR", "1.0") or "1.0"),
     "tick_interval_s": float(_ENV.get("TLC_TICK_INTERVAL_SEC", "5.0") or "5.0"),
     "gps_ttl_seconds": int(_ENV.get("GPS_TTL_SECONDS", "20") or "20"),
-    "env_file": "env/fleet_demo.env",
+    "env_file": _ENV_FILE_RAW.replace("\\", "/"),
     "scenario": _ENV.get("TLC_SCENARIO", "fleet") or "fleet",
 }
 
@@ -308,9 +309,10 @@ def check_readiness(
     return False, {"active_couriers": last_active, "replay": replay_meta}
 
 
-def print_fleet_kpis(api_base: str) -> None:
+def print_fleet_kpis(api_base: str) -> bool:
     _safe_print("\n-- Fleet KPIs ----------------------------------------------------------")
     copilot_health = {}
+    routing_quality_ok = True
     for path in ["/health", "/stats", "/copilot/health"]:
         payload = _get_json(f"{api_base}{path}", timeout=8)
         if not payload:
@@ -328,11 +330,37 @@ def print_fleet_kpis(api_base: str) -> None:
         valhalla_success = int(replay.get("route_valhalla_public_success", 0) or 0)
         prefetch_success = int(replay.get("route_prefetch_success", 0) or 0)
         linear_fallback = int(replay.get("route_linear_fallback", 0) or 0)
+        hold_fallback = int(replay.get("route_hold_fallback", 0) or 0)
+        routing_errors = int(replay.get("route_osrm_errors", 0) or 0)
         routed_success = osrm_success + osrm_public_success + valhalla_success
+        nonlinear_issues = max(hold_fallback, routing_errors)
+        allowed_boot_blips = max(0, int(routed_success * 0.05)) if routed_success >= 100 else 0
+        if trajectory_mode == "osrm" and linear_fallback > 0:
+            routing_quality_ok = False
+            _safe_print("\n[fail] replay routing quality gate failed.")
+            _safe_print(
+                "       Linear fallback remained visible after warmup: "
+                f"linear={linear_fallback}."
+            )
+        elif trajectory_mode == "osrm" and nonlinear_issues > allowed_boot_blips:
+            routing_quality_ok = False
+            _safe_print("\n[fail] replay routing quality gate failed.")
+            _safe_print(
+                "       Routing still shows too many hold/error events after warmup: "
+                f"hold={hold_fallback}, errors={routing_errors}, "
+                f"allowed_boot_blips={allowed_boot_blips}, routed_success={routed_success}."
+            )
+        elif trajectory_mode == "osrm" and nonlinear_issues > 0:
+            _safe_print(
+                "\n[warn] replay routing had a few startup blips but is now within tolerance: "
+                f"hold={hold_fallback}, errors={routing_errors}, "
+                f"allowed_boot_blips={allowed_boot_blips}, routed_success={routed_success}."
+            )
         if trajectory_mode == "osrm" and routed_success == 0 and prefetch_success == 0 and linear_fallback >= 50:
             _safe_print("\n[warn] replay route_mode=osrm but no routed segments succeeded yet.")
             _safe_print("       Most trips are currently using fallback geometry (check local OSRM profile/data).")
     _safe_print("------------------------------------------------------------------------")
+    return routing_quality_ok
 
 
 def get_fleet_demo_config() -> dict:
@@ -357,8 +385,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.kpis_only:
-        print_fleet_kpis(args.api.rstrip("/"))
-        return
+        raise SystemExit(0 if print_fleet_kpis(args.api.rstrip("/")) else 1)
 
     running = _running_services()
     missing = sorted(_REQUIRED_DEMO_SERVICES - running) if running else []
@@ -367,7 +394,7 @@ def main() -> None:
             "[fleet-check] warning: required services are not all running: "
             + ", ".join(missing)
         )
-        _safe_print("[fleet-check] run: docker compose --env-file env/fleet_demo.env --profile routing up -d")
+        _safe_print(f"[fleet-check] run: docker compose --env-file {_ENV_FILE_RAW} --profile routing up -d")
 
     ok, details = check_readiness(
         api_base=args.api.rstrip("/"),
@@ -378,14 +405,18 @@ def main() -> None:
         replay_grace_s=max(5, int(args.replay_grace)),
     )
 
-    print_fleet_kpis(args.api.rstrip("/"))
-    if ok:
+    kpis_ok = print_fleet_kpis(args.api.rstrip("/"))
+    if ok and kpis_ok:
         _safe_print("\n[fleet-check] Demo ready.")
         _safe_print(f"  Copilot PWA      -> {args.api.rstrip('/')}/copilot")
         _safe_print(f"  API docs         -> {args.api.rstrip('/')}/docs")
         replay_count = int((details.get("replay") or {}).get("replay_count", 0) or 0)
         _safe_print(f"  Replay available -> {replay_count > 0} (count={replay_count})")
         raise SystemExit(0)
+
+    if ok and not kpis_ok:
+        _safe_print("\n[fleet-check] Demo not ready: routing quality gate failed.")
+        raise SystemExit(1)
 
     _safe_print("\n[fleet-check] Demo not ready yet.")
     raise SystemExit(1)

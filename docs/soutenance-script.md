@@ -10,7 +10,8 @@ make up
 
 - API docs: `http://localhost:8001/docs`
 - Live map: `http://localhost:8001/map`
-- Copilot PWA: `http://localhost:8001/copilot`
+- Driver Copilot app: `http://localhost:8001/copilot/driver-app`
+- Copilot operator fallback: `http://localhost:8001/copilot`
 - Grafana: `http://localhost:3000`
 
 ## 3) Demonstrate realtime pipeline

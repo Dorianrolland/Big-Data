@@ -107,6 +107,10 @@
     .badge-delivering { background: rgba(240,136,62,.2); color: var(--orange); }
     .badge-available  { background: rgba(63,185,80,.2);  color: var(--green);  }
     .badge-idle       { background: rgba(72,79,88,.3);   color: var(--muted);  }
+    .badge-pickup-assigned { background: rgba(125,211,252,.18); color: #7dd3fc; }
+    .badge-pickup-en-route { background: rgba(56,189,248,.18); color: #38bdf8; }
+    .badge-pickup-arrived { background: rgba(251,191,36,.2); color: #fbbf24; }
+    .badge-repositioning { background: rgba(56,189,248,.18); color: #38bdf8; }
     .popup-row { font-size: 12px; color: var(--muted); line-height: 2; display: flex; justify-content: space-between; }
     .popup-row strong { color: var(--text); font-weight: 600; font-family: 'JetBrains Mono', monospace; font-size: 11px; }
 
@@ -329,8 +333,10 @@ const FOCUS_STATUS_POLL_MS = Number(_urlParams.get('focusStatusPoll') || '10000'
 const FOCUS_INTERP_MIN_MS = 900;
 const FOCUS_INTERP_MAX_MS = 16000;
 const FOCUS_INTERP_TARGET_KMH = Number(_urlParams.get('focusKmh') || '22');
+const FOCUS_FREEZE_JUMP_KM = Math.max(0.08, Number(_urlParams.get('focusFreezeJumpKm') || '0.18'));
 const PERF_POLL_ENABLED = (_urlParams.get('perf') || (FOCUS_ENABLED ? '0' : '1')) === '1';
 const FLEET_QUERY_LIMIT = Math.max(50, Number(_urlParams.get('fleetLimit') || '500'));
+const FLEET_TRACK_POINTS = Math.max(8, Math.min(64, Number(_urlParams.get('fleetTrack') || '48')));
 const FLEET_INTERP_MIN_MS = 550;
 const FLEET_INTERP_MAX_MS = 18000;
 const FLEET_INTERP_TARGET_KMH = Number(_urlParams.get('fleetKmh') || '24');
@@ -351,6 +357,10 @@ const STATUS = {
   delivering: { color: '#f0883e', bg: 'rgba(240,136,62,.18)', badge: 'badge-delivering' },
   available:  { color: '#3fb950', bg: 'rgba(63,185,80,.18)',  badge: 'badge-available'  },
   idle:       { color: '#484f58', bg: 'rgba(72,79,88,.25)',   badge: 'badge-idle'        },
+  pickup_assigned: { color: '#7dd3fc', bg: 'rgba(125,211,252,.16)', badge: 'badge-pickup-assigned' },
+  pickup_en_route: { color: '#38bdf8', bg: 'rgba(56,189,248,.18)', badge: 'badge-pickup-en-route' },
+  pickup_arrived: { color: '#fbbf24', bg: 'rgba(251,191,36,.18)', badge: 'badge-pickup-arrived' },
+  repositioning: { color: '#38bdf8', bg: 'rgba(56,189,248,.18)', badge: 'badge-repositioning' },
 };
 const defaultStatus = { color: '#484f58', bg: 'rgba(72,79,88,.25)', badge: 'badge-idle' };
 
@@ -462,9 +472,26 @@ function mkMarker(lv) {
 
   m.bindPopup('', { maxWidth: 240, className: '' });
   m.on('click', () => { m.setPopupContent(buildPopup(lv)); m.openPopup(); });
+  applyFleetQualityStyle(m, halo, lv, s);
 
   halos.set(lv.livreur_id, halo);
   return m;
+}
+
+function applyFleetQualityStyle(marker, halo, lv, statusStyle) {
+  const s = statusStyle || STATUS[lv.status] || defaultStatus;
+  const degraded = lv.route_source === 'hold' || !!lv.stale_reason;
+  const anomalous = lv.anomaly_state === 'anomalous';
+  marker.setStyle({
+    fillColor: s.color,
+    color: anomalous ? '#f85149' : (degraded ? '#f0883e' : '#ffffff'),
+    fillOpacity: degraded ? .82 : .95,
+    weight: anomalous ? 2.5 : 1.6,
+  });
+  halo?.setStyle({
+    fillColor: anomalous ? '#f85149' : s.color,
+    fillOpacity: degraded ? .10 : .15,
+  });
 }
 
 /* ── Popup ──────────────────────────────────────────────────────────────── */
@@ -481,6 +508,9 @@ function buildPopup(lv) {
     <div class="popup-row"><span>Cap</span><strong>${(lv.heading_deg||0).toFixed(0)}°</strong></div>
     <div class="popup-row"><span>Précision GPS</span><strong>±${(lv.accuracy_m||0).toFixed(0)} m</strong></div>
     ${lv.distance_km!=null?`<div class="popup-row"><span>Distance centre</span><strong>${lv.distance_km.toFixed(2)} km</strong></div>`:''}
+    ${lv.route_source?`<div class="popup-row"><span>Route source</span><strong>${lv.route_source}</strong></div>`:''}
+    ${lv.anomaly_state && lv.anomaly_state !== 'ok' ? `<div class="popup-row"><span>Anomalie</span><strong>${lv.anomaly_state}</strong></div>` : ''}
+    ${lv.stale_reason?`<div class="popup-row"><span>Etat degrade</span><strong>${lv.stale_reason}</strong></div>`:''}
   </div>`;
 }
 
@@ -538,22 +568,112 @@ function parseIsoTimestampMs(ts) {
 function fleetInterpolatedPosition(state, now) {
   const span = Math.max(1, state.targetWall - state.startWall);
   const t = Math.max(0, Math.min(1, (now - state.startWall) / span));
-  return {
-    lat: state.fromLat + (state.targetLat - state.fromLat) * t,
-    lon: state.fromLon + (state.targetLon - state.fromLon) * t,
-  };
+  const path = state.path;
+  if (!path || path.length < 2) {
+    return { lat: state.targetLat, lon: state.targetLon };
+  }
+  const totalKm = state.totalKm || 0;
+  if (totalKm <= 0) {
+    const last = path[path.length - 1];
+    return { lat: last.lat, lon: last.lon };
+  }
+  const targetKm = t * totalKm;
+  let acc = 0;
+  for (let i = 0; i < path.length - 1; i++) {
+    const segKm = haversineKm(path[i].lat, path[i].lon, path[i + 1].lat, path[i + 1].lon);
+    if (acc + segKm >= targetKm || i === path.length - 2) {
+      const localT = segKm > 0 ? Math.max(0, Math.min(1, (targetKm - acc) / segKm)) : 1;
+      return {
+        lat: path[i].lat + (path[i + 1].lat - path[i].lat) * localT,
+        lon: path[i].lon + (path[i + 1].lon - path[i].lon) * localT,
+      };
+    }
+    acc += segKm;
+  }
+  const last = path[path.length - 1];
+  return { lat: last.lat, lon: last.lon };
 }
 
-function fleetDurationMs(fromLat, fromLon, toLat, toLon, sourceDeltaMs) {
-  const distanceKm = haversineKm(fromLat, fromLon, toLat, toLon);
+function pathLengthKm(path) {
+  let total = 0;
+  for (let i = 0; i < path.length - 1; i++) {
+    total += haversineKm(path[i].lat, path[i].lon, path[i + 1].lat, path[i + 1].lon);
+  }
+  return total;
+}
+
+function fleetRemainingPath(state, now, currentRendered) {
+  const fallback = [
+    { lat: currentRendered.lat, lon: currentRendered.lon },
+    { lat: state.targetLat, lon: state.targetLon },
+  ];
+  const path = Array.isArray(state?.path) ? state.path : [];
+  if (path.length < 2) return fallback;
+  const totalKm = Number(state?.totalKm || 0);
+  if (!(totalKm > 0)) return fallback;
+
+  const span = Math.max(1, state.targetWall - state.startWall);
+  const t = Math.max(0, Math.min(1, (now - state.startWall) / span));
+  const targetKm = t * totalKm;
+  let acc = 0;
+  for (let i = 0; i < path.length - 1; i++) {
+    const segKm = haversineKm(path[i].lat, path[i].lon, path[i + 1].lat, path[i + 1].lon);
+    if (acc + segKm >= targetKm || i === path.length - 2) {
+      const suffix = [{ lat: currentRendered.lat, lon: currentRendered.lon }];
+      const nextPoint = path[i + 1];
+      if (nextPoint && haversineKm(currentRendered.lat, currentRendered.lon, nextPoint.lat, nextPoint.lon) >= 0.003) {
+        suffix.push({ lat: nextPoint.lat, lon: nextPoint.lon });
+      }
+      for (let j = i + 2; j < path.length; j++) {
+        suffix.push({ lat: path[j].lat, lon: path[j].lon });
+      }
+      return suffix;
+    }
+    acc += segKm;
+  }
+  return fallback;
+}
+
+function buildFleetPath(state, lv, currentRendered, now) {
+  const DEDUPE_KM = 0.003;
+  const cleaned = [];
+  const pushPoint = (lat, lon) => {
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+    const prev = cleaned[cleaned.length - 1];
+    if (prev && haversineKm(prev.lat, prev.lon, lat, lon) < DEDUPE_KM) return;
+    cleaned.push({ lat, lon });
+  };
+  const suffix = state ? fleetRemainingPath(state, now, currentRendered) : [];
+  for (const p of suffix) {
+    if (!p) continue;
+    pushPoint(Number(p.lat), Number(p.lon));
+  }
+  const lastTs = state ? (state.lastServerTsMs ?? 0) : 0;
+  const track = Array.isArray(lv.recent_track) ? lv.recent_track : [];
+  for (const p of track) {
+    if (!p) continue;
+    const ts = parseIsoTimestampMs(p.ts);
+    if (ts != null && lastTs && ts <= lastTs) continue;
+    pushPoint(Number(p.lat), Number(p.lon));
+  }
+  pushPoint(lv.lat, lv.lon);
+  if (cleaned.length < 2) {
+    return [
+      { lat: lv.lat, lon: lv.lon },
+      { lat: lv.lat, lon: lv.lon },
+    ];
+  }
+  return cleaned;
+}
+
+function fleetDurationMs(pathKm) {
+  // Glide between polls on the real-time poll cadence. Server-side timestamp
+  // deltas are inflated by TLC_SPEED_FACTOR and must not drive the wall-clock
+  // animation budget.
   const speed = Math.max(10, FLEET_INTERP_TARGET_KMH || 24);
-  const travelMs = (distanceKm / speed) * 3600 * 1000;
-  const observedMs = Number.isFinite(sourceDeltaMs) && sourceDeltaMs > 250
-    ? sourceDeltaMs
-    : POLL_GPS;
-  const budgetMs = Math.max(observedMs * 0.9, travelMs);
-  const dynamicMax = Math.max(FLEET_INTERP_MAX_MS, observedMs * 2.0);
-  return Math.max(FLEET_INTERP_MIN_MS, Math.min(dynamicMax, budgetMs));
+  const travelMs = (pathKm / speed) * 3600 * 1000;
+  const budgetMs = Math.max(POLL_GPS * 0.95, travelMs);
+  return Math.max(FLEET_INTERP_MIN_MS, Math.min(FLEET_INTERP_MAX_MS, budgetMs));
 }
 
 function focusDurationMs(fromLat, fromLon, toLat, toLon, sourceDeltaMs) {
@@ -568,17 +688,78 @@ function focusDurationMs(fromLat, fromLon, toLat, toLon, sourceDeltaMs) {
   return Math.max(FOCUS_INTERP_MIN_MS, Math.min(dynamicMax, budgetMs));
 }
 
+function buildFocusPath(state, pos, currentRendered, trail, nextServerTsMs) {
+  const DEDUPE_KM = 0.003;
+  const cleaned = [];
+  let intermediateCount = 0;
+  const lastAcceptedTs = Number(state?.lastServerTsMs || 0);
+
+  const pushPoint = (lat, lon, ts = null) => {
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return false;
+    const prev = cleaned[cleaned.length - 1];
+    if (prev && haversineKm(prev.lat, prev.lon, lat, lon) < DEDUPE_KM) return false;
+    cleaned.push({ lat, lon, ts });
+    return true;
+  };
+
+  pushPoint(Number(currentRendered.lat), Number(currentRendered.lon), lastAcceptedTs || null);
+  const points = Array.isArray(trail) ? trail : [];
+  for (const point of points) {
+    if (!point) continue;
+    const ts = parseIsoTimestampMs(point.ts);
+    if (ts != null && lastAcceptedTs && ts <= lastAcceptedTs) continue;
+    if (pushPoint(Number(point.lat), Number(point.lon), ts)) {
+      intermediateCount += 1;
+    }
+  }
+  pushPoint(Number(pos.lat), Number(pos.lon), nextServerTsMs);
+
+  const jumpKm = haversineKm(
+    Number(currentRendered.lat),
+    Number(currentRendered.lon),
+    Number(pos.lat),
+    Number(pos.lon),
+  );
+  const totalKm = pathLengthKm(cleaned);
+  const hasIntermediate = intermediateCount > 0 && cleaned.length >= 3;
+  const safe = cleaned.length >= 2 && totalKm > 0 && (hasIntermediate || jumpKm <= FOCUS_FREEZE_JUMP_KM);
+
+  if (!safe) {
+    return {
+      accepted: false,
+      path: [
+        { lat: Number(currentRendered.lat), lon: Number(currentRendered.lon) },
+        { lat: Number(currentRendered.lat), lon: Number(currentRendered.lon) },
+      ],
+      totalKm: 0,
+      jumpKm,
+    };
+  }
+
+  return {
+    accepted: true,
+    path: cleaned.map(({ lat, lon }) => ({ lat, lon })),
+    totalKm,
+    jumpKm,
+  };
+}
+
 function upsertFleetMotion(lv, now) {
   const marker = markers.get(lv.livreur_id);
   if (!marker) return;
   const halo = halos.get(lv.livreur_id);
   const s = STATUS[lv.status] || defaultStatus;
   const nextServerTsMs = parseIsoTimestampMs(lv.ts);
+  const freezeMarker = lv.route_source === 'hold' || lv.anomaly_state === 'anomalous';
   let state = fleetMotion.get(lv.livreur_id);
   if (!state) {
+    const initPath = [
+      { lat: lv.lat, lon: lv.lon },
+      { lat: lv.lat, lon: lv.lon },
+    ];
     state = {
-      fromLat: lv.lat,
-      fromLon: lv.lon,
+      path: initPath,
+      totalKm: 0,
       targetLat: lv.lat,
       targetLon: lv.lon,
       startWall: now,
@@ -589,24 +770,33 @@ function upsertFleetMotion(lv, now) {
     fleetMotion.set(lv.livreur_id, state);
     marker.setLatLng([lv.lat, lv.lon]);
     halo?.setLatLng([lv.lat, lv.lon]);
-  } else {
-    const current = fleetInterpolatedPosition(state, now);
-    const sourceDeltaMs = (
-      nextServerTsMs != null
-      && state.lastServerTsMs != null
-      && nextServerTsMs > state.lastServerTsMs
-    ) ? (nextServerTsMs - state.lastServerTsMs) : null;
-    state.fromLat = current.lat;
-    state.fromLon = current.lon;
+  } else if (freezeMarker) {
+    state.path = [
+      { lat: lv.lat, lon: lv.lon },
+      { lat: lv.lat, lon: lv.lon },
+    ];
+    state.totalKm = 0;
     state.targetLat = lv.lat;
     state.targetLon = lv.lon;
     state.startWall = now;
-    state.targetWall = now + fleetDurationMs(current.lat, current.lon, lv.lat, lv.lon, sourceDeltaMs);
-    if (nextServerTsMs != null) state.lastServerTsMs = nextServerTsMs;
-    state.payload = lv;
+    state.targetWall = now + FLEET_INTERP_MIN_MS;
+    marker.setLatLng([lv.lat, lv.lon]);
+    halo?.setLatLng([lv.lat, lv.lon]);
+  } else {
+    const current = fleetInterpolatedPosition(state, now);
+    const path = buildFleetPath(state, lv, current, now);
+    const totalKm = pathLengthKm(path);
+    state.path = path;
+    state.totalKm = totalKm;
+    state.targetLat = lv.lat;
+    state.targetLon = lv.lon;
+    state.startWall = now;
+    state.targetWall = now + fleetDurationMs(totalKm);
   }
-  marker.setStyle({ fillColor: s.color });
-  halo?.setStyle({ fillColor: s.color });
+
+  if (nextServerTsMs != null) state.lastServerTsMs = nextServerTsMs;
+  state.payload = lv;
+  applyFleetQualityStyle(marker, halo, lv, s);
   if (marker.isPopupOpen()) marker.setPopupContent(buildPopup(lv));
 }
 
@@ -635,7 +825,9 @@ async function pollGPS() {
   gpsPollInFlight = true;
   try {
     const data = await fetchJson(
-      '/livreurs-proches?lat=40.7580&lon=-73.9855&rayon=20&limit=' + encodeURIComponent(String(FLEET_QUERY_LIMIT))
+      '/livreurs-proches?lat=40.7580&lon=-73.9855&rayon=20&limit='
+      + encodeURIComponent(String(FLEET_QUERY_LIMIT))
+      + '&track_points=' + encodeURIComponent(String(FLEET_TRACK_POINTS))
     );
     const livreurs = data.livreurs || [];
 
@@ -758,6 +950,8 @@ const focusState = {
   halo: null,
   trail: null,         // legacy single polyline — unused since trail coloring
   trailGroup: null,    // L.layerGroup holding one polyline per status run
+  path: null,
+  totalKm: 0,
   lastLat: null,
   lastLon: null,
   targetLat: null,
@@ -896,6 +1090,8 @@ function ensureFocusMarker(lat, lon, status) {
 function colorForTrailStatus(status) {
   switch ((status || '').toLowerCase()) {
     case 'delivering':      return '#4ade80'; // green — revenue leg
+    case 'pickup_assigned': return '#7dd3fc'; // light blue — mission assigned
+    case 'pickup_en_route': return '#38bdf8'; // blue — heading to pickup
     case 'repositioning':   return '#38bdf8'; // blue — empty leg
     case 'pickup_arrived':  return '#fbbf24'; // amber — at pickup
     case 'idle':
@@ -935,11 +1131,32 @@ function renderTrail(points) {
 
 function currentFocusInterpolated(now) {
   if (focusState.targetLat == null || focusState.targetLon == null) return null;
+  const path = Array.isArray(focusState.path) ? focusState.path : null;
+  if (!path || path.length < 2) {
+    return { lat: focusState.targetLat, lon: focusState.targetLon };
+  }
   const span = Math.max(100, focusState.targetUpdateWall - focusState.lastUpdateWall);
   const t = Math.max(0, Math.min(1, (now - focusState.lastUpdateWall) / span));
-  const lat = focusState.lastLat + (focusState.targetLat - focusState.lastLat) * t;
-  const lon = focusState.lastLon + (focusState.targetLon - focusState.lastLon) * t;
-  return { lat, lon };
+  const totalKm = Number(focusState.totalKm || 0);
+  if (!(totalKm > 0)) {
+    const last = path[path.length - 1];
+    return { lat: last.lat, lon: last.lon };
+  }
+  const targetKm = t * totalKm;
+  let acc = 0;
+  for (let i = 0; i < path.length - 1; i++) {
+    const segKm = haversineKm(path[i].lat, path[i].lon, path[i + 1].lat, path[i + 1].lon);
+    if (acc + segKm >= targetKm || i === path.length - 2) {
+      const localT = segKm > 0 ? Math.max(0, Math.min(1, (targetKm - acc) / segKm)) : 1;
+      return {
+        lat: path[i].lat + (path[i + 1].lat - path[i].lat) * localT,
+        lon: path[i].lon + (path[i + 1].lon - path[i].lon) * localT,
+      };
+    }
+    acc += segKm;
+  }
+  const last = path[path.length - 1];
+  return { lat: last.lat, lon: last.lon };
 }
 
 async function pollFocus() {
@@ -964,9 +1181,15 @@ async function pollFocus() {
       ensureFocusMarker(pos.lat, pos.lon, pos.status);
       const now = performance.now();
       const nextServerTsMs = parseIsoTimestampMs(pos.ts);
+      const freezeMarker = focusState.stale || pos.route_source === 'hold' || pos.anomaly_state === 'anomalous';
       if (focusState.lastLat == null) {
         focusState.lastLat = pos.lat;
         focusState.lastLon = pos.lon;
+        focusState.path = [
+          { lat: pos.lat, lon: pos.lon },
+          { lat: pos.lat, lon: pos.lon },
+        ];
+        focusState.totalKm = 0;
         focusState.marker.setLatLng([pos.lat, pos.lon]);
         focusState.halo.setLatLng([pos.lat, pos.lon]);
         focusState.targetLat = pos.lat;
@@ -975,7 +1198,6 @@ async function pollFocus() {
         focusState.targetUpdateWall = now + FOCUS_INTERP_MIN_MS;
         focusState.lastServerTsMs = nextServerTsMs;
       } else {
-        // Keep interpolation continuous even if polls are jittery.
         const current = currentFocusInterpolated(now);
         if (current) {
           focusState.lastLat = current.lat;
@@ -984,23 +1206,67 @@ async function pollFocus() {
           focusState.lastLat = focusState.targetLat != null ? focusState.targetLat : focusState.lastLat;
           focusState.lastLon = focusState.targetLon != null ? focusState.targetLon : focusState.lastLon;
         }
-        const sourceDeltaMs = (
-          nextServerTsMs != null
-          && focusState.lastServerTsMs != null
-          && nextServerTsMs > focusState.lastServerTsMs
-        ) ? (nextServerTsMs - focusState.lastServerTsMs) : null;
-        focusState.lastUpdateWall = now;
-        focusState.targetUpdateWall = now + focusDurationMs(
-          focusState.lastLat,
-          focusState.lastLon,
-          pos.lat,
-          pos.lon,
-          sourceDeltaMs,
-        );
-        if (nextServerTsMs != null) focusState.lastServerTsMs = nextServerTsMs;
+        const rendered = {
+          lat: focusState.lastLat,
+          lon: focusState.lastLon,
+        };
+        if (freezeMarker) {
+          const jumpKm = haversineKm(rendered.lat, rendered.lon, pos.lat, pos.lon);
+          const holdLat = jumpKm <= FOCUS_FREEZE_JUMP_KM ? pos.lat : rendered.lat;
+          const holdLon = jumpKm <= FOCUS_FREEZE_JUMP_KM ? pos.lon : rendered.lon;
+          focusState.path = [
+            { lat: holdLat, lon: holdLon },
+            { lat: holdLat, lon: holdLon },
+          ];
+          focusState.totalKm = 0;
+          focusState.targetLat = holdLat;
+          focusState.targetLon = holdLon;
+          focusState.lastUpdateWall = now;
+          focusState.targetUpdateWall = now + FOCUS_INTERP_MIN_MS;
+          focusState.marker.setLatLng([holdLat, holdLon]);
+          focusState.halo.setLatLng([holdLat, holdLon]);
+          if (nextServerTsMs != null && jumpKm <= FOCUS_FREEZE_JUMP_KM) {
+            focusState.lastServerTsMs = nextServerTsMs;
+          }
+        } else {
+          const motion = buildFocusPath(
+            focusState,
+            pos,
+            rendered,
+            d && Array.isArray(d.trail) ? d.trail : [],
+            nextServerTsMs,
+          );
+          if (motion.accepted) {
+            const sourceDeltaMs = (
+              nextServerTsMs != null
+              && focusState.lastServerTsMs != null
+              && nextServerTsMs > focusState.lastServerTsMs
+            ) ? (nextServerTsMs - focusState.lastServerTsMs) : null;
+            focusState.path = motion.path;
+            focusState.totalKm = motion.totalKm;
+            focusState.targetLat = pos.lat;
+            focusState.targetLon = pos.lon;
+            focusState.lastUpdateWall = now;
+            focusState.targetUpdateWall = now + focusDurationMs(
+              rendered.lat,
+              rendered.lon,
+              pos.lat,
+              pos.lon,
+              sourceDeltaMs,
+            );
+            if (nextServerTsMs != null) focusState.lastServerTsMs = nextServerTsMs;
+          } else {
+            focusState.path = motion.path;
+            focusState.totalKm = 0;
+            focusState.targetLat = rendered.lat;
+            focusState.targetLon = rendered.lon;
+            focusState.lastUpdateWall = now;
+            focusState.targetUpdateWall = now + FOCUS_INTERP_MIN_MS;
+            focusState.marker.setLatLng([rendered.lat, rendered.lon]);
+            focusState.halo.setLatLng([rendered.lat, rendered.lon]);
+          }
+        }
       }
-      focusState.targetLat = pos.lat;
-      focusState.targetLon = pos.lon;
       if (focusState.firstFit !== true) {
         map.setView([pos.lat, pos.lon], 14, { animate: false });
         focusState.firstFit = true;

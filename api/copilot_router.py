@@ -189,6 +189,8 @@ NYC_LON_MIN, NYC_LON_MAX = -74.27, -73.68
 NYC_CENTER_LAT, NYC_CENTER_LON = 40.7580, -73.9855
 ZONE_STEP = 0.02
 NYC_ZONE_CENTROID_PATHS = (
+    Path(__file__).resolve().parent / "context_poller" / "nyc_zone_centroids.json",
+    Path(__file__).resolve().parent / "tlc_replay" / "nyc_zone_centroids.json",
     Path(__file__).resolve().parent.parent / "context_poller" / "nyc_zone_centroids.json",
     Path(__file__).resolve().parent.parent / "tlc_replay" / "nyc_zone_centroids.json",
 )
@@ -990,6 +992,10 @@ def _resolve_zone_coordinates(zone_id: str | None) -> tuple[float, float] | None
     if not raw:
         return None
 
+    coords = _load_nyc_zone_centroids().get(raw)
+    if coords is not None:
+        return coords
+
     if raw.startswith("nyc_"):
         key = raw.split("_", 1)[1]
         coords = _load_nyc_zone_centroids().get(key)
@@ -1075,6 +1081,734 @@ def _dispatch_offer_summary(offer: dict[str, Any]) -> dict[str, Any]:
         "reasons": list(reasons) if isinstance(reasons, list) else [],
         "reason_codes": list(reason_codes) if isinstance(reason_codes, list) else [],
     }
+
+
+def _brief_safe_reason(label: str, exc: Exception) -> str:
+    if isinstance(exc, HTTPException):
+        detail = exc.detail
+        if isinstance(detail, str) and detail.strip():
+            return detail.strip()
+        return f"{label}_unavailable"
+    return f"{label}_unavailable"
+
+
+async def _brief_safe_call(label: str, coro) -> dict[str, Any]:
+    try:
+        data = await coro
+        return {"ok": True, "label": label, "data": data, "stale": False}
+    except Exception as exc:
+        logger.warning("copilot brief block '%s' unavailable: %s", label, exc)
+        return {
+            "ok": False,
+            "label": label,
+            "data": None,
+            "stale": True,
+            "unavailable_reason": _brief_safe_reason(label, exc),
+        }
+
+
+def _friendly_driver_brief_reason(reason: str | None, *, fallback: str | None = None) -> str | None:
+    text = str(reason or "").strip()
+    if not text:
+        return fallback
+    normalized = text.lower().replace("-", "_").replace(" ", "_")
+    mapping = {
+        "instant_dispatch_unavailable": "Live dispatch is warming up, so the copilot is using live market context.",
+        "dispatch_unavailable": "Live dispatch is warming up, so the copilot is using live market context.",
+        "dispatch_unavailable_unavailable": "Live dispatch is warming up, so the copilot is using live market context.",
+        "position_missing": "Live driver position is still warming up.",
+        "best_offers_around_unavailable": "Nearby offer ranking is refreshing. The site keeps a live fallback visible.",
+        "offers_unavailable": "Offer feed is refreshing. The site keeps a live fallback visible.",
+        "shift_timeout": "The long-range plan is refreshing, so the site is showing market-driven moves instead.",
+        "shift_plan_unavailable": "The long-range plan is refreshing, so the site is showing market-driven moves instead.",
+        "zone_contexts_unavailable": "Zone context is refreshing. The site keeps the latest live market view visible.",
+    }
+    for key, copy in mapping.items():
+        if key in normalized:
+            return copy
+    if fallback:
+        return fallback
+    humanized = text.replace("_", " ").strip()
+    return humanized[:1].upper() + humanized[1:] if humanized else None
+
+
+def _coord_pair(lat: Any, lon: Any) -> dict[str, float] | None:
+    out_lat = _finite_float_or_none(lat)
+    out_lon = _finite_float_or_none(lon)
+    if out_lat is None or out_lon is None:
+        return None
+    return {
+        "lat": round(float(out_lat), 6),
+        "lon": round(float(out_lon), 6),
+    }
+
+
+def _copy_selected_fields(source: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for field in fields:
+        if field in source:
+            out[field] = source.get(field)
+    return out
+
+
+def _append_unique_reason(reasons: list[str], text: str | None) -> None:
+    candidate = str(text or "").strip()
+    if not candidate:
+        return
+    lowered = candidate.lower()
+    if any(existing.lower() == lowered for existing in reasons):
+        return
+    reasons.append(candidate)
+
+
+def _traffic_level(traffic_factor: Any) -> str:
+    traffic = max(_as_float(traffic_factor, 1.0), 0.2)
+    if traffic >= 1.22:
+        return "Heavy"
+    if traffic >= 1.08:
+        return "Moderate"
+    return "Light"
+
+
+def _offer_decision_badge(offer: dict[str, Any]) -> str:
+    action = str(offer.get("recommendation_action") or offer.get("decision") or "").strip().lower()
+    if action in {"accept", "top_pick", "take"}:
+        return "Take"
+    if action in {"consider", "viable", "maybe"}:
+        return "Maybe"
+    accept_score = _as_float(offer.get("accept_score"), 0.0)
+    if accept_score >= 0.7:
+        return "Take"
+    if accept_score >= 0.45:
+        return "Maybe"
+    return "Skip"
+
+
+def _reason_code_copy(reason_code: str) -> str | None:
+    mapping = {
+        "GAIN_STRONG": "Strong earnings upside right now.",
+        "TIME_EFFICIENT": "Time efficiency is favorable on this route.",
+        "FUEL_EFFICIENT": "Fuel spend stays under control.",
+        "FUEL_HEAVY": "Fuel spend is meaningful on this run.",
+        "RISK_LOW": "Operational risk looks low.",
+        "RISK_HIGH": "Operational risk is elevated.",
+        "DECISION_CONFIDENT": "The copilot is confident in this recommendation.",
+        "PROFILE_BALANCED": "This option matches your current driving profile.",
+    }
+    return mapping.get(str(reason_code or "").strip().upper())
+
+
+def _coach_reasons_from_offer(offer: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    accept_score = _as_float(offer.get("accept_score"), 0.0)
+    target_gap = _as_float(offer.get("target_gap_eur_h"), 0.0)
+    fuel_cost = _as_float((offer.get("costs") or {}).get("fuel_cost_eur"), -1.0)
+    route_duration = _as_float(offer.get("route_duration_min"), 0.0)
+    distance_to_pickup = _as_float(offer.get("distance_to_pickup_km"), 0.0)
+    traffic_factor = max(_as_float(offer.get("traffic_factor"), 1.0), 0.2)
+
+    if accept_score >= 0.75:
+        _append_unique_reason(reasons, f"High copilot confidence ({round(accept_score * 100)}%).")
+    if target_gap >= 0.5:
+        _append_unique_reason(reasons, f"Above your target by {round(target_gap, 1)} EUR/h.")
+    if fuel_cost >= 0.0 and fuel_cost <= 1.8:
+        _append_unique_reason(reasons, f"Estimated fuel cost stays low at {round(fuel_cost, 2)} EUR.")
+    if route_duration > 0.0 and route_duration <= 18.0:
+        _append_unique_reason(reasons, f"Fast full route ({round(route_duration, 1)} min total).")
+    if distance_to_pickup > 0.0 and distance_to_pickup <= 1.5:
+        _append_unique_reason(reasons, f"Pickup is close ({round(distance_to_pickup, 1)} km away).")
+    if traffic_factor <= 1.08:
+        _append_unique_reason(reasons, "Traffic is still manageable on this route.")
+
+    for code in offer.get("reason_codes") or []:
+        _append_unique_reason(reasons, _reason_code_copy(str(code)))
+
+    for detail in offer.get("explanation_details") or []:
+        if not isinstance(detail, dict):
+            continue
+        if str(detail.get("impact") or "").lower() != "positive":
+            continue
+        label = str(detail.get("label") or "").strip()
+        if not label:
+            continue
+        _append_unique_reason(reasons, f"{label.capitalize()} supports taking it.")
+
+    for freeform in offer.get("explanation") or []:
+        text = str(freeform or "").replace("_", " ").strip()
+        if text:
+            _append_unique_reason(reasons, text[:1].upper() + text[1:] + ".")
+
+    if not reasons:
+        _append_unique_reason(reasons, "Balanced earnings, ETA, and fuel profile.")
+    return reasons[:3]
+
+
+def _coach_warning_from_offer(offer: dict[str, Any]) -> str | None:
+    target_gap = _as_float(offer.get("target_gap_eur_h"), 0.0)
+    fuel_cost = _as_float((offer.get("costs") or {}).get("fuel_cost_eur"), -1.0)
+    traffic_factor = max(_as_float(offer.get("traffic_factor"), 1.0), 0.2)
+    route_source = str(offer.get("route_source") or "estimated")
+    if traffic_factor >= 1.22:
+        return "Heavy traffic may stretch the ETA."
+    if fuel_cost >= 2.8:
+        return "Fuel burn is noticeable on this run."
+    if target_gap < -1.0:
+        return "This order sits below your current hourly target."
+    if route_source not in {"osrm", "hold"}:
+        return "Routing is estimated rather than OSRM-verified."
+    return None
+
+
+def _market_score(zone: dict[str, Any]) -> float:
+    demand = max(_as_float(zone.get("demand_index"), 0.0), 0.0)
+    supply = max(_as_float(zone.get("supply_index"), 1.0), 0.2)
+    return demand / supply
+
+
+def _zone_is_fresh(zone: dict[str, Any]) -> bool:
+    if _as_bool(zone.get("context_fallback_applied"), False):
+        return False
+    stale_sources = int(max(_as_float(zone.get("context_stale_sources"), 0.0), 0.0))
+    return stale_sources <= 2
+
+
+def _zone_market_summary(zone: dict[str, Any], *, market_score: float | None = None) -> dict[str, Any]:
+    zone_id = str(zone.get("zone_id") or "")
+    coords_payload = (
+        _coord_pair(zone.get("lat"), zone.get("lon"))
+        or _coord_pair(zone.get("zone_lat"), zone.get("zone_lon"))
+    )
+    coords = (coords_payload["lat"], coords_payload["lon"]) if coords_payload is not None else _resolve_zone_coordinates(zone_id)
+    if coords is None:
+        raise ValueError("zone_coordinates_unavailable")
+    demand = round(_as_float(zone.get("demand_index"), 1.0), 3)
+    supply = round(max(_as_float(zone.get("supply_index"), 1.0), 0.2), 3)
+    score = float(
+        market_score
+        if market_score is not None
+        else _as_float(zone.get("market_score"), _as_float(zone.get("opportunity_score"), _market_score(zone)))
+    )
+    return {
+        "zone_id": zone_id,
+        "lat": round(float(coords[0]), 6),
+        "lon": round(float(coords[1]), 6),
+        "market_score": round(score, 4),
+        "demand_index": demand,
+        "supply_index": supply,
+        "traffic_factor": round(max(_as_float(zone.get("traffic_factor"), 1.0), 0.2), 3),
+        "weather_factor": round(_as_float(zone.get("weather_factor"), 1.0), 3),
+        "event_pressure": round(max(_as_float(zone.get("event_pressure"), 0.0), 0.0), 4),
+        "label": "Hot right now" if score >= 1.2 else "Calm / low demand",
+        "stale": not _zone_is_fresh(zone),
+    }
+
+
+async def _hydrate_offer_geometry(redis_client: aioredis.Redis, offer: dict[str, Any]) -> dict[str, Any]:
+    enriched = dict(offer)
+    offer_id = str(offer.get("offer_id") or "").strip()
+    raw: dict[str, Any] = {}
+    if offer_id:
+        try:
+            raw = await redis_client.hgetall(f"{OFFER_KEY_PREFIX}{offer_id}")
+        except Exception:
+            raw = {}
+
+    pickup = _coord_pair(raw.get("pickup_lat"), raw.get("pickup_lon"))
+    dropoff = _coord_pair(raw.get("dropoff_lat"), raw.get("dropoff_lon"))
+    if pickup is not None:
+        enriched["pickup"] = pickup
+    if dropoff is not None:
+        enriched["dropoff"] = dropoff
+
+    if "zone" not in enriched:
+        zone_coords = _resolve_zone_coordinates(str(offer.get("zone_id") or ""))
+        if zone_coords is not None:
+            enriched["zone"] = {
+                "zone_id": str(offer.get("zone_id") or ""),
+                "lat": round(float(zone_coords[0]), 6),
+                "lon": round(float(zone_coords[1]), 6),
+            }
+    return enriched
+
+
+async def _build_offer_driver_brief(
+    redis_client: aioredis.Redis,
+    offer: dict[str, Any],
+    *,
+    traffic_factor: float | None = None,
+) -> dict[str, Any]:
+    enriched = await _hydrate_offer_geometry(redis_client, offer)
+    traffic = max(_as_float(traffic_factor if traffic_factor is not None else offer.get("traffic_factor"), 1.0), 0.2)
+    pickup_eta = _as_float(offer.get("eta_to_pickup_min"), _as_float(offer.get("distance_to_pickup_km"), 0.0) * 4.0)
+    full_eta = _as_float(offer.get("route_duration_min"), pickup_eta)
+    fuel_cost = _as_float((offer.get("costs") or {}).get("fuel_cost_eur"), 0.0)
+    return {
+        "kind": "offer",
+        "offer_id": offer.get("offer_id"),
+        "zone_id": offer.get("zone_id"),
+        "decision_badge": _offer_decision_badge(offer),
+        "accept_score": round(_as_float(offer.get("accept_score"), 0.0), 4),
+        "recommendation_score": round(
+            _as_float(offer.get("recommendation_score"), _as_float(offer.get("accept_score"), 0.0)),
+            4,
+        ),
+        "eur_per_hour_net": round(_as_float(offer.get("eur_per_hour_net"), 0.0), 2),
+        "estimated_net_eur": round(_as_float(offer.get("estimated_net_eur"), 0.0), 2),
+        "target_gap_eur_h": round(_as_float(offer.get("target_gap_eur_h"), 0.0), 2),
+        "fuel_cost_eur": round(fuel_cost, 2),
+        "pickup_eta_min": round(pickup_eta, 2),
+        "full_eta_min": round(full_eta, 2),
+        "traffic_factor": round(traffic, 3),
+        "traffic_level": _traffic_level(traffic),
+        "route_source": offer.get("route_source"),
+        "route_distance_km": round(_as_float(offer.get("route_distance_km"), 0.0), 3),
+        "route_duration_min": round(_as_float(offer.get("route_duration_min"), 0.0), 2),
+        "pickup": enriched.get("pickup"),
+        "dropoff": enriched.get("dropoff"),
+        "zone": enriched.get("zone"),
+        "coach_headline": (
+            f"Best order now: +{round(_as_float(offer.get('target_gap_eur_h'), 0.0), 1)} EUR/h above target"
+            if _as_float(offer.get("target_gap_eur_h"), 0.0) >= 0.5
+            else "Best order right now with balanced profit and ETA"
+        ),
+        "coach_reasons": _coach_reasons_from_offer(offer),
+        "coach_warning": _coach_warning_from_offer(offer),
+        "reason_codes": list(offer.get("reason_codes") or []),
+        "raw": _copy_selected_fields(
+            offer,
+            (
+                "decision",
+                "recommendation_action",
+                "recommendation_score",
+                "objective_score",
+                "score_breakdown",
+                "explanation",
+                "explanation_details",
+                "costs",
+            ),
+        ),
+    }
+
+
+def _build_reposition_driver_brief(reposition: dict[str, Any]) -> dict[str, Any]:
+    eta_min = _as_float(reposition.get("eta_min"), 0.0)
+    net_gain = _as_float(reposition.get("net_gain_vs_stay_eur_h"), 0.0)
+    forecast_pressure = _as_float(reposition.get("forecast_pressure_ratio"), 0.0)
+    traffic = max(_as_float(reposition.get("traffic_factor"), 1.0), 0.2)
+    reasons: list[str] = []
+    if _as_float(reposition.get("dispatch_score"), 0.0) >= 0.65:
+        _append_unique_reason(reasons, "This is the strongest nearby market move.")
+    if net_gain > 0.0:
+        _append_unique_reason(reasons, f"Projected upside beats staying put by {round(net_gain, 1)} EUR/h.")
+    if eta_min > 0.0 and eta_min <= 12.0:
+        _append_unique_reason(reasons, f"Reposition ETA stays short at {round(eta_min, 1)} min.")
+    if forecast_pressure >= 1.1:
+        _append_unique_reason(reasons, f"Demand should outpace supply soon ({round(forecast_pressure, 2)}x).")
+    if not reasons:
+        _append_unique_reason(reasons, "Balanced reposition with controlled time and fuel cost.")
+    warning = None
+    if traffic >= 1.22:
+        warning = "Traffic is building on the reposition leg."
+    elif _as_float(reposition.get("reposition_total_cost_eur"), 0.0) >= 3.0:
+        warning = "Reposition cost is material, so only move if demand keeps rising."
+    return {
+        "kind": "reposition",
+        "zone_id": reposition.get("zone_id"),
+        "decision_badge": "Take",
+        "accept_score": round(_as_float(reposition.get("dispatch_score"), 0.0), 4),
+        "recommendation_score": round(_as_float(reposition.get("dispatch_score"), 0.0), 4),
+        "eur_per_hour_net": round(_as_float(reposition.get("risk_adjusted_potential_eur_h"), 0.0), 2),
+        "estimated_net_eur": round(_as_float(reposition.get("net_gain_vs_stay_eur_h"), 0.0), 2),
+        "target_gap_eur_h": round(net_gain, 2),
+        "fuel_cost_eur": round(_as_float(reposition.get("travel_cost_eur"), 0.0), 2),
+        "pickup_eta_min": round(eta_min, 2),
+        "full_eta_min": round(eta_min, 2),
+        "traffic_factor": round(traffic, 3),
+        "traffic_level": _traffic_level(traffic),
+        "route_source": reposition.get("route_source"),
+        "route_distance_km": round(_as_float(reposition.get("route_distance_km"), 0.0), 3),
+        "route_duration_min": round(eta_min, 2),
+        "pickup": None,
+        "dropoff": _coord_pair(reposition.get("zone_lat"), reposition.get("zone_lon")),
+        "zone": {
+            "zone_id": reposition.get("zone_id"),
+            "lat": round(_as_float(reposition.get("zone_lat"), 0.0), 6),
+            "lon": round(_as_float(reposition.get("zone_lon"), 0.0), 6),
+        },
+        "coach_headline": f"Move now: zone {reposition.get('zone_id')} is heating up",
+        "coach_reasons": reasons[:3],
+        "coach_warning": warning,
+        "reason_codes": ["REPOSITION_UPSIDE", "ZONE_FORECAST"],
+        "raw": _copy_selected_fields(
+            reposition,
+            (
+                "dispatch_score",
+                "forecast_pressure_ratio",
+                "forecast_volatility",
+                "reposition_total_cost_eur",
+                "travel_cost_eur",
+                "time_cost_eur",
+                "risk_adjusted_potential_eur_h",
+                "net_gain_vs_stay_eur_h",
+            ),
+        ),
+    }
+
+
+def _build_hold_driver_brief(next_zone: dict[str, Any] | None, *, warning: str | None = None) -> dict[str, Any]:
+    zone_hint = str((next_zone or {}).get("zone_id") or "the next active zone")
+    reasons = [
+        "Current nearby orders do not clear your target right now.",
+        "Holding avoids fuel burn while demand rebuilds.",
+    ]
+    if next_zone:
+        reasons.append(f"If demand improves, the next watch zone is {zone_hint}.")
+    return {
+        "kind": "hold",
+        "zone_id": (next_zone or {}).get("zone_id"),
+        "decision_badge": "Hold",
+        "accept_score": 0.0,
+        "recommendation_score": 0.0,
+        "eur_per_hour_net": 0.0,
+        "estimated_net_eur": 0.0,
+        "target_gap_eur_h": 0.0,
+        "fuel_cost_eur": 0.0,
+        "pickup_eta_min": None,
+        "full_eta_min": None,
+        "traffic_factor": round(_as_float((next_zone or {}).get("traffic_factor"), 1.0), 3),
+        "traffic_level": _traffic_level((next_zone or {}).get("traffic_factor")),
+        "route_source": "hold",
+        "route_distance_km": 0.0,
+        "route_duration_min": 0.0,
+        "pickup": None,
+        "dropoff": _coord_pair((next_zone or {}).get("lat"), (next_zone or {}).get("lon")),
+        "zone": (
+            {
+                "zone_id": (next_zone or {}).get("zone_id"),
+                "lat": round(_as_float((next_zone or {}).get("lat"), 0.0), 6),
+                "lon": round(_as_float((next_zone or {}).get("lon"), 0.0), 6),
+            }
+            if next_zone
+            else None
+        ),
+        "coach_headline": "Hold position and wait for the next strong order",
+        "coach_reasons": reasons[:3],
+        "coach_warning": warning or "No order currently beats a smart wait-and-see move.",
+        "reason_codes": ["HOLD"],
+        "raw": {},
+    }
+
+
+async def _driver_live_summary(redis_client: aioredis.Redis, driver_id: str) -> dict[str, Any]:
+    raw = await redis_client.hgetall(f"{COURIER_HASH_PREFIX}{driver_id}")
+    parsed = _parse_fleet_driver(driver_id, raw) if raw else None
+    try:
+        offer_ids = await redis_client.lrange(f"{DRIVER_OFFERS_PREFIX}{driver_id}:offers", 0, 2)
+    except Exception:
+        offer_ids = []
+
+    available = parsed is not None
+    status = (
+        str((parsed or {}).get("status") or raw.get("status") or "offline")
+        if raw
+        else "offline"
+    )
+    return {
+        "driver_id": driver_id,
+        "available": available,
+        "status": status,
+        "offer_count": len(offer_ids or []),
+        "opportunity_score": _as_float((parsed or {}).get("opportunity_score"), 0.0),
+        "lat": (parsed or {}).get("lat"),
+        "lon": (parsed or {}).get("lon"),
+        "zone_id": (parsed or {}).get("zone_id") or raw.get("zone_id") if raw else None,
+    }
+
+
+def _driver_brief_alias_rank(summary: dict[str, Any]) -> float:
+    if not summary.get("available"):
+        return -1.0
+    offer_count = int(max(_as_float(summary.get("offer_count"), 0.0), 0.0))
+    status = str(summary.get("status") or "").lower()
+    status_bonus = 0.0
+    if status in {"available", "idle"}:
+        status_bonus = 8.0
+    elif status in {"pickup", "pickup_en_route", "pickup_assigned", "pickup_arrived"}:
+        status_bonus = 6.0
+    elif status in {"repositioning"}:
+        status_bonus = 5.0
+    elif status in {"delivering"}:
+        status_bonus = 4.0
+    return (100.0 if offer_count > 0 else 0.0) + (offer_count * 12.0) + (_as_float(summary.get("opportunity_score"), 0.0) * 10.0) + status_bonus
+
+
+async def _scan_driver_keys(redis_client: aioredis.Redis) -> list[str]:
+    keys: list[str] = []
+    try:
+        async for key in redis_client.scan_iter(match=f"{COURIER_HASH_PREFIX}*", count=200):
+            keys.append(key)
+    except TypeError:
+        async for key in redis_client.scan_iter(match=f"{COURIER_HASH_PREFIX}*"):
+            keys.append(key)
+    return keys
+
+
+async def _select_driver_brief_context(redis_client: aioredis.Redis, requested_driver_id: str) -> dict[str, Any]:
+    requested = await _driver_live_summary(redis_client, requested_driver_id)
+    requested_actionable = bool(requested.get("available")) and int(requested.get("offer_count") or 0) > 0
+    if requested_actionable:
+        return {
+            "requested_driver_id": requested_driver_id,
+            "source_driver_id": requested_driver_id,
+            "alias_active": False,
+            "requested_summary": requested,
+            "source_summary": requested,
+            "note": None,
+        }
+
+    candidates: list[dict[str, Any]] = []
+    for key in await _scan_driver_keys(redis_client):
+        driver_key = key if isinstance(key, str) else key.decode()
+        driver_id = driver_key.replace(COURIER_HASH_PREFIX, "", 1)
+        if not driver_id or driver_id == requested_driver_id:
+            continue
+        summary = await _driver_live_summary(redis_client, driver_id)
+        if not summary.get("available"):
+            continue
+        candidates.append(summary)
+        if len(candidates) >= 80:
+            break
+
+    candidates.sort(
+        key=lambda summary: (-_driver_brief_alias_rank(summary), str(summary.get("driver_id") or "")),
+    )
+    source = candidates[0] if candidates else requested
+    alias_active = str(source.get("driver_id") or "") != requested_driver_id
+    note = None
+    if alias_active:
+        if int(requested.get("offer_count") or 0) <= 0 and not requested.get("available"):
+            note = "The demo account is linked to a live fleet feed so the jury always sees a real mission."
+        elif int(requested.get("offer_count") or 0) <= 0:
+            note = "The demo account has no active order yet, so the site is showing the strongest live driver feed."
+        else:
+            note = "The site is following a live fleet feed to keep the current route and market context visible."
+
+    return {
+        "requested_driver_id": requested_driver_id,
+        "source_driver_id": str(source.get("driver_id") or requested_driver_id),
+        "alias_active": alias_active,
+        "requested_summary": requested,
+        "source_summary": source,
+        "note": note,
+    }
+
+
+def _zone_candidate_market_score(zone: dict[str, Any]) -> float:
+    return max(
+        _as_float(
+            zone.get("market_score"),
+            _as_float(zone.get("opportunity_score"), _as_float(zone.get("forecast_pressure_ratio"), _market_score(zone))),
+        ),
+        0.0,
+    )
+
+
+def _zone_candidate_coords(zone: dict[str, Any]) -> dict[str, float] | None:
+    direct = _coord_pair(zone.get("lat"), zone.get("lon")) or _coord_pair(zone.get("zone_lat"), zone.get("zone_lon"))
+    if direct is not None:
+        return direct
+    coords = _resolve_zone_coordinates(str(zone.get("zone_id") or ""))
+    if coords is None:
+        return None
+    return {"lat": round(float(coords[0]), 6), "lon": round(float(coords[1]), 6)}
+
+
+def _build_market_reposition_driver_brief(
+    zone: dict[str, Any] | None,
+    *,
+    target_hourly_eur: float,
+    fuel_price_eur_l: float,
+    consumption_l_100km: float,
+    warning: str | None = None,
+) -> dict[str, Any] | None:
+    if not isinstance(zone, dict):
+        return None
+    zone_id = str(zone.get("zone_id") or "").strip()
+    coords = _zone_candidate_coords(zone)
+    market_score = _zone_candidate_market_score(zone)
+    if not zone_id or coords is None or market_score < 1.02:
+        return None
+
+    distance_km = max(_as_float(zone.get("distance_km"), _as_float(zone.get("route_distance_km"), 0.0)), 0.0)
+    eta_min = max(_as_float(zone.get("reposition_time_min"), _as_float(zone.get("eta_min"), 0.0)), 0.0)
+    if eta_min <= 0.0 and distance_km > 0.0:
+        eta_min = (distance_km / max(REPOSITION_BASE_SPEED_KMH, 1.0)) * 60.0
+
+    fuel_cost = _as_float(zone.get("reposition_cost_eur"), _as_float(zone.get("travel_cost_eur"), 0.0))
+    if fuel_cost <= 0.0 and distance_km > 0.0:
+        fuel_cost = distance_km * (consumption_l_100km / 100.0) * fuel_price_eur_l
+
+    uplift = max((market_score - 1.0) * 7.0, 0.5 if market_score >= 1.08 else 0.0)
+    potential_eur_h = max(target_hourly_eur + uplift, target_hourly_eur)
+    dispatch_score = _clamp(
+        0.46 + max(market_score - 1.0, 0.0) * 0.28 + (0.05 if eta_min > 0.0 and eta_min <= 12.0 else 0.0),
+        0.42,
+        0.94,
+    )
+    payload = {
+        "zone_id": zone_id,
+        "zone_lat": coords["lat"],
+        "zone_lon": coords["lon"],
+        "dispatch_score": round(dispatch_score, 4),
+        "risk_adjusted_potential_eur_h": round(potential_eur_h, 2),
+        "net_gain_vs_stay_eur_h": round(max(potential_eur_h - target_hourly_eur, 0.0), 2),
+        "travel_cost_eur": round(max(fuel_cost, 0.0), 2),
+        "eta_min": round(max(eta_min, 0.0), 2),
+        "route_distance_km": round(max(distance_km, 0.0), 3),
+        "route_source": "market_fallback",
+        "traffic_factor": round(max(_as_float(zone.get("traffic_factor"), 1.0), 0.2), 3),
+        "forecast_pressure_ratio": round(max(market_score, 0.0), 4),
+        "reposition_total_cost_eur": round(max(fuel_cost, 0.0), 2),
+    }
+    brief = _build_reposition_driver_brief(payload)
+    brief["decision_badge"] = "Take" if dispatch_score >= 0.68 else "Maybe"
+    brief["coach_headline"] = f"Best market move: {zone_id} is heating up"
+    brief["coach_warning"] = warning or "Live dispatch is catching up, so this move is derived from market context."
+    brief["route_source"] = "market_fallback"
+    return brief
+
+
+def _build_market_shift_items(
+    zones: list[dict[str, Any]],
+    *,
+    target_hourly_eur: float,
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for zone in zones:
+        if not isinstance(zone, dict):
+            continue
+        zone_id = str(zone.get("zone_id") or "").strip()
+        if not zone_id or zone_id in seen:
+            continue
+        coords = _zone_candidate_coords(zone)
+        if coords is None:
+            continue
+        seen.add(zone_id)
+        market_score = _zone_candidate_market_score(zone)
+        eta_min = max(_as_float(zone.get("reposition_time_min"), _as_float(zone.get("eta_min"), 0.0)), 0.0)
+        why_now = (
+            f"Demand is outrunning supply in {zone_id}."
+            if market_score >= 1.1
+            else f"{zone_id} is the next watch zone if local demand strengthens."
+        )
+        reasons = [
+            f"Market score sits at {round(market_score, 2)}.",
+            (
+                f"Estimated reposition stays manageable at {round(eta_min, 1)} minutes."
+                if eta_min > 0.0
+                else "The copilot can pivot here as soon as demand firms up."
+            ),
+            f"This move protects a {round(target_hourly_eur, 1)} EUR/h target.",
+        ]
+        items.append(
+            {
+                "zone_id": zone_id,
+                "shift_score": round(max(market_score, 0.0), 3),
+                "estimated_net_eur_h": round(max(target_hourly_eur + max(market_score - 1.0, 0.0) * 6.5, target_hourly_eur), 2),
+                "eta_min": round(eta_min, 2) if eta_min > 0.0 else None,
+                "confidence": round(_clamp(0.44 + max(market_score - 1.0, 0.0) * 0.24, 0.35, 0.86), 4),
+                "why_now": why_now,
+                "reasons": reasons[:3],
+                "context_fallback_applied": True,
+            }
+        )
+        if len(items) >= 3:
+            break
+    for idx, item in enumerate(items, start=1):
+        item["rank"] = idx
+    return items
+
+
+def _gbfs_zone_to_market_summary(zone: dict[str, Any], *, hot: bool) -> dict[str, Any] | None:
+    zone_id = str(zone.get("zone_id") or "").strip()
+    coords = _resolve_zone_coordinates(zone_id)
+    if not zone_id or coords is None:
+        return None
+    demand_boost = max(_as_float(zone.get("demand_boost"), 0.0), 0.0)
+    occupancy_ratio = _clamp(_as_float(zone.get("occupancy_ratio"), 0.5), 0.0, 1.0)
+    stations_count = max(int(_as_float(zone.get("stations_count"), 0.0)), 0)
+    demand_index = 1.0 + (demand_boost * 2.6)
+    supply_index = max((1.0 - demand_boost) + 0.35, 0.2)
+    market_score = demand_index / supply_index
+    if not hot:
+        demand_index = max(0.35, 1.15 - (demand_boost * 1.8))
+        supply_index = max(1.0 + occupancy_ratio, 0.2)
+        market_score = demand_index / supply_index
+    return {
+        "zone_id": zone_id,
+        "lat": round(float(coords[0]), 6),
+        "lon": round(float(coords[1]), 6),
+        "market_score": round(market_score, 4),
+        "demand_index": round(demand_index, 3),
+        "supply_index": round(supply_index, 3),
+        "traffic_factor": 1.0,
+        "weather_factor": 1.0,
+        "event_pressure": round(demand_boost, 4),
+        "label": "Hot right now" if hot else "Calm / low demand",
+        "stale": False,
+        "stations_count": stations_count,
+    }
+
+
+def _build_quality_badges(health: dict[str, Any] | None) -> list[dict[str, str]]:
+    if not isinstance(health, dict):
+        return [{"code": "health_partial", "label": "System snapshot partial", "tone": "warn"}]
+
+    badges: list[dict[str, str]] = []
+    model_gate = health.get("model_quality_gate") or {}
+    tlc_replay = health.get("tlc_replay") or {}
+    fuel_ctx = health.get("fuel_context") or {}
+    data_quality = health.get("data_quality") or {}
+
+    badges.append(
+        {
+            "code": "model_gate",
+            "label": "Model gate OK" if bool(model_gate.get("accepted", True)) else "Model gate flagged",
+            "tone": "good" if bool(model_gate.get("accepted", True)) else "warn",
+        }
+    )
+
+    linear_fallback = int(_as_float(tlc_replay.get("route_linear_fallback"), 0.0))
+    hold_fallback = int(_as_float(tlc_replay.get("route_hold_fallback"), 0.0))
+    route_errors = int(_as_float(tlc_replay.get("route_osrm_errors"), 0.0))
+    routing_green = linear_fallback == 0 and hold_fallback == 0 and route_errors == 0
+    badges.append(
+        {
+            "code": "routing_quality",
+            "label": "Routing green" if routing_green else "Routing degraded",
+            "tone": "good" if routing_green else "warn",
+        }
+    )
+
+    fuel_status = str(fuel_ctx.get("fuel_sync_status") or "")
+    badges.append(
+        {
+            "code": "fuel_sync",
+            "label": "Fuel synced" if fuel_status in {"ok", "fresh"} else "Fuel cached",
+            "tone": "good" if fuel_status in {"ok", "fresh"} else "warn",
+        }
+    )
+
+    stale_count = int(_as_float(data_quality.get("stale_sources_count"), 0.0))
+    badges.append(
+        {
+            "code": "context_freshness",
+            "label": "Context fresh" if stale_count <= 1 else f"{stale_count} stale sources",
+            "tone": "good" if stale_count <= 1 else "warn",
+        }
+    )
+    return badges
 
 
 def _forecast_zone_metrics(
@@ -1667,6 +2401,14 @@ async def copilot_web() -> FileResponse:
     if page.exists():
         return FileResponse(str(page), media_type="text/html")
     raise HTTPException(status_code=404, detail="copilot PWA page not found")
+
+
+@copilot_router.get("/driver-app", include_in_schema=False)
+async def driver_copilot_web() -> FileResponse:
+    page = Path(__file__).parent / "static" / "driver_app" / "index.html"
+    if page.exists():
+        return FileResponse(str(page), media_type="text/html")
+    raise HTTPException(status_code=404, detail="driver copilot demo page not found")
 
 
 @copilot_router.post("/score-offer", response_model=ScoreOfferResponse)
@@ -2887,6 +3629,10 @@ async def _load_zone_context_payloads(redis_client: aioredis.Redis) -> list[dict
         if not zone:
             continue
         context_payload = _zone_context_payload(zone)
+        coords = _resolve_zone_coordinates(str(context_payload.get("zone_id") or ""))
+        if coords is not None:
+            context_payload["lat"] = round(float(coords[0]), 6)
+            context_payload["lon"] = round(float(coords[1]), 6)
         demand = float(context_payload.get("demand_index") or 1.0)
         supply = max(float(context_payload.get("supply_index") or 1.0), 0.2)
         weather = float(context_payload.get("weather_factor") or 1.0)
@@ -3254,6 +4000,410 @@ async def next_best_zone(
         "max_distance_km": max_distance_km,
         "count": len(enriched),
         "recommendations": enriched[:top_k],
+    }
+
+
+@copilot_router.get("/driver/{driver_id}/copilot-brief")
+async def driver_copilot_brief(request: Request, driver_id: str):
+    redis_client: aioredis.Redis = request.app.state.redis
+    normalized_driver_id = _normalize_driver_id_or_422(driver_id)
+    demo_context = await _select_driver_brief_context(redis_client, normalized_driver_id)
+    effective_driver_id = str(demo_context.get("source_driver_id") or normalized_driver_id)
+
+    results = await asyncio.gather(
+        _brief_safe_call("profile", get_driver_profile(request, normalized_driver_id)),
+        _brief_safe_call(
+            "position",
+            driver_position(request, effective_driver_id, include_zone_context=True),
+        ),
+        _brief_safe_call(
+            "best_offers_around",
+            best_offers_around(
+                request,
+                effective_driver_id,
+                lat=None,
+                lon=None,
+                radius_km=4.0,
+                limit=3,
+                scan_limit=120,
+                min_accept_score=0.0,
+                target_hourly_net_eur=None,
+                rank_by="recommendation",
+                w_gain=None,
+                w_time=None,
+                w_fuel=None,
+                use_osrm=True,
+            ),
+        ),
+        _brief_safe_call(
+            "offers",
+            driver_offers(
+                request,
+                effective_driver_id,
+                limit=6,
+                min_accept_score=0.0,
+                target_hourly_net_eur=None,
+                sort_by="objective",
+                w_gain=None,
+                w_time=None,
+                w_fuel=None,
+                use_osrm=False,
+            ),
+        ),
+        _brief_safe_call(
+            "instant_dispatch",
+            instant_dispatch(
+                request,
+                effective_driver_id,
+                lat=None,
+                lon=None,
+                around_radius_km=4.0,
+                around_limit=3,
+                scan_limit=120,
+                zone_top_k=3,
+                min_accept_score=0.0,
+                max_reposition_eta_min=DEFAULT_MAX_REPOSITION_ETA_MIN,
+                forecast_horizon_min=DEFAULT_DISPATCH_FORECAST_HORIZON_MIN,
+                dispatch_strategy="balanced",
+                target_hourly_net_eur=None,
+                use_osrm=True,
+            ),
+        ),
+        _brief_safe_call(
+            "next_best_zone",
+            next_best_zone(
+                request,
+                effective_driver_id,
+                top_k=6,
+                lat=None,
+                lon=None,
+                home_lat=None,
+                home_lon=None,
+                max_distance_km=None,
+                distance_weight=0.0,
+            ),
+        ),
+        _brief_safe_call(
+            "shift_plan",
+            shift_plan(
+                request,
+                effective_driver_id,
+                horizon_min=60,
+                top_k=3,
+                lat=None,
+                lon=None,
+                max_distance_km=None,
+                distance_weight=0.3,
+                target_hourly_net_eur=None,
+                use_osrm=True,
+            ),
+        ),
+        _brief_safe_call("fuel_context", fuel_context(request)),
+        _brief_safe_call("health", copilot_health(request)),
+        _brief_safe_call("zone_contexts", _load_zone_context_payloads(redis_client)),
+        _brief_safe_call("gbfs_zones", gbfs_zones(request, top_k=12)),
+    )
+    blocks = {result["label"]: result for result in results}
+
+    profile_result = blocks["profile"]
+    position_result = blocks["position"]
+    around_result = blocks["best_offers_around"]
+    offers_result = blocks["offers"]
+    dispatch_result = blocks["instant_dispatch"]
+    next_zone_result = blocks["next_best_zone"]
+    shift_result = blocks["shift_plan"]
+    fuel_result = blocks["fuel_context"]
+    health_result = blocks["health"]
+    zone_contexts_result = blocks["zone_contexts"]
+    gbfs_result = blocks["gbfs_zones"]
+
+    profile = (
+        profile_result["data"]
+        if profile_result["ok"] and isinstance(profile_result["data"], dict)
+        else _normalize_driver_profile(None, driver_id=normalized_driver_id, source_hint="default")
+    )
+    position = (
+        position_result["data"]
+        if position_result["ok"] and isinstance(position_result["data"], dict)
+        else {
+            "driver_id": normalized_driver_id,
+            "available": False,
+            "status": "offline",
+            "lat": None,
+            "lon": None,
+            "zone_id": None,
+            "zone_cell": None,
+            "zone_context": None,
+        }
+    )
+    position["driver_id"] = normalized_driver_id
+    position["source_driver_id"] = effective_driver_id
+    position["aliased_live_feed"] = bool(demo_context.get("alias_active"))
+
+    zone_contexts_raw = zone_contexts_result["data"] if zone_contexts_result["ok"] else []
+    zone_contexts = [zone for zone in zone_contexts_raw if isinstance(zone, dict)]
+    gbfs_payload = gbfs_result["data"] if gbfs_result["ok"] and isinstance(gbfs_result["data"], dict) else {}
+    gbfs_items = [zone for zone in gbfs_payload.get("zones", []) if isinstance(zone, dict)]
+    zone_index = {
+        str(zone.get("zone_id") or ""): zone
+        for zone in zone_contexts
+        if isinstance(zone, dict) and str(zone.get("zone_id") or "")
+    }
+
+    around_payload = around_result["data"] if around_result["ok"] and isinstance(around_result["data"], dict) else {}
+    offers_payload = offers_result["data"] if offers_result["ok"] and isinstance(offers_result["data"], dict) else {}
+    dispatch_payload = (
+        dispatch_result["data"] if dispatch_result["ok"] and isinstance(dispatch_result["data"], dict) else {}
+    )
+    next_zone_payload = (
+        next_zone_result["data"] if next_zone_result["ok"] and isinstance(next_zone_result["data"], dict) else {}
+    )
+
+    around_offers = [offer for offer in around_payload.get("offers", []) if isinstance(offer, dict)]
+    plain_offers = [offer for offer in offers_payload.get("offers", []) if isinstance(offer, dict)]
+    next_zone_items = [zone for zone in next_zone_payload.get("recommendations", []) if isinstance(zone, dict)]
+    fuel_payload = fuel_result["data"] if fuel_result["ok"] and isinstance(fuel_result["data"], dict) else {}
+    health_payload = health_result["data"] if health_result["ok"] and isinstance(health_result["data"], dict) else {}
+    target_hourly_eur = _as_float(profile.get("target_eur_h"), DRIVER_PROFILE_DEFAULT_TARGET_EUR_H)
+    consumption_l_100km = _as_float(profile.get("consommation_l_100"), DRIVER_PROFILE_DEFAULT_CONSUMPTION_L_100)
+    fuel_price_eur_l = _as_float(fuel_payload.get("fuel_price_eur_l"), DEFAULT_FUEL_PRICE_EUR_L)
+
+    fresh_zone_contexts = [zone for zone in zone_contexts if _resolve_zone_coordinates(str(zone.get("zone_id") or ""))]
+    fresh_zones = [zone for zone in fresh_zone_contexts if _zone_is_fresh(zone)]
+    effective_market_pool = fresh_zones if fresh_zones else fresh_zone_contexts
+    ranked_hot = sorted(
+        effective_market_pool,
+        key=lambda zone: (-_market_score(zone), str(zone.get("zone_id") or "")),
+    )
+    ranked_calm = sorted(
+        effective_market_pool,
+        key=lambda zone: (_market_score(zone), str(zone.get("zone_id") or "")),
+    )
+
+    hot_zones: list[dict[str, Any]] = []
+    for zone in ranked_hot:
+        try:
+            hot_zones.append(_zone_market_summary(zone, market_score=_market_score(zone)))
+        except ValueError:
+            continue
+        if len(hot_zones) >= 5:
+            break
+
+    calm_zones: list[dict[str, Any]] = []
+    for zone in ranked_calm:
+        try:
+            calm_zones.append(_zone_market_summary(zone, market_score=_market_score(zone)))
+        except ValueError:
+            continue
+        if len(calm_zones) >= 5:
+            break
+
+    if not hot_zones:
+        for zone in next_zone_items:
+            try:
+                hot_zones.append(_zone_market_summary(zone, market_score=_zone_candidate_market_score(zone)))
+            except ValueError:
+                continue
+            if len(hot_zones) >= 5:
+                break
+    if not hot_zones:
+        for zone in gbfs_items[:5]:
+            summary = _gbfs_zone_to_market_summary(zone, hot=True)
+            if summary is None:
+                continue
+            hot_zones.append(summary)
+            if len(hot_zones) >= 5:
+                break
+    if not calm_zones:
+        for zone in sorted(gbfs_items, key=lambda item: (_as_float(item.get("demand_boost"), 0.0), str(item.get("zone_id") or ""))):
+            summary = _gbfs_zone_to_market_summary(zone, hot=False)
+            if summary is None:
+                continue
+            calm_zones.append(summary)
+            if len(calm_zones) >= 5:
+                break
+
+    best_reposition_raw = dispatch_payload.get("reposition_option")
+    best_reposition = (
+        _build_reposition_driver_brief(best_reposition_raw)
+        if isinstance(best_reposition_raw, dict)
+        else None
+    )
+    market_warning = _friendly_driver_brief_reason(
+        dispatch_result.get("unavailable_reason"),
+        fallback="Live dispatch is catching up, so the site is using live market context.",
+    )
+    if best_reposition is None:
+        best_reposition = _build_market_reposition_driver_brief(
+            next_zone_items[0] if next_zone_items else (hot_zones[0] if hot_zones else None),
+            target_hourly_eur=target_hourly_eur,
+            fuel_price_eur_l=fuel_price_eur_l,
+            consumption_l_100km=consumption_l_100km,
+            warning=market_warning,
+        )
+
+    primary_recommendation: dict[str, Any]
+    alternatives: list[dict[str, Any]] = []
+
+    if around_offers:
+        zone_id = str(around_offers[0].get("zone_id") or "")
+        primary_recommendation = await _build_offer_driver_brief(
+            redis_client,
+            around_offers[0],
+            traffic_factor=(zone_index.get(zone_id) or {}).get("traffic_factor"),
+        )
+        for offer in around_offers[1:3]:
+            alt_zone_id = str(offer.get("zone_id") or "")
+            alternatives.append(
+                await _build_offer_driver_brief(
+                    redis_client,
+                    offer,
+                    traffic_factor=(zone_index.get(alt_zone_id) or {}).get("traffic_factor"),
+                )
+            )
+    elif plain_offers:
+        zone_id = str(plain_offers[0].get("zone_id") or "")
+        primary_recommendation = await _build_offer_driver_brief(
+            redis_client,
+            plain_offers[0],
+            traffic_factor=(zone_index.get(zone_id) or {}).get("traffic_factor"),
+        )
+        for offer in plain_offers[1:3]:
+            alt_zone_id = str(offer.get("zone_id") or "")
+            alternatives.append(
+                await _build_offer_driver_brief(
+                    redis_client,
+                    offer,
+                    traffic_factor=(zone_index.get(alt_zone_id) or {}).get("traffic_factor"),
+                )
+            )
+    elif best_reposition is not None:
+        primary_recommendation = best_reposition
+        reposition_candidates = [
+            candidate
+            for candidate in dispatch_payload.get("reposition_candidates", [])
+            if isinstance(candidate, dict)
+        ]
+        if reposition_candidates:
+            for candidate in reposition_candidates[1:3]:
+                alternatives.append(_build_reposition_driver_brief(candidate))
+        else:
+            for zone in next_zone_items[1:3]:
+                fallback_brief = _build_market_reposition_driver_brief(
+                    zone,
+                    target_hourly_eur=target_hourly_eur,
+                    fuel_price_eur_l=fuel_price_eur_l,
+                    consumption_l_100km=consumption_l_100km,
+                    warning=market_warning,
+                )
+                if fallback_brief is not None:
+                    alternatives.append(fallback_brief)
+    else:
+        next_zone_summary = None
+        if next_zone_items:
+            first_zone = next_zone_items[0]
+            next_zone_summary = {
+                "zone_id": first_zone.get("zone_id"),
+                "lat": first_zone.get("lat"),
+                "lon": first_zone.get("lon"),
+                "traffic_factor": first_zone.get("traffic_factor"),
+            }
+        elif hot_zones:
+            next_zone_summary = hot_zones[0]
+        hold_warning = None
+        if dispatch_result["stale"]:
+            hold_warning = _friendly_driver_brief_reason(dispatch_result.get("unavailable_reason"))
+        elif around_result["stale"] and offers_result["stale"]:
+            hold_warning = "Offer feeds are partial, so the app is holding a cached stance."
+        primary_recommendation = _build_hold_driver_brief(next_zone_summary, warning=hold_warning)
+
+    if len(alternatives) < 3 and best_reposition is not None and primary_recommendation.get("kind") != "reposition":
+        alternatives.append(best_reposition)
+    alternatives = alternatives[:3]
+
+    shift_block = {
+        "count": 0,
+        "items": [],
+        "stale": True,
+        "unavailable_reason": _friendly_driver_brief_reason(shift_result.get("unavailable_reason")),
+        "source": "shift_plan_unavailable",
+    }
+    if shift_result["ok"] and isinstance(shift_result["data"], dict):
+        shift_data = dict(shift_result["data"])
+        shift_data["items"] = [item for item in shift_data.get("items", []) if isinstance(item, dict)][:3]
+        shift_data["stale"] = False
+        shift_data["unavailable_reason"] = None
+        shift_data["source"] = "shift_plan"
+        shift_block = shift_data
+
+    if shift_block.get("count", 0) <= 0:
+        shift_candidates: list[dict[str, Any]] = []
+        if next_zone_items:
+            shift_candidates.extend(next_zone_items)
+        if not shift_candidates:
+            shift_candidates.extend(hot_zones)
+        shift_items = _build_market_shift_items(shift_candidates, target_hourly_eur=target_hourly_eur)
+        if shift_items:
+            shift_block = {
+                "count": len(shift_items),
+                "items": shift_items,
+                "stale": True,
+                "source": "market_fallback",
+                "unavailable_reason": _friendly_driver_brief_reason(
+                    shift_result.get("unavailable_reason"),
+                    fallback="Shift plan is refreshing, so the site is showing the best live market moves instead.",
+                ),
+            }
+
+    source_states = {
+        result["label"]: {
+            "stale": bool(result.get("stale")),
+            "unavailable_reason": _friendly_driver_brief_reason(result.get("unavailable_reason")),
+        }
+        for result in results
+    }
+
+    return {
+        "driver": {
+            "driver_id": normalized_driver_id,
+            "status": position.get("status") or "offline",
+            "profile": profile,
+            "position": position,
+            "fuel_context": fuel_payload,
+            "stale": bool(profile_result.get("stale") or position_result.get("stale")),
+            "unavailable_reason": (
+                _friendly_driver_brief_reason(profile_result.get("unavailable_reason"))
+                or _friendly_driver_brief_reason(position_result.get("unavailable_reason"))
+            ),
+        },
+        "primary_recommendation": primary_recommendation,
+        "alternatives": alternatives,
+        "zones": {
+            "hot_zones": hot_zones,
+            "calm_zones": calm_zones,
+            "best_reposition": best_reposition,
+            "stale": bool(zone_contexts_result.get("stale") or next_zone_result.get("stale") or gbfs_result.get("stale")),
+            "unavailable_reason": (
+                _friendly_driver_brief_reason(zone_contexts_result.get("unavailable_reason"))
+                or _friendly_driver_brief_reason(next_zone_result.get("unavailable_reason"))
+                or _friendly_driver_brief_reason(gbfs_result.get("unavailable_reason"))
+            ),
+        },
+        "shift": shift_block,
+        "demo_context": {
+            "requested_driver_id": normalized_driver_id,
+            "source_driver_id": effective_driver_id,
+            "alias_active": bool(demo_context.get("alias_active")),
+            "requested_offer_count": int((demo_context.get("requested_summary") or {}).get("offer_count") or 0),
+            "source_offer_count": int((demo_context.get("source_summary") or {}).get("offer_count") or 0),
+            "note": demo_context.get("note"),
+        },
+        "system": {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "stale": any(bool(result.get("stale")) for result in results),
+            "quality_badges": _build_quality_badges(health_payload),
+            "sources": source_states,
+        },
     }
 
 
@@ -3876,14 +5026,22 @@ def _report_to_pdf(report: dict) -> bytes:
     try:
         from fpdf import FPDF
     except ImportError:
-        raise HTTPException(status_code=501, detail="fpdf2 not installed")
+        raise HTTPException(status_code=501, detail="fpdf/fpdf2 not installed")
+
+    def _cell_line(pdf: FPDF, w: float, h: float, txt: str = "", **kwargs) -> None:
+        try:
+            pdf.cell(w, h, txt, new_x="LMARGIN", new_y="NEXT", **kwargs)
+        except TypeError:
+            kwargs.pop("new_x", None)
+            kwargs.pop("new_y", None)
+            pdf.cell(w, h, txt, ln=1, **kwargs)
 
     class _PDF(FPDF):
         def header(self):
             self.set_font("Helvetica", "B", 10)
             self.set_fill_color(30, 30, 30)
             self.set_text_color(255, 255, 255)
-            self.cell(0, 8, "FleetStream - Rapport de Session Copilot", fill=True, new_x="LMARGIN", new_y="NEXT", align="C")
+            _cell_line(self, 0, 8, "FleetStream - Rapport de Session Copilot", fill=True, align="C")
             self.set_text_color(0, 0, 0)
             self.ln(2)
 
@@ -3900,17 +5058,17 @@ def _report_to_pdf(report: dict) -> bytes:
 
     pdf.set_font("Helvetica", "B", 14)
     pdf.set_text_color(20, 20, 20)
-    pdf.cell(0, 10, f"Rapport de session - Chauffeur {report['driver_id']}", new_x="LMARGIN", new_y="NEXT", align="C")
+    _cell_line(pdf, 0, 10, f"Rapport de session - Chauffeur {report['driver_id']}", align="C")
     pdf.set_font("Helvetica", "I", 9)
     pdf.set_text_color(100, 100, 100)
-    pdf.cell(0, 6, f"Genere le {report['generated_at'][:10]}", new_x="LMARGIN", new_y="NEXT", align="C")
+    _cell_line(pdf, 0, 6, f"Genere le {report['generated_at'][:10]}", align="C")
     pdf.set_text_color(0, 0, 0)
     pdf.ln(4)
 
     # KPIs
     pdf.set_font("Helvetica", "B", 11)
     pdf.set_fill_color(240, 240, 240)
-    pdf.cell(0, 7, "KPIs de session", fill=True, new_x="LMARGIN", new_y="NEXT")
+    _cell_line(pdf, 0, 7, "KPIs de session", fill=True)
     pdf.ln(1)
 
     kpi_labels = {
@@ -3927,7 +5085,7 @@ def _report_to_pdf(report: dict) -> bytes:
         pdf.set_font("Helvetica", "", 9)
         pdf.cell(100, 6, label)
         pdf.set_font("Helvetica", "B", 9)
-        pdf.cell(0, 6, str(val) if val is not None else "N/A", new_x="LMARGIN", new_y="NEXT")
+        _cell_line(pdf, 0, 6, str(val) if val is not None else "N/A")
     pdf.ln(4)
 
     # Decisions table
@@ -3935,7 +5093,7 @@ def _report_to_pdf(report: dict) -> bytes:
     if decisions:
         pdf.set_font("Helvetica", "B", 11)
         pdf.set_fill_color(240, 240, 240)
-        pdf.cell(0, 7, f"Decisions ({len(decisions)} missions)", fill=True, new_x="LMARGIN", new_y="NEXT")
+        _cell_line(pdf, 0, 7, f"Decisions ({len(decisions)} missions)", fill=True)
         pdf.ln(1)
         cols = ["mission_id", "zone_id", "elapsed_min", "realized_delta_eur_h", "success"]
         widths = [50, 25, 25, 40, 25]
@@ -3955,9 +5113,10 @@ def _report_to_pdf(report: dict) -> bytes:
                 pdf.cell(w, 5, str(val)[:25] if val is not None else "", border=1, fill=fill)
             pdf.ln()
 
-    buf = io.BytesIO()
-    pdf.output(buf)
-    return buf.getvalue()
+    rendered = pdf.output(dest="S")
+    if isinstance(rendered, (bytes, bytearray)):
+        return bytes(rendered)
+    return str(rendered).encode("latin-1")
 
 
 @copilot_router.get("/driver/{driver_id}/session-report")
@@ -4043,6 +5202,91 @@ def _parse_fleet_driver(courier_id: str, state: dict) -> dict | None:
     }
 
 
+def _nearest_zone_context_for_point(
+    lat: float,
+    lon: float,
+    zone_points: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    best_zone: dict[str, Any] | None = None
+    best_distance = float("inf")
+    for zone in zone_points:
+        try:
+            zone_lat = float(zone.get("lat"))
+            zone_lon = float(zone.get("lon"))
+        except (TypeError, ValueError):
+            continue
+        distance = _haversine_km(lat, lon, zone_lat, zone_lon)
+        if distance < best_distance:
+            best_distance = distance
+            best_zone = zone
+    return best_zone
+
+
+def _fleet_best_action_from_score(opportunity_score: float) -> str:
+    if opportunity_score >= 0.7:
+        return "accept_next"
+    if opportunity_score >= 0.45:
+        return "reposition"
+    return "hold"
+
+
+def _enrich_fleet_driver_entry(
+    entry: dict[str, Any],
+    zone_index: dict[str, dict[str, Any]],
+    zone_points: list[dict[str, Any]],
+) -> dict[str, Any]:
+    zone_source = "redis"
+    zone_id = str(entry.get("zone_id") or "").strip() or "unknown"
+    zone_context = zone_index.get(zone_id)
+    if zone_context is None and (zone_id == "unknown" or float(entry.get("demand_index") or 0.0) <= 0.0):
+        zone_context = _nearest_zone_context_for_point(
+            float(entry.get("lat") or 0.0),
+            float(entry.get("lon") or 0.0),
+            zone_points,
+        )
+        if zone_context is not None:
+            zone_source = "nearest_zone_context"
+    elif zone_context is not None:
+        zone_source = "zone_context"
+
+    if zone_context is None:
+        return entry
+
+    enriched = dict(entry)
+    resolved_zone_id = str(zone_context.get("zone_id") or zone_id or "unknown")
+    enriched["zone_id"] = resolved_zone_id
+    enriched["zone_lat"] = zone_context.get("lat")
+    enriched["zone_lon"] = zone_context.get("lon")
+    enriched["zone_source"] = zone_source
+
+    for source_key in ("demand_index", "supply_index", "weather_factor", "traffic_factor"):
+        current_value = _as_float(enriched.get(source_key), 0.0)
+        if source_key in {"weather_factor", "traffic_factor"} and current_value > 0.0:
+            continue
+        if source_key in {"demand_index", "supply_index"} and current_value > 0.0:
+            continue
+        zone_value = zone_context.get(source_key)
+        if zone_value is not None:
+            enriched[source_key] = round(_as_float(zone_value, current_value), 4)
+
+    demand = _as_float(enriched.get("demand_index"), 0.0)
+    supply = max(_as_float(enriched.get("supply_index"), 0.5), 0.01)
+    pressure = demand / supply
+    opportunity_score = round(min(max(pressure / 5.0 * 0.6 + demand * 0.4, 0.0), 1.0), 3)
+    enriched["pressure_ratio"] = round(pressure, 4)
+    enriched["opportunity_score"] = opportunity_score
+    enriched["best_action"] = _fleet_best_action_from_score(opportunity_score)
+    return enriched
+
+
+def _fleet_driver_sort_key(entry: dict[str, Any]) -> tuple[float, str, str]:
+    return (
+        float(entry.get("opportunity_score") or 0.0),
+        str(entry.get("updated_at") or ""),
+        str(entry.get("courier_id") or ""),
+    )
+
+
 @copilot_router.get("/fleet/overview")
 async def fleet_overview(
     request: Request,
@@ -4054,6 +5298,18 @@ async def fleet_overview(
     """Vue agrégée flotte : top chauffeurs, scores opportunité, alertes."""
     redis_client: aioredis.Redis = request.app.state.redis
 
+    zone_contexts = await _load_zone_context_payloads(redis_client)
+    zone_index = {
+        str(item.get("zone_id") or ""): item
+        for item in zone_contexts
+        if isinstance(item, dict) and str(item.get("zone_id") or "")
+    }
+    zone_points = [
+        item
+        for item in zone_contexts
+        if isinstance(item, dict) and item.get("lat") is not None and item.get("lon") is not None
+    ]
+
     drivers: list[dict] = []
     async for key in redis_client.scan_iter(match=f"{COURIER_HASH_PREFIX}*", count=200):
         courier_id = key.replace(COURIER_HASH_PREFIX, "") if isinstance(key, str) else key.decode().replace(COURIER_HASH_PREFIX, "")
@@ -4063,6 +5319,7 @@ async def fleet_overview(
         entry = _parse_fleet_driver(courier_id, raw)
         if entry is None:
             continue
+        entry = _enrich_fleet_driver_entry(entry, zone_index, zone_points)
         if zone and entry["zone_id"] != zone:
             continue
         if status and entry["status"] != status:
@@ -4070,10 +5327,9 @@ async def fleet_overview(
         if entry["opportunity_score"] < min_score:
             continue
         drivers.append(entry)
-        if len(drivers) >= limit:
-            break
 
-    drivers.sort(key=lambda d: -d["opportunity_score"])
+    drivers = sorted(drivers, key=_fleet_driver_sort_key, reverse=True)
+    selected_drivers = drivers[:limit]
 
     # Aggregate fleet KPIs
     n = len(drivers)
@@ -4092,11 +5348,13 @@ async def fleet_overview(
 
     return {
         "active_drivers": n,
+        "drivers_returned": len(selected_drivers),
+        "truncated": n > len(selected_drivers),
         "avg_demand_index": avg_demand,
         "avg_pressure_ratio": avg_pressure,
         "top_zones": sorted(zone_counts.items(), key=lambda x: -x[1])[:5],
         "status_distribution": status_counts,
         "top_opportunities": top_opportunities,
         "alerts": alerts,
-        "drivers": drivers,
+        "drivers": selected_drivers,
     }

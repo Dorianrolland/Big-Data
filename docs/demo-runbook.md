@@ -20,7 +20,8 @@ make up && sleep 30 && python3 ml/backtest_copilot.py
 > Chaque offre de mission dure 8 secondes — le chauffeur accepte ou refuse.
 > Notre Copilot score chaque offre en <50 ms et recommande la meilleure action."
 
-Montrer : `http://localhost:8001/copilot` → PWA avec chip d'offre en direct.
+Montrer : `http://localhost:8001/copilot/driver-app` → app chauffeur Copilot dédiée.
+Secours si besoin : `http://localhost:8001/copilot` → PWA opérateur complète.
 
 ---
 
@@ -120,3 +121,38 @@ python3 -m pytest tests/ -q --tb=short
 | DLQ cold path      | 0 fichier| `ls data/dlq/`                 |
 | Tests unitaires    | 100% pass| `pytest tests/ -q`             |
 | Backtest CSV       | généré   | `data/reports/backtest_summary.csv` |
+
+---
+
+## Question Jury Probable : "Pourquoi vos métriques ML sont si hautes ?"
+
+### Réponse courte prête à dire
+
+> "Oui, les métriques sont très élevées, et on l'assume comme un point à challenger.
+> On a justement gardé ce signal visible dans `/copilot/health` avec un flag qualité
+> `temporal_auc_extremely_high` pour ne pas masquer le risque. Notre lecture honnête,
+> c'est que le problème est probablement très séparable sur cette fenêtre TLC, mais
+> qu'il faut encore vérifier plus profondément l'absence de fuite de variables ou un
+> train/test trop favorable avant d'en faire une promesse produit forte."
+
+### Les chiffres exacts à connaître
+
+- Modèle : `copilot_v2`
+- Entraîné le `2026-04-20T22:34:47Z`
+- Fenêtre d'entraînement : `2024-01-01` -> `2024-11-01`
+- Split déclaré : `temporal`
+- `roc_auc = 0.999490138364625`
+- `average_precision = 0.9985776645784981`
+- Flag qualité : `temporal_auc_extremely_high`
+
+### Si le jury insiste
+
+- "On ne présente pas ce score comme une vérité business définitive, mais comme un résultat expérimental très fort qui doit être audité."
+- "Le garde-fou important, c'est qu'on expose explicitement le `model_quality_gate` dans l'API au lieu de cacher ce type de signal."
+- "La vraie valeur de la soutenance est surtout l'architecture Big Data temps réel, la robustesse de la simulation, le hot path Redis, le cold path Parquet/DuckDB, et l'intégration du scoring dans la décision opérationnelle."
+
+### Ce qu'il ne faut pas dire
+
+- Ne pas dire : "le modèle est parfait"
+- Ne pas dire : "cela prouve qu'il généralisera en production"
+- Préférer : "résultat prometteur, mais encore à auditer sur la qualité du protocole d'évaluation"

@@ -121,6 +121,19 @@ def partition_dir(root: Path, dt: datetime | None) -> Path:
     return root / f"year={dt.year}" / f"month={dt.month:02d}" / f"day={dt.day:02d}" / f"hour={dt.hour:02d}"
 
 
+def _atomic_write_table(table: pa.Table, out_path: Path) -> None:
+    tmp_path = out_path.with_name(f".{out_path.stem}.{time.time_ns()}.tmp.parquet")
+    try:
+        pq.write_table(table, tmp_path, compression="snappy", row_group_size=10_000)
+        os.replace(tmp_path, out_path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
 def write_positions(records: list[dict]) -> None:
     buckets: dict[tuple[int, int, int, int] | None, list[dict]] = defaultdict(list)
     for rec in records:
@@ -152,7 +165,7 @@ def write_positions(records: list[dict]) -> None:
             schema=POSITION_SCHEMA,
         )
         out = folder / f"batch_{int(time.time() * 1000)}.parquet"
-        pq.write_table(table, out, compression="snappy", row_group_size=10_000)
+        _atomic_write_table(table, out)
 
 
 def write_events(records: list[dict]) -> None:
@@ -212,7 +225,7 @@ def write_events(records: list[dict]) -> None:
             schema=EVENT_SCHEMA,
         )
         out = folder / f"batch_{int(time.time() * 1000)}.parquet"
-        pq.write_table(table, out, compression="snappy", row_group_size=10_000)
+        _atomic_write_table(table, out)
 
 
 def parse_position(raw: bytes) -> dict:

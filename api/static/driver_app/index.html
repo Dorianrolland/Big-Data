@@ -1,0 +1,997 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>FleetStream Driver Copilot</title>
+  <meta name="theme-color" content="#141414" />
+  <meta name="description" content="Driver-facing copilot demo for FleetStream." />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Driver Copilot" />
+  <link rel="manifest" href="/static/driver_app/manifest.webmanifest" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    :root {
+      --bg: #111111;
+      --bg-soft: #191919;
+      --panel: rgba(26, 26, 26, 0.86);
+      --panel-strong: rgba(38, 38, 38, 0.96);
+      --line: rgba(255, 255, 255, 0.08);
+      --ink: #f4f1e8;
+      --ink-soft: #c8c2b4;
+      --muted: #978f81;
+      --amber: #ffb100;
+      --amber-soft: rgba(255, 177, 0, 0.16);
+      --cyan: #36d4d2;
+      --cyan-soft: rgba(54, 212, 210, 0.16);
+      --good: #51d98b;
+      --warn: #ff9d57;
+      --bad: #ff6f6f;
+      --radius-xl: 28px;
+      --radius-lg: 22px;
+      --radius-md: 16px;
+      --shadow: 0 22px 60px rgba(0, 0, 0, 0.42);
+      --font-ui: "Space Grotesk", "Avenir Next", "Segoe UI", sans-serif;
+      --font-display: "Space Grotesk", "Trebuchet MS", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      min-height: 100%;
+      background:
+        radial-gradient(circle at 18% 10%, rgba(255, 177, 0, 0.18), transparent 28%),
+        radial-gradient(circle at 84% 18%, rgba(54, 212, 210, 0.16), transparent 30%),
+        linear-gradient(180deg, #121212 0%, #0b0b0b 100%);
+      color: var(--ink);
+      font-family: var(--font-ui);
+    }
+
+    body {
+      padding: 18px;
+    }
+
+    .stage {
+      display: grid;
+      gap: 18px;
+      max-width: 1380px;
+      margin: 0 auto;
+      align-items: start;
+    }
+
+    .phone-shell {
+      position: relative;
+      width: min(100%, 430px);
+      margin: 0 auto;
+      background: linear-gradient(180deg, rgba(28, 28, 28, 0.98), rgba(14, 14, 14, 0.98));
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 34px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      min-height: calc(100vh - 36px);
+    }
+
+    .phone-shell::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background:
+        radial-gradient(circle at top, rgba(255, 177, 0, 0.1), transparent 30%),
+        radial-gradient(circle at bottom right, rgba(54, 212, 210, 0.1), transparent 32%);
+      pointer-events: none;
+    }
+
+    .notch {
+      position: absolute;
+      top: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 132px;
+      height: 28px;
+      background: #070707;
+      border-radius: 0 0 18px 18px;
+      z-index: 4;
+    }
+
+    .app {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      min-height: calc(100vh - 36px);
+      grid-template-rows: auto 1fr auto;
+    }
+
+    .topbar {
+      padding: 28px 18px 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .brand {
+      display: grid;
+      gap: 4px;
+    }
+
+    .brand-title {
+      font-family: var(--font-display);
+      font-size: 1.02rem;
+      font-weight: 800;
+      letter-spacing: 0.02em;
+    }
+
+    .brand-subtitle {
+      font-size: 0.78rem;
+      color: var(--ink-soft);
+    }
+
+    .topbar-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .ghost-button,
+    .solid-button,
+    .tab-button,
+    .preset-button {
+      border: none;
+      border-radius: 999px;
+      font-family: inherit;
+      cursor: pointer;
+      transition: transform 140ms ease, opacity 140ms ease, background 140ms ease;
+    }
+
+    .ghost-button:hover,
+    .solid-button:hover,
+    .tab-button:hover,
+    .preset-button:hover {
+      transform: translateY(-1px);
+    }
+
+    .ghost-button {
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--ink);
+      padding: 10px 12px;
+      font-size: 0.8rem;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    .solid-button {
+      background: linear-gradient(135deg, #ffbe1b 0%, #ef8e00 100%);
+      color: #18120a;
+      padding: 14px 16px;
+      font-size: 0.92rem;
+      font-weight: 800;
+      box-shadow: 0 16px 30px rgba(255, 177, 0, 0.22);
+    }
+
+    .solid-button.secondary {
+      background: linear-gradient(135deg, #47d8d5 0%, #1592b2 100%);
+      color: #061518;
+      box-shadow: 0 16px 30px rgba(54, 212, 210, 0.18);
+    }
+
+    .solid-button.subtle {
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--ink);
+      box-shadow: none;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    .screen {
+      display: none;
+      padding: 0 18px 22px;
+    }
+
+    .screen.active {
+      display: block;
+    }
+
+    .hero {
+      display: grid;
+      gap: 18px;
+      align-content: center;
+      min-height: calc(100vh - 170px);
+      padding-bottom: 42px;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      width: fit-content;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      color: var(--ink-soft);
+      font-size: 0.76rem;
+      letter-spacing: 0.02em;
+    }
+
+    .hero h1,
+    .view-title {
+      margin: 0;
+      font-family: var(--font-display);
+      line-height: 0.98;
+      letter-spacing: -0.03em;
+    }
+
+    .hero h1 {
+      font-size: clamp(2.5rem, 8vw, 4.4rem);
+    }
+
+    .hero p,
+    .supporting-copy {
+      margin: 0;
+      color: var(--ink-soft);
+      line-height: 1.5;
+    }
+
+    .login-card,
+    .onboarding-card,
+    .card,
+    .rail-card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-xl);
+      backdrop-filter: blur(10px);
+      box-shadow: var(--shadow);
+    }
+
+    .login-card,
+    .onboarding-card {
+      padding: 18px;
+      display: grid;
+      gap: 14px;
+    }
+
+    .input {
+      width: 100%;
+      border-radius: 16px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(255, 255, 255, 0.05);
+      color: var(--ink);
+      min-height: 48px;
+      padding: 12px 14px;
+      font: inherit;
+    }
+
+    .stack {
+      display: grid;
+      gap: 14px;
+    }
+
+    .preset-grid,
+    .detail-grid {
+      display: grid;
+      gap: 10px;
+    }
+
+    .preset-button {
+      text-align: left;
+      padding: 16px;
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--ink);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    .preset-button strong,
+    .metric-value,
+    .chip strong {
+      display: block;
+      font-weight: 800;
+    }
+
+    .preset-button span,
+    .muted,
+    .mini-copy {
+      display: block;
+      color: var(--muted);
+      font-size: 0.82rem;
+      line-height: 1.45;
+    }
+
+    .scroll-view {
+      display: grid;
+      gap: 14px;
+      padding-bottom: 92px;
+    }
+
+    .card {
+      padding: 16px;
+      display: grid;
+      gap: 14px;
+    }
+
+    .headline-card {
+      background:
+        linear-gradient(165deg, rgba(255, 177, 0, 0.16), rgba(54, 212, 210, 0.08)),
+        var(--panel-strong);
+    }
+
+    .chip-row,
+    .action-row,
+    .metric-row,
+    .reason-list,
+    .list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .chip {
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+      padding: 8px 10px;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      color: var(--ink-soft);
+    }
+
+    .chip.good { color: var(--good); }
+    .chip.warn { color: var(--warn); }
+    .chip.bad { color: var(--bad); }
+
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .metric {
+      padding: 12px;
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .metric-label {
+      color: var(--muted);
+      font-size: 0.76rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 6px;
+    }
+
+    .metric-value {
+      font-size: 1.12rem;
+      line-height: 1.08;
+    }
+
+    .reason-list .chip {
+      background: var(--amber-soft);
+      border-color: rgba(255, 177, 0, 0.16);
+      color: #ffd98f;
+    }
+
+    .warning {
+      padding: 12px 14px;
+      border-radius: 16px;
+      background: rgba(255, 157, 87, 0.12);
+      border: 1px solid rgba(255, 157, 87, 0.22);
+      color: #ffcba3;
+      font-size: 0.84rem;
+      line-height: 1.45;
+    }
+
+    .map {
+      width: 100%;
+      min-height: 220px;
+      border-radius: 22px;
+      overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      background: #0f172a;
+    }
+
+    .list-item {
+      display: grid;
+      gap: 10px;
+      padding: 14px;
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .list-item-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+    }
+
+    .list-title {
+      font-weight: 800;
+      font-size: 0.96rem;
+    }
+
+    .list-subtitle {
+      font-size: 0.82rem;
+      color: var(--ink-soft);
+    }
+
+    .mini-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .mini-stat {
+      padding: 10px;
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.04);
+      min-height: 68px;
+    }
+
+    .mini-stat .metric-label {
+      margin-bottom: 4px;
+    }
+
+    .empty-state {
+      padding: 18px;
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--ink-soft);
+      line-height: 1.5;
+      border: 1px dashed rgba(255, 255, 255, 0.08);
+    }
+
+    .tabbar {
+      position: sticky;
+      bottom: 0;
+      z-index: 5;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      padding: 14px 18px 18px;
+      background: linear-gradient(180deg, rgba(8, 8, 8, 0), rgba(8, 8, 8, 0.96) 40%);
+    }
+
+    .tab-button {
+      min-height: 52px;
+      padding: 10px 12px;
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--ink-soft);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      font-size: 0.8rem;
+      font-weight: 700;
+    }
+
+    .tab-button.active {
+      background: linear-gradient(135deg, rgba(255, 177, 0, 0.2), rgba(54, 212, 210, 0.14));
+      color: var(--ink);
+      border-color: rgba(255, 177, 0, 0.2);
+    }
+
+    .sheet {
+      position: fixed;
+      inset: auto 0 0;
+      z-index: 8;
+      padding: 20px 18px calc(18px + env(safe-area-inset-bottom));
+      background: rgba(9, 9, 9, 0.96);
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 28px 28px 0 0;
+      transform: translateY(110%);
+      transition: transform 180ms ease;
+      box-shadow: 0 -22px 60px rgba(0, 0, 0, 0.35);
+    }
+
+    .sheet.open {
+      transform: translateY(0);
+    }
+
+    .sheet-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+
+    .sheet-grid {
+      display: grid;
+      gap: 12px;
+    }
+
+    .label {
+      display: grid;
+      gap: 6px;
+      color: var(--ink-soft);
+      font-size: 0.8rem;
+    }
+
+    .status-line {
+      color: var(--ink-soft);
+      font-size: 0.8rem;
+      min-height: 1.1rem;
+    }
+
+    .rail {
+      display: none;
+      gap: 18px;
+    }
+
+    .rail-card {
+      padding: 18px;
+      display: grid;
+      gap: 12px;
+    }
+
+    .rail-title {
+      margin: 0;
+      font-size: 1rem;
+      font-weight: 800;
+    }
+
+    .rail-grid {
+      display: grid;
+      gap: 12px;
+    }
+
+    .footer-note {
+      color: var(--muted);
+      font-size: 0.74rem;
+      text-align: center;
+      padding-top: 6px;
+    }
+
+    @media (min-width: 1200px) {
+      body {
+        padding: 28px;
+      }
+
+      .stage {
+        grid-template-columns: minmax(430px, 480px) minmax(0, 1fr);
+      }
+
+      .phone-shell {
+        margin: 0;
+        min-height: calc(100vh - 56px);
+      }
+
+      .rail {
+        display: grid;
+      }
+    }
+
+    .desktop-nav {
+      display: none;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .desktop-nav .tab-button {
+      min-height: 42px;
+      padding-inline: 14px;
+    }
+
+    body {
+      padding: 20px;
+    }
+
+    .stage {
+      max-width: 1640px;
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .phone-shell {
+      width: 100%;
+      max-width: none;
+      margin: 0;
+      border-radius: 32px;
+      min-height: auto;
+      overflow: hidden;
+    }
+
+    .notch,
+    .rail,
+    .tabbar {
+      display: none !important;
+    }
+
+    .app {
+      min-height: auto;
+      grid-template-rows: auto 1fr;
+    }
+
+    .topbar {
+      padding: 24px 26px 18px;
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 16px;
+      align-items: center;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+      background: rgba(10, 10, 10, 0.72);
+      backdrop-filter: blur(14px);
+    }
+
+    .topbar-actions {
+      justify-content: flex-end;
+    }
+
+    .screen {
+      padding: 0 26px 26px;
+    }
+
+    #screenApp .scroll-view {
+      padding: 22px 0 18px;
+      display: grid;
+      grid-template-columns: repeat(12, minmax(0, 1fr));
+      gap: 18px;
+      align-items: start;
+    }
+
+    #screenApp .headline-card {
+      grid-column: 1 / -1;
+    }
+
+    #tabHome {
+      grid-column: 1 / span 7;
+    }
+
+    #tabOrders {
+      grid-column: 8 / span 5;
+    }
+
+    #tabZones {
+      grid-column: 1 / span 7;
+    }
+
+    #tabShift {
+      grid-column: 8 / span 5;
+    }
+
+    #screenApp .footer-note {
+      grid-column: 1 / -1;
+      text-align: left;
+      padding-top: 0;
+    }
+
+    .map {
+      min-height: 320px;
+    }
+
+    .metric-grid {
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+
+    .detail-grid {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .card .card {
+      background: rgba(255, 255, 255, 0.025);
+      box-shadow: none;
+    }
+
+    .warning {
+      background: rgba(54, 212, 210, 0.12);
+      border-color: rgba(54, 212, 210, 0.2);
+      color: #b6f2f1;
+    }
+
+    .hero {
+      min-height: calc(100vh - 210px);
+      max-width: 820px;
+      padding-bottom: 18px;
+    }
+
+    .sheet {
+      inset: 24px 24px auto auto;
+      width: min(430px, calc(100vw - 48px));
+      border-radius: 28px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      transform: translateX(120%);
+    }
+
+    .sheet.open {
+      transform: translateX(0);
+    }
+
+    @media (max-width: 1180px) {
+      .topbar {
+        grid-template-columns: 1fr;
+      }
+
+      .desktop-nav {
+        order: 3;
+      }
+
+      #screenApp .scroll-view {
+        grid-template-columns: minmax(0, 1fr);
+      }
+
+      #tabHome,
+      #tabOrders,
+      #tabZones,
+      #tabShift {
+        grid-column: 1 / -1;
+      }
+
+      .metric-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .detail-grid,
+      .mini-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .sheet {
+        inset: auto 0 0;
+        width: auto;
+        border-radius: 28px 28px 0 0;
+        transform: translateY(110%);
+      }
+
+      .sheet.open {
+        transform: translateY(0);
+      }
+    }
+
+    @media (min-width: 900px) {
+      .desktop-nav {
+        display: flex;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="stage">
+    <div class="phone-shell">
+      <div class="notch"></div>
+      <div class="app">
+        <header class="topbar">
+          <div class="brand">
+            <div class="brand-title">FleetStream Driver Copilot</div>
+            <div class="brand-subtitle" id="brandSubtitle">Demo account</div>
+          </div>
+          <div class="topbar-actions">
+            <button class="ghost-button" id="refreshButton" type="button">Refresh</button>
+            <button class="ghost-button" id="openProfileButton" type="button">Profile</button>
+          </div>
+          <nav class="desktop-nav" id="desktopNav" hidden>
+            <button class="tab-button active" data-tab="home" type="button">Overview</button>
+            <button class="tab-button" data-tab="orders" type="button">Orders</button>
+            <button class="tab-button" data-tab="zones" type="button">Zones</button>
+            <button class="tab-button" data-tab="shift" type="button">Shift</button>
+          </nav>
+        </header>
+
+        <main>
+          <section class="screen active" id="screenLogin">
+            <div class="hero">
+              <span class="eyebrow">Single-driver demo app</span>
+              <h1>Drive smarter. Pick better jobs.</h1>
+              <p>Step into the shoes of a new FleetStream driver. The copilot explains what to take, why to take it, how much fuel it burns, and where the city is heating up next.</p>
+              <div class="login-card">
+                <div>
+                  <div class="view-title">Demo login</div>
+                  <p class="supporting-copy">Use the prepared driver persona for the oral demo.</p>
+                </div>
+                <label class="label">
+                  Demo account
+                  <input class="input" id="loginEmail" type="email" value="alex.rivera@fleetstream.demo" />
+                </label>
+                <button class="solid-button" id="enterDemoButton" type="button">Enter demo account</button>
+                <div class="status-line">Demo account - no real authentication</div>
+              </div>
+            </div>
+          </section>
+
+          <section class="screen" id="screenOnboarding">
+            <div class="hero">
+              <span class="eyebrow">Quick onboarding</span>
+              <h1>Choose how Alex should drive tonight.</h1>
+              <p>One tap sets the driver profile and tunes the copilot for the demo flow.</p>
+              <div class="onboarding-card">
+                <div class="preset-grid">
+                  <button class="preset-button" data-preset="max_earnings" type="button">
+                    <strong>Max earnings</strong>
+                    <span>Push harder on upside. Higher target. Longer ETA tolerance.</span>
+                  </button>
+                  <button class="preset-button" data-preset="balanced" type="button">
+                    <strong>Balanced</strong>
+                    <span>Best default for the oral: solid profit, controlled fuel, stable ETA.</span>
+                  </button>
+                  <button class="preset-button" data-preset="low_fuel" type="button">
+                    <strong>Low fuel</strong>
+                    <span>Prefer short, cleaner moves and tighter pickup windows.</span>
+                  </button>
+                </div>
+                <div class="status-line" id="onboardingStatus">Balanced is recommended for the main demo story.</div>
+              </div>
+            </div>
+          </section>
+
+          <section class="screen" id="screenApp">
+            <div class="scroll-view">
+              <section class="card headline-card">
+                <div class="chip-row">
+                  <span class="chip"><strong id="driverName">Alex Rivera</strong></span>
+                  <span class="chip"><span id="driverVehicle">Toyota Prius Hybrid</span></span>
+                  <span class="chip warn" id="staleBadge">Live snapshot loading</span>
+                </div>
+                <div>
+                  <div class="view-title" id="homeHeadline">Best order right now</div>
+                  <p class="supporting-copy" id="homeSubheadline">The driver copilot is assembling your next move.</p>
+                </div>
+                <div class="warning" id="demoSourceBanner" hidden></div>
+                <div class="chip-row" id="qualityBadges"></div>
+              </section>
+
+              <section class="card" id="tabHome">
+                <div class="list-item">
+                  <div class="list-item-top">
+                    <div>
+                      <div class="list-title">Best order right now</div>
+                      <div class="list-subtitle" id="recommendationBadge">Waiting for the live recommendation</div>
+                    </div>
+                    <span class="chip good" id="recommendationKind">Offer</span>
+                  </div>
+                  <div class="metric-grid">
+                    <div class="metric"><div class="metric-label">Score</div><div class="metric-value" id="metricScore">-</div></div>
+                    <div class="metric"><div class="metric-label">Net EUR/h</div><div class="metric-value" id="metricProfit">-</div></div>
+                    <div class="metric"><div class="metric-label">Trip net</div><div class="metric-value" id="metricTripNet">-</div></div>
+                    <div class="metric"><div class="metric-label">Fuel cost</div><div class="metric-value" id="metricFuel">-</div></div>
+                    <div class="metric"><div class="metric-label">Pickup ETA</div><div class="metric-value" id="metricPickupEta">-</div></div>
+                    <div class="metric"><div class="metric-label">Full ETA</div><div class="metric-value" id="metricFullEta">-</div></div>
+                    <div class="metric"><div class="metric-label">Traffic</div><div class="metric-value" id="metricTraffic">-</div></div>
+                    <div class="metric"><div class="metric-label">Route source</div><div class="metric-value" id="metricRouteSource">-</div></div>
+                  </div>
+                  <div>
+                    <div class="metric-label">Why take it now</div>
+                    <div class="reason-list" id="homeReasons"></div>
+                  </div>
+                  <div class="warning" id="homeWarning" hidden></div>
+                  <div class="action-row">
+                    <button class="solid-button" id="takeJobButton" type="button">Take this job</button>
+                    <button class="solid-button secondary" id="compareButton" type="button">Compare options</button>
+                  </div>
+                </div>
+                <div class="card">
+                  <div class="list-item-top">
+                    <div>
+                      <div class="list-title">Driver route preview</div>
+                      <div class="list-subtitle">Driver position to pickup/dropoff or best reposition route.</div>
+                    </div>
+                  </div>
+                  <div class="map" id="homeMap"></div>
+                </div>
+                <div class="card" id="activeJobCard">
+                  <div class="list-item-top">
+                    <div>
+                      <div class="list-title">Active mission</div>
+                      <div class="list-subtitle" id="activeJobTitle">No accepted job yet.</div>
+                    </div>
+                    <span class="chip" id="activeJobStatus">Idle</span>
+                  </div>
+                  <p class="supporting-copy" id="activeJobMeta">Take the recommended job to lock it in for the demo story.</p>
+                  <div class="action-row">
+                    <button class="solid-button subtle" id="completeMissionButton" type="button">Mark completed</button>
+                    <button class="solid-button subtle" id="stopMissionButton" type="button">Stop mission</button>
+                  </div>
+                </div>
+              </section>
+
+              <section class="card" id="tabOrders">
+                <div class="list-item-top">
+                  <div>
+                    <div class="list-title">Top 3 recommendations</div>
+                    <div class="list-subtitle">Profit, fuel, ETA, and decision signal side by side.</div>
+                  </div>
+                </div>
+                <div class="stack" id="ordersList"></div>
+              </section>
+
+              <section class="card" id="tabZones">
+                <div class="list-item-top">
+                  <div>
+                    <div class="list-title">City demand map</div>
+                    <div class="list-subtitle">Hot and calm areas for the next move.</div>
+                  </div>
+                </div>
+                <div class="map" id="zonesMap"></div>
+                <div class="detail-grid">
+                  <div class="card">
+                    <div class="list-title">Hot right now</div>
+                    <div class="stack" id="hotZonesList"></div>
+                  </div>
+                  <div class="card">
+                    <div class="list-title">Calm / low demand</div>
+                    <div class="stack" id="calmZonesList"></div>
+                  </div>
+                  <div class="card">
+                    <div class="list-title">Best reposition</div>
+                    <div class="stack" id="bestRepositionCard"></div>
+                  </div>
+                </div>
+              </section>
+
+              <section class="card" id="tabShift">
+                <div class="list-item-top">
+                  <div>
+                    <div class="list-title">Shift plan</div>
+                    <div class="list-subtitle">60-minute outlook plus the local mission journal.</div>
+                  </div>
+                </div>
+                <div class="stack" id="shiftList"></div>
+                <div class="card">
+                  <div class="list-title">Mission journal</div>
+                  <div class="stack" id="journalList"></div>
+                </div>
+              </section>
+
+              <div class="footer-note" id="uxStatus">Ready for the driver demo.</div>
+            </div>
+          </section>
+        </main>
+
+        <nav class="tabbar" id="tabbar" hidden>
+          <button class="tab-button active" data-tab="home" type="button">Home</button>
+          <button class="tab-button" data-tab="orders" type="button">Orders</button>
+          <button class="tab-button" data-tab="zones" type="button">Zones</button>
+          <button class="tab-button" data-tab="shift" type="button">Shift</button>
+        </nav>
+      </div>
+    </div>
+
+    <aside class="rail">
+      <section class="rail-card">
+        <h2 class="rail-title">Stage mode</h2>
+        <p class="supporting-copy">The phone shell on the left is the demo hero. This right rail keeps a high-level view visible for the jury: market pulse, quality badges, and the recommended narrative.</p>
+        <div class="rail-grid">
+          <div class="card">
+            <div class="list-title">Narration cue</div>
+            <p class="supporting-copy" id="railNarration">Log in, apply the preset, show the best order, explain why, then switch to the zones tab.</p>
+          </div>
+          <div class="card">
+            <div class="list-title">Recommended move</div>
+            <div class="metric-grid">
+              <div class="metric"><div class="metric-label">Decision</div><div class="metric-value" id="railDecision">-</div></div>
+              <div class="metric"><div class="metric-label">Traffic</div><div class="metric-value" id="railTraffic">-</div></div>
+              <div class="metric"><div class="metric-label">Fuel</div><div class="metric-value" id="railFuel">-</div></div>
+              <div class="metric"><div class="metric-label">ETA</div><div class="metric-value" id="railEta">-</div></div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="list-title">Market pulse</div>
+            <div class="stack" id="railZones"></div>
+          </div>
+        </div>
+      </section>
+    </aside>
+  </div>
+
+  <aside class="sheet" id="profileSheet">
+    <div class="sheet-head">
+      <div>
+        <div class="view-title">Driver profile</div>
+        <p class="supporting-copy">Adjust the copilot without showing expert controls.</p>
+      </div>
+      <button class="ghost-button" id="closeProfileButton" type="button">Close</button>
+    </div>
+    <div class="sheet-grid">
+      <label class="label">Target EUR/h<input class="input" id="profileTarget" type="number" step="0.1" min="0" max="150" /></label>
+      <label class="label">Fuel consumption (L/100 km)<input class="input" id="profileFuel" type="number" step="0.1" min="2" max="30" /></label>
+      <label class="label">Risk aversion (0 to 1)<input class="input" id="profileRisk" type="number" step="0.01" min="0" max="1" /></label>
+      <label class="label">Max ETA (min)<input class="input" id="profileEta" type="number" step="0.1" min="3" max="60" /></label>
+      <button class="solid-button" id="saveProfileButton" type="button">Save profile</button>
+      <div class="status-line" id="profileStatus">Profile changes apply to the next refresh cycle.</div>
+    </div>
+  </aside>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="/static/driver_app/app.js"></script>
+</body>
+</html>

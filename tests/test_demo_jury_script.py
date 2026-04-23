@@ -37,6 +37,16 @@ def test_demo_jury_ps1_has_required_sections():
     assert "backtest" in content.lower()
     assert "KPI" in content or "kpi" in content.lower()
     assert "fleet/overview" in content
+    assert "accept_score" in content
+    assert "route_linear_fallback" in content
+    assert "route_hold_fallback" in content
+    assert "routing_quality_ok" in content
+
+
+def test_demo_run_ps1_uses_accept_score_contract():
+    content = _read_utf8(_DEMO_RUN)
+    assert "accept_score" in content
+    assert ".score" not in content
 
 
 def test_demo_jury_ps1_one_command():
@@ -45,6 +55,8 @@ def test_demo_jury_ps1_one_command():
     # Verify param block has all defaults
     assert 'ApiBase     = "http://localhost:8001"' in content
     assert 'WarmupSec      = 45' in content or 'WarmupSec' in content
+    assert '[switch]$Fleet       = $true' in content
+    assert '[int]$MinDrivers     = 140' in content
 
 
 def test_backtest_generates_csv():

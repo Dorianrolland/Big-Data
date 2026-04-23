@@ -47,16 +47,19 @@ Write-Host ""
 
 Write-Host "[1/5] Start Docker stack..." -ForegroundColor Yellow
 Set-Location $Root
-$routingArgs = @()
-$osrmData = Join-Path $Root "data\osrm\new-york-latest.osrm"
+$envArgs = @("--env-file", "env/fleet_jury.env")
+$routingArgs = @("--profile", "routing")
+$osrmData = Join-Path $Root "data\osrm\new-york-latest.osrm.properties"
 if (Test-Path $osrmData) {
-    $routingArgs = @("--profile", "routing")
     Write-Host "  routing profile enabled (local OSRM data found)" -ForegroundColor DarkGray
+} else {
+    Write-Error "Missing OSRM dataset: $osrmData"
+    exit 1
 }
 if ($SkipBuild) {
-    docker compose @routingArgs up -d
+    docker compose @envArgs @routingArgs up -d
 } else {
-    docker compose @routingArgs up --build -d
+    docker compose @envArgs @routingArgs up --build -d
 }
 if ($LASTEXITCODE -ne 0) {
     Write-Error "docker compose up failed"
@@ -88,8 +91,8 @@ $checks = @{}
 
 try {
     $perf = Invoke-RestMethod -Uri "$ApiBase/health/performance?samples=50" -TimeoutSec 10
-    $checks["hot_path_p99_ms"] = [math]::Round([double]$perf.p99_ms, 2)
-    $checks["hot_path_ok"] = ([double]$perf.p99_ms -lt 10.0)
+    $checks["hot_path_p99_ms"] = [math]::Round([double]$perf.geosearch_benchmark.p99_ms, 2)
+    $checks["hot_path_ok"] = ([double]$perf.geosearch_benchmark.p99_ms -lt 10.0)
 } catch {
     $checks["hot_path_ok"] = $false
 }
@@ -98,8 +101,8 @@ try {
     $score = Invoke-RestMethod -Uri "$ApiBase/copilot/score-offer" -Method Post -ContentType "application/json" `
         -Body '{"courier_id":"drv_demo_001","offer_id":"demo_offer_001","estimated_fare_eur":12.5,"estimated_distance_km":4.2,"estimated_duration_min":18,"zone_id":"Z01","demand_index":0.75,"supply_index":0.4}' `
         -TimeoutSec 10
-    $checks["score_ok"] = ($null -ne $score.score)
-    $checks["score_value"] = [math]::Round([double]$score.score, 3)
+    $checks["score_ok"] = ($null -ne $score.accept_score)
+    $checks["score_value"] = [math]::Round([double]$score.accept_score, 3)
 } catch {
     $checks["score_ok"] = $false
 }

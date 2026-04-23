@@ -215,3 +215,46 @@ def test_pick_fleet_driver_returns_none_when_pickup_is_unreachable(monkeypatch):
     )
 
     assert replay._pick_fleet_driver(trip) is None
+
+
+def test_pick_fleet_driver_prefers_route_aware_same_side_candidate_over_cross_river_shortcut(monkeypatch):
+    replay = replay_main.TLCReplay("2024-01")
+    monkeypatch.setattr(replay_main, "TLC_COURIER_ID_MODE", "fleet_pool")
+    monkeypatch.setattr(replay_main, "TLC_FLEET_DEMO_N_DRIVERS", 2)
+    monkeypatch.setattr(replay_main, "TLC_FLEET_REPOSITION_KMH", 20.0)
+    monkeypatch.setattr(replay_main, "TLC_FLEET_MAX_REPOSITION_MIN", 30.0)
+    monkeypatch.setattr(replay_main, "TLC_FLEET_PICKUP_GRACE_MIN", 5.0)
+    replay.fleet_pool_enabled = True
+    replay.fleet_driver_ids = ["drv_demo_001", "drv_demo_002"]
+    base_ts = datetime(2024, 1, 2, 11, 55, tzinfo=timezone.utc)
+    replay.zone_road_anchors = {
+        10: (40.7130, -73.9620),   # east of river
+        11: (40.7200, -73.9820),   # same Manhattan side
+        12: (40.7160, -73.9720),   # pickup zone
+    }
+    replay.fleet_driver_state = {
+        "drv_demo_001": (base_ts, 40.7130, -73.9620, 10),
+        "drv_demo_002": (base_ts, 40.7200, -73.9820, 11),
+    }
+
+    trip = replay_main.Trip(
+        trip_key="fleet_route_aware_cross_river",
+        courier_id="drv_demo_999",
+        offer_id="offer_fleet_route_aware_cross_river",
+        order_id="order_fleet_route_aware_cross_river",
+        request_ts=datetime(2024, 1, 2, 12, 0, tzinfo=timezone.utc),
+        pickup_ts=datetime(2024, 1, 2, 12, 8, tzinfo=timezone.utc),
+        dropoff_ts=datetime(2024, 1, 2, 12, 20, tzinfo=timezone.utc),
+        pu_loc=12,
+        do_loc=238,
+        pickup_lat=40.7160,
+        pickup_lon=-73.9720,
+        dropoff_lat=40.7420,
+        dropoff_lon=-73.9730,
+        trip_km=3.2,
+        trip_min=12.0,
+        fare_usd=12.0,
+    )
+
+    picked = replay._pick_fleet_driver(trip)
+    assert picked == "drv_demo_002"

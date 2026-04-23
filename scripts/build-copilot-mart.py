@@ -18,14 +18,17 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
 import duckdb
+import pyarrow.parquet as pq
 
 _ROOT = Path(__file__).resolve().parent.parent
+_VALID_TOPIC_FILES_CACHE: dict[tuple[str, str], list[Path]] = {}
 
 FUEL_PRICE_EUR_L = 1.85
 CONSUMPTION_L_100KM = 7.5
@@ -41,27 +44,67 @@ def _net_eur_sql() -> str:
 
 
 def _net_eur_h_sql() -> str:
-    return f"(CASE WHEN estimated_duration_min > 0 THEN {_net_eur_sql()} / (estimated_duration_min / 60.0) ELSE 0 END)"
+    return (
+        f"(CASE WHEN estimated_duration_min > 0 "
+        f"THEN GREATEST({_net_eur_sql()} / (estimated_duration_min / 60.0), 0.0) "
+        f"ELSE 0 END)"
+    )
 
 
 def _duck_path(path: Path) -> str:
     return str(path).replace("\\", "/").replace("'", "''")
 
 
-def _topic_glob(parquet_dir: Path, topic: str) -> str:
-    return _duck_path(parquet_dir / f"topic={topic}" / "**" / "*.parquet")
+def _quarantine_root(parquet_dir: Path) -> Path:
+    return parquet_dir.parent / "parquet_quarantine"
+
+
+def _quarantine_file(parquet_dir: Path, file_path: Path, exc: Exception) -> None:
+    quarantine_root = _quarantine_root(parquet_dir)
+    relative = file_path.relative_to(parquet_dir)
+    destination = quarantine_root / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        destination = destination.with_name(f"{destination.stem}_{int(datetime.now(timezone.utc).timestamp())}.parquet")
+    shutil.move(str(file_path), str(destination))
+    print(f"[mart] quarantined invalid parquet: {file_path} -> {destination} ({exc})")
+
+
+def _validated_topic_files(parquet_dir: Path, topic: str) -> list[Path]:
+    cache_key = (str(parquet_dir.resolve()), topic)
+    cached = _VALID_TOPIC_FILES_CACHE.get(cache_key)
+    if cached is not None:
+        return list(cached)
+
+    root = parquet_dir / f"topic={topic}"
+    valid: list[Path] = []
+    if root.exists():
+        for file_path in sorted(root.rglob("*.parquet")):
+            try:
+                pq.read_metadata(file_path)
+            except Exception as exc:
+                _quarantine_file(parquet_dir, file_path, exc)
+                continue
+            valid.append(file_path)
+    _VALID_TOPIC_FILES_CACHE[cache_key] = list(valid)
+    return valid
+
+
+def _topic_scan_sql(parquet_dir: Path, topic: str) -> str:
+    files = _validated_topic_files(parquet_dir, topic)
+    if not files:
+        raise RuntimeError(f"[mart] no valid parquet files for topic={topic}")
+    quoted = ", ".join(f"'{_duck_path(path)}'" for path in files)
+    return f"read_parquet([{quoted}], hive_partitioning=true)"
 
 
 def _source_exists(parquet_dir: Path, topic: str) -> bool:
-    root = parquet_dir / f"topic={topic}"
-    return root.exists() and any(root.rglob("*.parquet"))
+    return bool(_validated_topic_files(parquet_dir, topic))
 
 
 def _topic_columns(con: duckdb.DuckDBPyConnection, parquet_dir: Path, topic: str) -> set[str]:
-    glob = _topic_glob(parquet_dir, topic)
-    rows = con.execute(
-        f"DESCRIBE SELECT * FROM read_parquet('{glob}', hive_partitioning=true) LIMIT 0"
-    ).fetchall()
+    scan_sql = _topic_scan_sql(parquet_dir, topic)
+    rows = con.execute(f"DESCRIBE SELECT * FROM {scan_sql} LIMIT 0").fetchall()
     return {str(name) for name, *_ in rows}
 
 
@@ -139,6 +182,7 @@ def _count_rows(con: duckdb.DuckDBPyConnection, parquet_path: Path) -> int:
 
 def build_mart(parquet_dir: Path, out_dir: Path) -> dict[str, int]:
     out_dir.mkdir(parents=True, exist_ok=True)
+    _VALID_TOPIC_FILES_CACHE.clear()
     con = duckdb.connect()
     counts: dict[str, int] = {}
     started = datetime.now(timezone.utc)
@@ -148,6 +192,7 @@ def build_mart(parquet_dir: Path, out_dir: Path) -> dict[str, int]:
         if _source_exists(parquet_dir, "order-offers-v1"):
             print("[mart] Building fact_offers...", end=" ", flush=True)
             topic = "order-offers-v1"
+            scan_sql = _topic_scan_sql(parquet_dir, topic)
             cols = _topic_columns(con, parquet_dir, topic)
             _assert_contract(
                 topic,
@@ -183,7 +228,7 @@ def build_mart(parquet_dir: Path, out_dir: Path) -> dict[str, int]:
                             {_num_expr(cols, "weather_factor", "1.0")} AS weather_factor,
                             {_num_expr(cols, "traffic_factor", "1.0")} AS traffic_factor,
                             {_status_expr(cols, "status")} AS status
-                        FROM read_parquet('{_topic_glob(parquet_dir, topic)}', hive_partitioning=true)
+                        FROM {scan_sql}
                     )
                     SELECT
                         offer_id,
@@ -220,6 +265,7 @@ def build_mart(parquet_dir: Path, out_dir: Path) -> dict[str, int]:
         if _source_exists(parquet_dir, "order-events-v1"):
             print("[mart] Building fact_order_events...", end=" ", flush=True)
             topic = "order-events-v1"
+            scan_sql = _topic_scan_sql(parquet_dir, topic)
             cols = _topic_columns(con, parquet_dir, topic)
             _assert_contract(
                 topic,
@@ -257,7 +303,7 @@ def build_mart(parquet_dir: Path, out_dir: Path) -> dict[str, int]:
                             {_num_expr(cols, "supply_index", "1.0")} AS supply_index,
                             {_num_expr(cols, "weather_factor", "1.0")} AS weather_factor,
                             {_num_expr(cols, "traffic_factor", "1.0")} AS traffic_factor
-                        FROM read_parquet('{_topic_glob(parquet_dir, topic)}', hive_partitioning=true)
+                        FROM {scan_sql}
                     )
                     SELECT
                         event_id,
@@ -294,6 +340,7 @@ def build_mart(parquet_dir: Path, out_dir: Path) -> dict[str, int]:
         if _source_exists(parquet_dir, "context-signals-v1"):
             print("[mart] Building fact_context_signals...", end=" ", flush=True)
             topic = "context-signals-v1"
+            scan_sql = _topic_scan_sql(parquet_dir, topic)
             cols = _topic_columns(con, parquet_dir, topic)
             _assert_contract(
                 topic,
@@ -321,7 +368,7 @@ def build_mart(parquet_dir: Path, out_dir: Path) -> dict[str, int]:
                             {_num_expr(cols, "supply_index", "1.0")} AS supply_index,
                             {_num_expr(cols, "weather_factor", "1.0")} AS weather_factor,
                             {_num_expr(cols, "traffic_factor", "1.0")} AS traffic_factor
-                        FROM read_parquet('{_topic_glob(parquet_dir, topic)}', hive_partitioning=true)
+                        FROM {scan_sql}
                     )
                     SELECT
                         event_id,

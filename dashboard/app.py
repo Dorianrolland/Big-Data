@@ -3,6 +3,7 @@ FleetStream — Analytics Dashboard
 Pixel Perfect "SaaS 2026" — HTML/CSS pur, zéro chrome Streamlit visible.
 Anti-DuplicateWidgetID : widgets hors boucle, résultats en session_state.
 """
+import html
 import os
 import time
 from datetime import datetime
@@ -578,6 +579,25 @@ def cached_fetch(
     return {}
 
 
+def analytics_notice_html(payload: dict, *, default_detail: str = "") -> str:
+    status = payload.get("analytics_status", {}) if isinstance(payload, dict) else {}
+    detail = ""
+    if isinstance(status, dict):
+        detail = str(status.get("detail", "") or "")
+    if not detail and isinstance(payload, dict):
+        detail = str(payload.get("detail", "") or "")
+    if not detail:
+        detail = default_detail
+    if not detail:
+        return ""
+    escaped = html.escape(detail)
+    return (
+        '<div style="margin-bottom:12px;font-size:11px;color:#92400E;'
+        'padding:8px 10px;background:#FEF3C7;border:1px solid #FCD34D;'
+        f'border-radius:10px">⚠️ {escaped}</div>'
+    )
+
+
 def bento(color: str, icon: str, label: str, value: str, sub: str = "", glyph: str = "") -> str:
     sub_html  = f'<div class="bento-sub">{sub}</div>' if sub else ""
     glph_html = f'<div class="bento-glyph">{glyph}</div>' if glyph else ""
@@ -920,7 +940,7 @@ st.markdown("""
 col_ds_id, col_ds_h, col_ds_btn = st.columns([3, 2, 1])
 with col_ds_id:
     ds_livreur_id = st.text_input(
-        "DS ID", value="L042", placeholder="ex: L007, L042…",
+        "DS ID", value="drv_demo_001", placeholder="ex: drv_demo_001, L007…",
         key="ds_livreur_id", label_visibility="collapsed",
     )
 with col_ds_h:
@@ -976,7 +996,7 @@ st.markdown("""
 col_cp_id, col_cp_btn = st.columns([4, 1])
 with col_cp_id:
     cp_driver_id = st.text_input(
-        "CP Driver", value="L042", placeholder="ex: L007, L042...",
+        "CP Driver", value="drv_demo_001", placeholder="ex: drv_demo_001, L007...",
         key="cp_driver_id", label_visibility="collapsed",
     )
 with col_cp_btn:
@@ -1018,7 +1038,7 @@ st.markdown(
 col_id, col_h, col_btn = st.columns([3, 2, 1])
 with col_id:
     livreur_id = st.text_input(
-        "ID", value="L042", placeholder="ex: L007, L042…",
+        "ID", value="drv_demo_001", placeholder="ex: drv_demo_001, L007…",
         key="hist_livreur_id", label_visibility="collapsed",
     )
 with col_h:
@@ -1049,6 +1069,10 @@ with ph_hist.container():
     if "resume" in hist:
         r    = hist["resume"]
         traj = hist.get("trajectory", [])
+        notice_html = analytics_notice_html(hist)
+
+        if notice_html:
+            st.markdown(notice_html, unsafe_allow_html=True)
 
         # KPIs trajectoire — HTML pur
         st.markdown(
@@ -1182,7 +1206,7 @@ with ph_hist.container():
         <div class="empty-state">
             <div class="es-icon">📡</div>
             <div class="es-text">
-                Saisir un identifiant livreur (ex. <strong>L042</strong>)<br/>
+                Saisir un identifiant livreur (ex. <strong>drv_demo_001</strong>)<br/>
                 et cliquer sur <strong>⚡ Analyser</strong>
             </div>
         </div>
@@ -1219,7 +1243,7 @@ while True:
             '<div class="bento-grid">'
             + bento("indigo",  "🛵", "Livreurs actifs",
                     str(hp.get("livreurs_actifs", 0)),
-                    "Redis TTL 30s", "🛵")
+                    f'Redis TTL {hp.get("ttl_secondes", 30)}s', "🛵")
             + bento("sky",     "📨", "Messages GPS",
                     f"{n_msgs:,}" if isinstance(n_msgs, int) else "—",
                     "Redpanda → Hot path", "📡")
@@ -1319,6 +1343,7 @@ while True:
             interp = ds.get("interpretation", "")
             det = ds.get("details_score", {})
             met = ds.get("metriques", {})
+            notice_html = analytics_notice_html(ds)
             score_color = (
                 "#10B981" if grade == "A" else
                 "#3B82F6" if grade == "B" else
@@ -1334,6 +1359,7 @@ while True:
                 f'<span class="bi-card-title">Score Livreur — {ds.get("livreur_id","?")} '
                 f'· {ds.get("periode_heures","?")}h</span>'
                 f'</div>'
+                f'{notice_html}'
                 f'<div class="health-ring">'
                 f'<div class="grade-badge grade-{grade}">{grade}</div>'
                 f'<div style="flex:1">'
@@ -1384,13 +1410,35 @@ while True:
             prod_h  = insights.get("productivite_historique", {})
             alertes = insights.get("alertes", {})
             recos   = insights.get("recommandations", [])
+            analytics_status = insights.get("analytics_status", {})
+            statuts_detail = fleet.get("statuts_detail", {})
+            pickup_total = (
+                int(statuts_detail.get("pickup_assigned", 0) or 0)
+                + int(statuts_detail.get("pickup_en_route", 0) or 0)
+                + int(statuts_detail.get("pickup_arrived", 0) or 0)
+            )
+            repositioning_total = int(statuts_detail.get("repositioning", 0) or 0)
+            engaged_pct = fleet.get("taux_engagement_pct", "—")
+            degraded_note = ""
+            if analytics_status.get("degraded"):
+                degraded_note = (
+                    f'<div style="margin-bottom:12px;font-size:11px;color:#92400E;'
+                    f'padding:8px 10px;background:#FEF3C7;border:1px solid #FCD34D;'
+                    f'border-radius:10px">⚠️ {analytics_status.get("detail", insights.get("detail", "Analyse partiellement dégradée."))}</div>'
+                )
 
             suspects_html = ""
             for s in alertes.get("detail_suspects", [])[:3]:
+                duration_min = s.get("immobile_duration_min")
+                duration_label = (
+                    f' · {duration_min} min immobile'
+                    if duration_min not in (None, "", 0, 0.0)
+                    else ""
+                )
                 suspects_html += (
                     f'<div style="font-size:11px;color:#991B1B;padding:4px 8px;'
                     f'background:#FEE2E2;border-radius:7px;margin-bottom:4px">'
-                    f'⚠️ <b>{s.get("livreur_id")}</b> · {s.get("speed_kmh")} km/h · {s.get("status")}'
+                    f'⚠️ <b>{s.get("livreur_id")}</b> · {s.get("speed_kmh")} km/h · {s.get("status")}{duration_label}'
                     f'</div>'
                 )
 
@@ -1416,17 +1464,21 @@ while True:
                 f'<div class="bi-kpi-row">'
                 f'<div class="bi-kpi"><div class="bi-kpi-lbl">Utilisation</div>'
                 f'<div class="bi-kpi-val">{fleet.get("taux_utilisation_pct","—")}<span style="font-size:11px;color:#94A3B8"> %</span></div>'
-                f'<div class="bi-kpi-sub">delivering / total</div></div>'
+                f'<div class="bi-kpi-sub">livraison réelle / total</div></div>'
                 f'<div class="bi-kpi"><div class="bi-kpi-lbl">Disponibles</div>'
                 f'<div class="bi-kpi-val">{fleet.get("taux_disponibilite_pct","—")}<span style="font-size:11px;color:#94A3B8"> %</span></div>'
                 f'<div class="bi-kpi-sub">prêts à livrer</div></div>'
                 f'<div class="bi-kpi"><div class="bi-kpi-lbl">Vitesse moy.</div>'
                 f'<div class="bi-kpi-val">{prod_h.get("vitesse_moyenne_kmh","—")}<span style="font-size:11px;color:#94A3B8"> km/h</span></div>'
                 f'<div class="bi-kpi-sub">flotte complète</div></div>'
+                f'</div>'
+                f'<div style="margin-top:10px;font-size:11px;color:#94A3B8">'
+                f'Flux actif: {engaged_pct}% engagés · {pickup_total} en pickup · {repositioning_total} en repositioning'
                 f'</div></div></div>'
+                + degraded_note
                 + (f'<div style="margin-bottom:12px">'
                    f'<div style="font-size:11px;font-weight:700;color:#EF4444;margin-bottom:6px">'
-                   f'🚨 {alertes.get("livreurs_immobiles_en_livraison",0)} livreur(s) suspect(s)</div>'
+                   f'🚨 {alertes.get("livreurs_immobiles_en_livraison",0)} livreur(s) suspect(s) en livraison réelle</div>'
                    f'{suspects_html}</div>' if alertes.get("livreurs_immobiles_en_livraison", 0) > 0 else "")
                 + reco_html
                 + '</div>',
@@ -1446,6 +1498,7 @@ while True:
             anom_list = anomalies_data.get("anomalies", [])
             nb_crit = resume.get("critiques", 0)
             nb_warn = resume.get("warnings", 0)
+            analytics_status = anomalies_data.get("analytics_status", {})
 
             anomalies_html = ""
             if anom_list:
@@ -1473,6 +1526,13 @@ while True:
                     '<div class="reco-item ok">✅ Aucune anomalie comportementale '
                     f'détectée sur les {anomalies_data.get("fenetre_minutes",10)} dernières minutes '
                     f'({resume.get("livreurs_scannes",0)} livreurs analysés).</div>'
+                )
+            if analytics_status.get("degraded"):
+                anomalies_html = (
+                    f'<div style="margin-bottom:12px;font-size:11px;color:#92400E;'
+                    f'padding:8px 10px;background:#FEF3C7;border:1px solid #FCD34D;'
+                    f'border-radius:10px">⚠️ {analytics_status.get("detail", anomalies_data.get("detail", "Analyse partiellement dégradée."))}</div>'
+                    + anomalies_html
                 )
 
             header_color = "#EF4444" if nb_crit > 0 else "#F59E0B" if nb_warn > 0 else "#10B981"
@@ -1503,6 +1563,7 @@ while True:
             d_resume = demand_data.get("resume", {})
             dispatch = demand_data.get("dispatch_prioritaire", [])
             cold_z   = demand_data.get("zones_a_decouvrir", [])
+            notice_html = analytics_notice_html(demand_data)
 
             dispatch_html = ""
             for z in dispatch[:4]:
@@ -1531,6 +1592,7 @@ while True:
                 f'<span style="margin-left:auto;font-size:10px;color:#94A3B8">'
                 f'Horizon 30 min</span>'
                 f'</div>'
+                f'{notice_html}'
                 f'<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px">'
                 f'<div class="bi-kpi"><div class="bi-kpi-lbl">🔺 Zones en hausse</div>'
                 f'<div class="bi-kpi-val" style="color:#EF4444">{d_resume.get("zones_en_hausse",0)}</div></div>'
@@ -1561,6 +1623,7 @@ while True:
             teleports = fraud_data.get("teleportations", [])
             frozen_list = fraud_data.get("positions_figees", [])
             total_frauds = f_resume.get("total_fraudes", 0)
+            notice_html = analytics_notice_html(fraud_data)
 
             fraud_html = ""
             if teleports:
@@ -1615,6 +1678,7 @@ while True:
                 f'<span style="margin-left:auto;font-size:10px;color:{fraud_color};font-weight:700">'
                 f'{total_frauds} alerte(s)</span>'
                 f'</div>'
+                f'{notice_html}'
                 f'<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px">'
                 f'<div class="bi-kpi"><div class="bi-kpi-lbl">🔴 Téléportations</div>'
                 f'<div class="bi-kpi-val" style="color:#EF4444">{f_resume.get("teleportations",0)}</div></div>'
@@ -1642,6 +1706,7 @@ while True:
             alertes_z = zones_data.get("alertes_dispatch", {})
             sous = alertes_z.get("zones_prioritaires", [])
             sur  = alertes_z.get("zones_saturees", [])
+            analytics_status = zones_data.get("analytics_status", {})
 
             def zone_item(z):
                 return (
@@ -1655,6 +1720,13 @@ while True:
 
             sous_html = "".join(zone_item(z) for z in sous) or '<div style="font-size:12px;color:#94A3B8;padding:8px">Aucune</div>'
             sur_html  = "".join(zone_item(z) for z in sur)  or '<div style="font-size:12px;color:#94A3B8;padding:8px">Aucune</div>'
+            degraded_note = ""
+            if analytics_status.get("degraded"):
+                degraded_note = (
+                    f'<div style="margin-bottom:12px;font-size:11px;color:#92400E;'
+                    f'padding:8px 10px;background:#FEF3C7;border:1px solid #FCD34D;'
+                    f'border-radius:10px">⚠️ {analytics_status.get("detail", zones_data.get("detail", "Analyse partiellement dégradée."))}</div>'
+                )
 
             st.markdown(
                 f'<div class="bi-card">'
@@ -1675,6 +1747,7 @@ while True:
                 f'<div class="bi-kpi-val" style="color:#3B82F6">{res.get("zones_sur_couvertes",0)}</div>'
                 f'<div class="bi-kpi-sub">redéploiement possible</div></div>'
                 f'</div>'
+                f'{degraded_note}'
                 f'<div class="zone-grid-bi">'
                 f'<div>'
                 f'<div class="zone-col-title zone-col-under">🔴 Zones à couvrir en priorité</div>'

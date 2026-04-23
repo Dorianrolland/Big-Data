@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+COPY api/requirements.txt ./requirements.txt
 # Installe dans un préfixe isolé pour le multi-stage copy
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
@@ -24,7 +24,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY . .
+COPY api/. .
+RUN mkdir -p /app/context_poller /app/tlc_replay
+COPY context_poller/nyc_zone_centroids.json /app/context_poller/nyc_zone_centroids.json
+COPY tlc_replay/nyc_zone_centroids.json /app/tlc_replay/nyc_zone_centroids.json
 
 EXPOSE 8000
 

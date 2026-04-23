@@ -17,6 +17,7 @@ def _import_script(name, path):
 def test_fleet_demo_env_exists():
     env_path = _ROOT / "env" / "fleet_demo.env"
     assert env_path.exists(), "fleet_demo.env must exist"
+    assert (_ROOT / "env" / "fleet_jury.env").exists(), "fleet_jury.env must exist"
 
 
 def test_fleet_demo_env_has_required_keys():
@@ -32,6 +33,10 @@ def test_fleet_demo_env_has_required_keys():
     ]
     for key in required_keys:
         assert key in content, f"missing key in fleet_demo.env: {key}"
+    assert "TLC_ROUTE_SYNC_ON_CACHE_MISS=true" in content
+    assert "TLC_ROUTE_LINEAR_FALLBACK_ALLOWED=false" in content
+    assert "TLC_LIVE_ROUTE_MAX_STEP_KM=0.06" in content
+    assert "FLEET_TRACK_MAX_POINTS=64" in content
 
 
 def test_fleet_demo_config():
@@ -50,6 +55,21 @@ def test_makefile_has_fleet_demo_targets():
     assert "fleet-demo-up" in makefile
     assert "fleet-demo-down" in makefile
     assert "fleet-demo-check" in makefile
+    assert "fleet-jury-up" in makefile
+    assert "--env-file env/fleet_jury.env --profile routing up --build -d" in makefile
+
+
+def test_docker_compose_defaults_are_fleet_safe():
+    compose = (_ROOT / "docker-compose.yml").read_text()
+    assert compose.count('GPS_TTL_SECONDS: "${GPS_TTL_SECONDS:-90}"') >= 2
+    assert 'FLEET_TRACK_MAX_POINTS: "${FLEET_TRACK_MAX_POINTS:-64}"' in compose
+    assert 'TLC_TRIP_SAMPLE_RATE: "${TLC_TRIP_SAMPLE_RATE:-0.14}"' in compose
+    assert 'TLC_MAX_ACTIVE_TRIPS: "${TLC_MAX_ACTIVE_TRIPS:-1100}"' in compose
+    assert compose.count('TLC_SCENARIO: "${TLC_SCENARIO:-fleet}"') >= 2
+    assert 'TLC_COURIER_ID_MODE: "${TLC_COURIER_ID_MODE:-}"' in compose
+    assert 'TLC_ROUTE_LINEAR_FALLBACK_ALLOWED: "${TLC_ROUTE_LINEAR_FALLBACK_ALLOWED:-false}"' in compose
+    assert "context: ." in compose
+    assert "dockerfile: api/Dockerfile" in compose
 
 
 def test_fleet_demo_env_seed_reproducible():
@@ -159,3 +179,51 @@ def test_check_replay_available_falls_back_to_health_events(monkeypatch):
     assert ok is True
     assert meta["replay_url"] == "health_fallback"
     assert meta["replay_count"] == 12
+
+
+def test_print_fleet_kpis_fails_when_routing_quality_gate_is_red(monkeypatch):
+    fleet_check = _import_script(
+        "fleet_demo_check", _ROOT / "scripts" / "fleet_demo_check.py"
+    )
+
+    def _fake_get_json(url, timeout=8, retries=1):  # noqa: ANN001
+        _ = timeout, retries
+        if url.endswith("/copilot/health"):
+            return {
+                "tlc_replay": {
+                    "trajectory_mode": "osrm",
+                    "route_osrm_success": "42",
+                    "route_linear_fallback": "1",
+                    "route_hold_fallback": "0",
+                    "route_osrm_errors": "0",
+                }
+            }
+        return {"ok": True}
+
+    monkeypatch.setattr(fleet_check, "_get_json", _fake_get_json)
+    assert fleet_check.print_fleet_kpis("http://localhost:8001") is False
+
+
+def test_print_fleet_kpis_tolerates_small_startup_routing_blips(monkeypatch):
+    fleet_check = _import_script(
+        "fleet_demo_check", _ROOT / "scripts" / "fleet_demo_check.py"
+    )
+
+    def _fake_get_json(url, timeout=8, retries=1):  # noqa: ANN001
+        _ = timeout, retries
+        if url.endswith("/copilot/health"):
+            return {
+                "tlc_replay": {
+                    "trajectory_mode": "osrm",
+                    "route_osrm_success": "240",
+                    "route_osrm_public_success": "0",
+                    "route_valhalla_public_success": "0",
+                    "route_linear_fallback": "0",
+                    "route_hold_fallback": "6",
+                    "route_osrm_errors": "5",
+                }
+            }
+        return {"ok": True}
+
+    monkeypatch.setattr(fleet_check, "_get_json", _fake_get_json)
+    assert fleet_check.print_fleet_kpis("http://localhost:8001") is True

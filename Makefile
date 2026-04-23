@@ -1,11 +1,11 @@
-.PHONY: up fleet-up down logs build clean restart status train-copilot train-copilot-10m train-copilot-report demo-copilot demo-rank demo-next-zone bench-copilot smoke-e2e perf-lot4 proof-lot4 real-mode sim-mode demo-ingest prepare-routing-osrm single-driver-reset single-driver-up single-driver-down single-driver-logs focus-map demo-scoreboard demo-scenarios build-mart query-kpis fleet-demo-up fleet-demo-down fleet-demo-check
+.PHONY: up fleet-up down logs build clean restart status train-copilot train-copilot-10m train-copilot-report demo-copilot demo-rank demo-next-zone bench-copilot smoke-e2e perf-lot4 proof-lot4 real-mode sim-mode demo-ingest prepare-routing-osrm single-driver-reset single-driver-up single-driver-down single-driver-logs focus-map demo-scoreboard demo-scenarios build-mart query-kpis fleet-demo-up fleet-demo-down fleet-demo-check fleet-jury-up fleet-jury-down fleet-jury-check
 
 ## Lance l'intégralité du stack (build + démarrage)
 up:
-	docker compose --env-file env/fleet_demo.env up --build -d
+	docker compose --env-file env/fleet_jury.env --profile routing up --build -d
 	@echo ""
 	@echo "✓ FleetStream démarré !"
-	@echo "  Scenario       → fleet_demo (env/fleet_demo.env)"
+	@echo "  Scenario       → fleet_jury (env/fleet_jury.env)"
 	@echo "  API docs       → http://localhost:8001/docs"
 	@echo "  Dashboard live → http://localhost:8501"
 	@echo "  Redpanda UI    → http://localhost:8080"
@@ -213,6 +213,17 @@ fleet-demo-down:
 ## Vérifie la stabilité du mode flotte (chauffeurs actifs, erreurs)
 fleet-demo-check:
 	python3 scripts/fleet_demo_check.py --min-drivers $${FLEET_DEMO_WARMUP_MIN_DRIVERS:-50} --timeout $${FLEET_DEMO_WARMUP_TIMEOUT_S:-120}
+
+## Lance explicitement le profil jury-safe pour la soutenance
+fleet-jury-up:
+	docker compose --env-file env/fleet_jury.env --profile routing up --build -d
+	@echo "Fleet jury démarré - fallback synthétique désactivé."
+
+fleet-jury-down:
+	docker compose down
+
+fleet-jury-check:
+	FLEET_DEMO_ENV_FILE=env/fleet_jury.env python3 scripts/fleet_demo_check.py --min-drivers $${FLEET_DEMO_WARMUP_MIN_DRIVERS:-120} --timeout $${FLEET_DEMO_WARMUP_TIMEOUT_S:-600}
 
 ## Lance explicitement le mode flotte (utile pour stress/perf uniquement)
 fleet-up:

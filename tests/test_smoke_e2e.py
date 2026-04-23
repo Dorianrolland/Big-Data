@@ -72,7 +72,8 @@ def test_compose_up_includes_env_file_when_provided(tmp_path, monkeypatch):
     monkeypatch.setattr(smoke_e2e, "run_cmd", fake_run_cmd)
     smoke_e2e.compose_up(build=True, compose_env_file=str(env_file))
     assert calls
-    assert calls[0][:5] == ["docker", "compose", "--env-file", str(env_file.resolve()), "up"]
+    assert calls[0][:4] == ["docker", "compose", "--env-file", str(env_file.resolve())]
+    assert "up" in calls[0]
     assert calls[0][-1] == "--build"
 
 

@@ -93,6 +93,23 @@ def test_compact_snappy_compression(sample_parquet_dir):
         assert compression.lower() in ("snappy", "lz4", "zstd")
 
 
+def test_validated_topic_files_skips_transient_tmp_parquet(sample_parquet_dir):
+    topic_dir = sample_parquet_dir / "topic=test-v1"
+    transient = topic_dir / "year=2026" / "month=04" / "day=20" / "hour=13" / ".batch_tmp.tmp.parquet"
+    transient.write_text("not a parquet", encoding="utf-8")
+
+    files = compact_mod._validated_topic_files(topic_dir)
+
+    assert transient not in files
+    assert transient.exists()
+
+
+def test_quarantine_invalid_file_ignores_missing_source(sample_parquet_dir):
+    parquet_root = sample_parquet_dir
+    missing = parquet_root / "topic=test-v1" / "year=2026" / "month=04" / "day=20" / "hour=13" / ".missing.tmp.parquet"
+    compact_mod._quarantine_invalid_file(parquet_root, missing, FileNotFoundError("gone"))
+
+
 def test_compact_run_on_real_data():
     """Test sur les vraies données du cold path (si disponibles)."""
     parquet_dir = _ROOT / "data" / "parquet_events"

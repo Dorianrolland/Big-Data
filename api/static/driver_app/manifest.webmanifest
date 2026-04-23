@@ -1,0 +1,26 @@
+{
+  "name": "FleetStream Driver Copilot Demo",
+  "short_name": "Driver Copilot",
+  "description": "Single-driver demo application for the FleetStream oral presentation.",
+  "start_url": "/copilot/driver-app",
+  "scope": "/copilot/driver-app",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#111111",
+  "theme_color": "#111111",
+  "lang": "en",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Crect width='192' height='192' rx='28' fill='%23111111'/%3E%3Ccircle cx='96' cy='96' r='54' fill='%23ffb100' opacity='0.92'/%3E%3Cpath d='M58 110h76l-8-25c-3-10-12-17-23-17H89c-11 0-20 7-23 17l-8 25zm14 18a10 10 0 110-20 10 10 0 010 20zm48 0a10 10 0 110-20 10 10 0 010 20z' fill='%230d0d0d'/%3E%3C/svg%3E",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect width='512' height='512' rx='72' fill='%23111111'/%3E%3Ccircle cx='256' cy='256' r='148' fill='%23ffb100' opacity='0.92'/%3E%3Cpath d='M154 296h204l-22-68c-9-28-35-46-64-46h-32c-29 0-55 18-64 46l-22 68zm42 48a28 28 0 110-56 28 28 0 010 56zm120 0a28 28 0 110-56 28 28 0 010 56z' fill='%230d0d0d'/%3E%3C/svg%3E",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

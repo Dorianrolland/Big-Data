@@ -29,10 +29,17 @@ def _courier_state(cid: str, lat: float, lon: float, **kwargs) -> dict[str, str]
 
 
 class _FakeRedis:
-    def __init__(self, couriers: dict[str, dict[str, str]]):
+    def __init__(self, couriers: dict[str, dict[str, str]], zones: dict[str, dict[str, str]] | None = None):
         self._couriers = couriers
+        self._zones = zones or {}
 
     async def scan_iter(self, match: str = "*", count: int = 100):
+        _ = count
+        if match.startswith(router.ZONE_CONTEXT_PREFIX):
+            prefix = router.ZONE_CONTEXT_PREFIX
+            for zone_id in self._zones:
+                yield f"{prefix}{zone_id}"
+            return
         prefix = router.COURIER_HASH_PREFIX
         for cid in self._couriers:
             yield f"{prefix}{cid}"
@@ -40,14 +47,36 @@ class _FakeRedis:
     async def hgetall(self, key: str) -> dict[str, str]:
         if isinstance(key, bytes):
             key = key.decode()
-        prefix = router.COURIER_HASH_PREFIX
-        cid = key[len(prefix):]
-        return dict(self._couriers.get(cid, {}))
+        courier_prefix = router.COURIER_HASH_PREFIX
+        if key.startswith(courier_prefix):
+            cid = key[len(courier_prefix):]
+            return dict(self._couriers.get(cid, {}))
+        zone_prefix = router.ZONE_CONTEXT_PREFIX
+        if key.startswith(zone_prefix):
+            zone_id = key[len(zone_prefix):]
+            return dict(self._zones.get(zone_id, {}))
+        return {}
+
+    def pipeline(self, transaction: bool = False):
+        _ = transaction
+        return _FakePipeline(self)
 
 
-def _make_request(couriers: dict):
+class _FakePipeline:
+    def __init__(self, redis: _FakeRedis):
+        self._redis = redis
+        self._keys: list[str] = []
+
+    def hgetall(self, key: str) -> None:
+        self._keys.append(key)
+
+    async def execute(self) -> list[dict[str, str]]:
+        return [await self._redis.hgetall(key) for key in self._keys]
+
+
+def _make_request(couriers: dict, zones: dict[str, dict[str, str]] | None = None):
     return SimpleNamespace(
-        app=SimpleNamespace(state=SimpleNamespace(redis=_FakeRedis(couriers)))
+        app=SimpleNamespace(state=SimpleNamespace(redis=_FakeRedis(couriers, zones)))
     )
 
 
@@ -115,3 +144,46 @@ def test_fleet_overview_driver_fields():
     assert "opportunity_score" in d
     assert "best_action" in d
     assert 0.0 <= d["opportunity_score"] <= 1.0
+
+
+def test_fleet_overview_limit_does_not_cap_active_driver_count():
+    req = _make_request(_SAMPLE_COURIERS)
+    result = asyncio.run(router.fleet_overview(req, zone=None, status=None, min_score=0.0, limit=3))
+    assert result["active_drivers"] == 10
+    assert result["drivers_returned"] == 3
+    assert result["truncated"] is True
+    assert len(result["drivers"]) == 3
+
+
+def test_fleet_overview_enriches_unknown_zone_from_nearest_context():
+    couriers = {
+        "drv_unknown": {
+            "lat": "40.7582",
+            "lon": "-73.9853",
+            "status": "delivering",
+            "ts": "2024-01-01T14:00:00+00:00",
+        }
+    }
+    zones = {
+        "nyc_161": {
+            "zone_id": "nyc_161",
+            "demand_index": "2.1",
+            "supply_index": "0.7",
+            "weather_factor": "1.1",
+            "traffic_factor": "1.2",
+        }
+    }
+    req = _make_request(couriers, zones)
+    result = asyncio.run(router.fleet_overview(req, zone=None, status=None, min_score=0.0, limit=10))
+    driver = result["drivers"][0]
+    assert driver["zone_id"] == "nyc_161"
+    assert driver["zone_source"] == "nearest_zone_context"
+    assert driver["demand_index"] > 0.0
+    assert driver["zone_lat"] is not None
+    assert driver["zone_lon"] is not None
+
+
+def test_api_dockerfile_copies_zone_centroids():
+    content = (_API_DIR / "Dockerfile").read_text(encoding="utf-8")
+    assert "COPY context_poller/nyc_zone_centroids.json /app/context_poller/nyc_zone_centroids.json" in content
+    assert "COPY tlc_replay/nyc_zone_centroids.json /app/tlc_replay/nyc_zone_centroids.json" in content

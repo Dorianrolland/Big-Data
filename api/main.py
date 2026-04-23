@@ -12,6 +12,7 @@ Monitoring : Prometheus via /metrics (prometheus-fastapi-instrumentator)
 Docs interactives : http://localhost:8001/docs
 """
 import asyncio
+import copy
 import json
 import logging
 import math
@@ -62,9 +63,18 @@ FOCUS_TRAIL_CACHE_MAX = max(32, int(os.getenv("FOCUS_TRAIL_CACHE_MAX", "512") or
 PERF_BENCH_CACHE_TTL_SECONDS = max(10.0, float(os.getenv("PERF_BENCH_CACHE_TTL_SECONDS", "60.0") or "60.0"))
 PERF_BENCH_MAX_SAMPLES = max(20, int(os.getenv("PERF_BENCH_MAX_SAMPLES", "120") or "120"))
 STATS_STATUS_SCAN_LIMIT = max(0, int(os.getenv("STATS_STATUS_SCAN_LIMIT", "1500") or "1500"))
+HOT_PATH_TTL_SECONDS = max(5, int(float(os.getenv("GPS_TTL_SECONDS", "30") or "30")))
 STATS_COLD_CACHE_TTL_SECONDS = max(
     5.0,
     float(os.getenv("STATS_COLD_CACHE_TTL_SECONDS", "45.0") or "45.0"),
+)
+ANALYTICS_RESULT_CACHE_TTL_SECONDS = max(
+    10.0,
+    float(os.getenv("ANALYTICS_RESULT_CACHE_TTL_SECONDS", "30.0") or "30.0"),
+)
+ANALYTICS_RESULT_CACHE_MAX = max(
+    32,
+    int(os.getenv("ANALYTICS_RESULT_CACHE_MAX", "256") or "256"),
 )
 ANALYTICS_COLD_QUERY_TIMEOUT_SECONDS = max(
     1.0,
@@ -73,21 +83,59 @@ ANALYTICS_COLD_QUERY_TIMEOUT_SECONDS = max(
 
 GEO_KEY          = "fleet:geo"
 HASH_PREFIX      = "fleet:livreur:"
+TRACK_KEY_PREFIX = "fleet:track:"
 STATS_MSGS_KEY   = "fleet:stats:total_messages"
 STATS_DLQ_KEY    = "fleet:stats:dlq_count"
 DLQ_KEY          = "fleet:dlq"
 DLQ_PATH         = Path(os.getenv("DLQ_PATH", "/data/dlq"))
 TLC_REPLAY_STATUS_KEY = "copilot:replay:tlc:status"
-DELIVERING_STATUS_ALIASES = {
-    "delivering",
-    "pickup_arrived",
-    "pickup_assigned",
-    "pickup_en_route",
-    "on_trip",
-    "busy",
-}
+DELIVERING_STATUS_ALIASES = {"delivering", "on_trip", "busy"}
+PICKUP_STATUS_ALIASES = {"pickup_arrived", "pickup_assigned", "pickup_en_route"}
+REPOSITIONING_STATUS_ALIASES = {"repositioning"}
 AVAILABLE_STATUS_ALIASES = {"available", "ready", "waiting_order"}
 IDLE_STATUS_ALIASES = {"idle", "offline", "paused"}
+STATUS_DETAIL_KEYS = (
+    "available",
+    "pickup_assigned",
+    "pickup_en_route",
+    "pickup_arrived",
+    "repositioning",
+    "delivering",
+    "idle",
+    "unknown",
+)
+STATUS_BUCKET_KEYS = (
+    "available",
+    "pickup",
+    "repositioning",
+    "delivering",
+    "idle",
+    "unknown",
+)
+FLEET_INSIGHTS_STATIONARY_SPEED_KMH = max(
+    0.1,
+    float(os.getenv("FLEET_INSIGHTS_STATIONARY_SPEED_KMH", "1.5") or "1.5"),
+)
+FLEET_INSIGHTS_STATIONARY_MIN_SECONDS = max(
+    60,
+    int(float(os.getenv("FLEET_INSIGHTS_STATIONARY_MIN_SECONDS", "120") or "120")),
+)
+FLEET_INSIGHTS_TRACK_POINTS = max(
+    4,
+    int(float(os.getenv("FLEET_INSIGHTS_TRACK_POINTS", "12") or "12")),
+)
+ANOMALY_STATIONARY_MIN_SECONDS = max(
+    60,
+    int(
+        float(
+            os.getenv(
+                "ANOMALY_STATIONARY_MIN_SECONDS",
+                str(FLEET_INSIGHTS_STATIONARY_MIN_SECONDS),
+            )
+            or str(FLEET_INSIGHTS_STATIONARY_MIN_SECONDS)
+        )
+    ),
+)
 
 _focus_trail_cache: OrderedDict[str, tuple[float, list[dict[str, Any]]]] = OrderedDict()
 _focus_trail_cache_lock = asyncio.Lock()
@@ -96,11 +144,13 @@ _perf_bench_cache_lock = asyncio.Lock()
 _stats_cold_cache: dict[str, Any] = {"expires_at": 0.0, "payload": {}}
 _stats_cold_cache_lock = asyncio.Lock()
 _stats_cold_refresh_in_flight = False
+_analytics_result_cache: OrderedDict[str, tuple[float, float, dict[str, Any]]] = OrderedDict()
+_analytics_result_cache_lock = asyncio.Lock()
 
 # ── Prometheus custom metrics ───────────────────────────────────────────────────
 gauge_active_livreurs = Gauge(
     "fleet_active_livreurs",
-    "Nombre de livreurs actifs dans Redis (TTL 30s)",
+    f"Nombre de livreurs actifs dans Redis (TTL {HOT_PATH_TTL_SECONDS}s)",
 )
 gauge_messages_processed = Gauge(
     "fleet_messages_processed",
@@ -294,7 +344,11 @@ async def live_map(request: Request):
         return RedirectResponse(url=f"/map?focus={TLC_SINGLE_DRIVER_ID}", status_code=307)
     p = Path(__file__).parent / "static" / "index.html"
     if p.exists():
-        return FileResponse(str(p), media_type="text/html")
+        return FileResponse(
+            str(p),
+            media_type="text/html",
+            headers={"Cache-Control": "no-store, must-revalidate"},
+        )
     return {"detail": "Dashboard non trouvé — monter le volume /static"}
 
 
@@ -310,6 +364,10 @@ class LivreurPosition(BaseModel):
     battery_pct: float = 0.0
     ts: str = ""
     distance_km: Optional[float] = None
+    route_source: str = ""
+    anomaly_state: str = "ok"
+    stale_reason: str = ""
+    recent_track: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class NearbyResponse(BaseModel):
@@ -331,9 +389,12 @@ class HistoryResume(BaseModel):
 class HistoryResponse(BaseModel):
     livreur_id: str
     heures: int
-    resume: HistoryResume
-    trajectory: list[dict]
+    resume: HistoryResume | None = None
+    trajectory: list[dict] = Field(default_factory=list)
     time_reference: dict[str, str] | None = None
+    cold_path_available: bool | None = None
+    analytics_status: dict[str, Any] | None = None
+    detail: str | None = None
 
 
 # ── Utilitaires ─────────────────────────────────────────────────────────────────
@@ -526,11 +587,190 @@ def _canonical_status(raw_status: str | None) -> str:
     status = (raw_status or "").strip().lower()
     if status in DELIVERING_STATUS_ALIASES:
         return "delivering"
+    if status in PICKUP_STATUS_ALIASES:
+        return status
+    if status in REPOSITIONING_STATUS_ALIASES:
+        return "repositioning"
     if status in AVAILABLE_STATUS_ALIASES:
         return "available"
     if status in IDLE_STATUS_ALIASES:
         return "idle"
     return status or "unknown"
+
+
+def _status_bucket(raw_status: str | None) -> str:
+    status = _canonical_status(raw_status)
+    if status in {"available", "delivering", "repositioning", "idle"}:
+        return status
+    if status in PICKUP_STATUS_ALIASES:
+        return "pickup"
+    return "unknown"
+
+
+def _status_detail_counts_template() -> dict[str, int]:
+    return {key: 0 for key in STATUS_DETAIL_KEYS}
+
+
+def _status_bucket_counts_template() -> dict[str, int]:
+    return {key: 0 for key in STATUS_BUCKET_KEYS}
+
+
+def _scale_count_map(counts: dict[str, int], total: int, sampled: int) -> dict[str, int]:
+    if sampled <= 0 or total <= sampled:
+        return dict(counts)
+    ratio = total / max(sampled, 1)
+    scaled = {key: int(round(value * ratio)) for key, value in counts.items()}
+    delta = total - sum(scaled.values())
+    scaled["unknown"] = max(0, scaled.get("unknown", 0) + delta)
+    return scaled
+
+
+def _trailing_stationary_duration_seconds(
+    points: list[dict[str, Any]],
+    *,
+    speed_threshold_kmh: float,
+    stationary_statuses: set[str] | None = None,
+) -> tuple[float, int]:
+    stationary_statuses = stationary_statuses or {"delivering"}
+    normalized: list[tuple[datetime, float, str]] = []
+    for point in points:
+        ts = _parse_iso_timestamp(str(point.get("ts") or ""))
+        if ts is None:
+            continue
+        try:
+            speed = float(point.get("speed_kmh", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            speed = 0.0
+        normalized.append((ts, speed, _canonical_status(point.get("status"))))
+    if not normalized:
+        return 0.0, 0
+    latest_ts, latest_speed, latest_status = normalized[-1]
+    if latest_status not in stationary_statuses or latest_speed > speed_threshold_kmh:
+        return 0.0, 0
+    earliest_ts = latest_ts
+    samples = 0
+    for ts, speed, status in reversed(normalized):
+        if status not in stationary_statuses or speed > speed_threshold_kmh:
+            break
+        earliest_ts = ts
+        samples += 1
+    return max(0.0, (latest_ts - earliest_ts).total_seconds()), samples
+
+
+def _parse_recent_track(raw_items: list[str] | None) -> list[dict[str, Any]]:
+    points: list[dict[str, Any]] = []
+    for raw in reversed(raw_items or []):
+        try:
+            item = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(item, dict):
+            continue
+        try:
+            lat = float(item.get("lat"))
+            lon = float(item.get("lon"))
+        except (TypeError, ValueError):
+            continue
+        point = {
+            "lat": lat,
+            "lon": lon,
+            "ts": str(item.get("ts") or ""),
+            "speed_kmh": float(item.get("speed_kmh", 0.0) or 0.0),
+            "status": _canonical_status(item.get("status")),
+            "route_source": str(item.get("route_source") or ""),
+            "anomaly_state": str(item.get("anomaly_state") or "ok"),
+        }
+        points.append(point)
+    return points
+
+
+def _normalize_focus_trail_point(point: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(point, dict):
+        return None
+    try:
+        lat = float(point.get("lat"))
+        lon = float(point.get("lon"))
+    except (TypeError, ValueError):
+        return None
+    speed_raw = point.get("speed_kmh", 0.0)
+    try:
+        speed = float(speed_raw or 0.0)
+    except (TypeError, ValueError):
+        speed = 0.0
+    return {
+        "ts": str(point.get("ts") or ""),
+        "lat": lat,
+        "lon": lon,
+        "speed_kmh": speed,
+        "status": _canonical_status(point.get("status")),
+    }
+
+
+def _merge_focus_trail_points(
+    cold_points: list[dict[str, Any]] | None,
+    hot_points: list[dict[str, Any]] | None,
+    *,
+    position: dict[str, Any] | None = None,
+    max_points: int = 60,
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+
+    def _append(point: dict[str, Any] | None) -> None:
+        normalized = _normalize_focus_trail_point(point)
+        if normalized is None:
+            return
+        if merged:
+            prev = merged[-1]
+            prev_ts = _parse_iso_timestamp(prev.get("ts"))
+            point_ts = _parse_iso_timestamp(normalized.get("ts"))
+            if prev_ts is not None and point_ts is not None and point_ts < prev_ts:
+                return
+            same_coords = (
+                abs(prev["lat"] - normalized["lat"]) < 1e-6
+                and abs(prev["lon"] - normalized["lon"]) < 1e-6
+            )
+            same_ts = bool(normalized["ts"]) and normalized["ts"] == prev.get("ts")
+            if same_coords or same_ts:
+                prev.update({key: value for key, value in normalized.items() if value not in ("", None)})
+                return
+        merged.append(normalized)
+
+    for point in cold_points or []:
+        _append(point)
+    for point in hot_points or []:
+        _append(point)
+    _append(position)
+
+    if max_points > 0 and len(merged) > max_points:
+        merged = merged[-max_points:]
+    return merged
+
+
+def _build_livreur_position(
+    livreur_id: str,
+    h: dict[str, Any],
+    *,
+    fallback_lat: float,
+    fallback_lon: float,
+    distance_km: float | None = None,
+    recent_track: list[dict[str, Any]] | None = None,
+) -> LivreurPosition:
+    return LivreurPosition(
+        livreur_id=livreur_id,
+        lat=float(h.get("lat", fallback_lat)),
+        lon=float(h.get("lon", fallback_lon)),
+        speed_kmh=float(h.get("speed_kmh", 0)),
+        heading_deg=float(h.get("heading_deg", 0)),
+        status=_canonical_status(h.get("status")),
+        accuracy_m=float(h.get("accuracy_m", 0)),
+        battery_pct=float(h.get("battery_pct", 0)),
+        ts=h.get("ts", ""),
+        distance_km=distance_km,
+        route_source=str(h.get("route_source") or ""),
+        anomaly_state=str(h.get("anomaly_state") or "ok"),
+        stale_reason=str(h.get("stale_reason") or ""),
+        recent_track=recent_track or [],
+    )
 
 
 def _redis_unavailable_message() -> str:
@@ -659,6 +899,87 @@ async def _cold_path_snapshot_cached() -> dict[str, Any]:
                 _stats_cold_refresh_in_flight = False
 
 
+def _analytics_cache_key(name: str, **params: Any) -> str:
+    normalized: dict[str, Any] = {}
+    for key, value in sorted(params.items()):
+        if isinstance(value, datetime):
+            normalized[key] = _dt_to_iso(value)
+        else:
+            normalized[key] = value
+    return f"{name}:{json.dumps(normalized, sort_keys=True, separators=(',', ':'), ensure_ascii=True)}"
+
+
+async def _analytics_result_cache_get(
+    key: str,
+    *,
+    allow_stale: bool = False,
+) -> tuple[dict[str, Any], float] | None:
+    now = time.time()
+    async with _analytics_result_cache_lock:
+        entry = _analytics_result_cache.get(key)
+        if not entry:
+            return None
+        expires_at, cached_at, payload = entry
+        if expires_at <= now and not allow_stale:
+            return None
+        _analytics_result_cache.move_to_end(key)
+        return copy.deepcopy(payload), cached_at
+
+
+async def _analytics_result_cache_set(key: str, payload: dict[str, Any]) -> None:
+    now = time.time()
+    expires_at = now + ANALYTICS_RESULT_CACHE_TTL_SECONDS
+    async with _analytics_result_cache_lock:
+        _analytics_result_cache[key] = (expires_at, now, copy.deepcopy(payload))
+        _analytics_result_cache.move_to_end(key)
+        while len(_analytics_result_cache) > ANALYTICS_RESULT_CACHE_MAX:
+            _analytics_result_cache.popitem(last=False)
+
+
+def _analytics_exception_detail(exc: Exception, *, fallback_label: str) -> str:
+    if isinstance(exc, HTTPException):
+        raw = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+    else:
+        raw = str(exc)
+    message = " ".join((raw or "").split())
+    if not message:
+        return fallback_label
+    if message.lower().startswith(fallback_label.lower()):
+        return message
+    return f"{fallback_label} {message}"
+
+
+def _analytics_status_payload(
+    payload: dict[str, Any],
+    *,
+    cold_path_available: bool,
+    degraded: bool,
+    source: str,
+    detail: str = "",
+    cached_at: float | None = None,
+) -> dict[str, Any]:
+    result = copy.deepcopy(payload)
+    result["cold_path_available"] = cold_path_available
+    status: dict[str, Any] = {
+        "source": source,
+        "degraded": degraded,
+        "cold_path_available": cold_path_available,
+    }
+    if detail:
+        status["detail"] = detail
+        result["detail"] = detail
+    if cached_at is not None:
+        cached_dt = datetime.fromtimestamp(cached_at, tz=timezone.utc)
+        status["cached_at"] = _dt_to_iso(cached_dt)
+        status["snapshot_age_s"] = int(max(0.0, time.time() - cached_at))
+    result["analytics_status"] = status
+    return result
+
+
+def _analytics_should_degrade(exc: Exception) -> bool:
+    return not isinstance(exc, HTTPException) or exc.status_code >= 500
+
+
 async def _latest_parquet_ts() -> datetime | None:
     recent_globs = _recent_hour_partition_globs(limit=8)
     fast_scan_sql = _parquet_scan_sql_from_globs(recent_globs)
@@ -761,11 +1082,12 @@ def _build_time_reference(
     tags=["Hot Path"],
 )
 async def livreurs_proches(
-    lat:    float = Query(..., description="Latitude",  example=40.7580),
-    lon:    float = Query(..., description="Longitude", example=-73.9855),
+    lat:    float = Query(..., description="Latitude", examples=[40.7580]),
+    lon:    float = Query(..., description="Longitude", examples=[-73.9855]),
     rayon:  float = Query(1.5, description="Rayon en km", ge=0.1, le=50.0),
-    statut: Optional[Literal["available", "delivering", "idle"]] = Query(None),
+    statut: Optional[Literal["available", "delivering", "pickup", "repositioning", "idle"]] = Query(None),
     limit:  int   = Query(50, ge=1, le=1000),
+    track_points: int = Query(0, ge=0, le=64, description="Nombre de points recents a joindre"),
 ):
     r: aioredis.Redis = app.state.redis
 
@@ -790,26 +1112,39 @@ async def livreurs_proches(
         op_name="pipeline hgetall livreurs-proches",
     )
 
+    track_payloads: list[list[str] | None]
+    if track_points > 0:
+        pipe = r.pipeline(transaction=False)
+        for item in raw:
+            pipe.lrange(f"{TRACK_KEY_PREFIX}{item[0]}", 0, track_points - 1)
+        track_payloads = await _run_redis(
+            pipe.execute(),
+            op_name="pipeline recent-track livreurs-proches",
+            default=[],
+        ) or []
+        if len(track_payloads) != len(raw):
+            track_payloads = [None] * len(raw)
+    else:
+        track_payloads = [None] * len(raw)
+
     livreurs: list[LivreurPosition] = []
-    for item, h in zip(raw, hashes):
+    for item, h, track_raw in zip(raw, hashes, track_payloads):
         name, dist, (glon, glat) = item
         if not h:
             continue
         normalized_status = _canonical_status(h.get("status"))
-        if statut and normalized_status != statut:
+        if statut and _status_bucket(normalized_status) != statut:
             continue
-        livreurs.append(LivreurPosition(
-            livreur_id=name,
-            lat=float(h.get("lat", glat)),
-            lon=float(h.get("lon", glon)),
-            speed_kmh=float(h.get("speed_kmh", 0)),
-            heading_deg=float(h.get("heading_deg", 0)),
-            status=normalized_status,
-            accuracy_m=float(h.get("accuracy_m", 0)),
-            battery_pct=float(h.get("battery_pct", 0)),
-            ts=h.get("ts", ""),
-            distance_km=round(dist, 3),
-        ))
+        livreurs.append(
+            _build_livreur_position(
+                name,
+                h,
+                fallback_lat=float(glat),
+                fallback_lon=float(glon),
+                distance_km=round(dist, 3),
+                recent_track=_parse_recent_track(track_raw if isinstance(track_raw, list) else None),
+            )
+        )
 
     return NearbyResponse(count=len(livreurs), rayon_km=rayon, livreurs=livreurs)
 
@@ -937,16 +1272,32 @@ async def livreur_focus(
             "accuracy_m": float(hot.get("accuracy_m", 0.0) or 0.0),
             "battery_pct": float(hot.get("battery_pct", 0.0) or 0.0),
             "ts": ts_iso,
+            "route_source": str(hot.get("route_source") or ""),
+            "anomaly_state": str(hot.get("anomaly_state") or "ok"),
+            "stale_reason": str(hot.get("stale_reason") or ""),
         }
 
     trail: list[dict] = []
     if trail_points > 0 and position is not None:
+        hot_track_raw = await _run_redis(
+            r.lrange(f"{TRACK_KEY_PREFIX}{driver_id}", 0, min(int(trail_points), 64) - 1),
+            op_name=f"lrange focus-track {driver_id}",
+            default=[],
+            strict=False,
+        ) or []
+        hot_trail = _parse_recent_track(hot_track_raw if isinstance(hot_track_raw, list) else None)
         window_end = now_utc
         cache_key = _focus_trail_cache_key(driver_id, int(trail_points), window_end)
         cached_trail = await _focus_trail_cache_get(cache_key)
         if cached_trail is not None:
-            trail = cached_trail
+            trail = _merge_focus_trail_points(
+                cached_trail,
+                hot_trail,
+                position=position,
+                max_points=int(trail_points),
+            )
         else:
+            cold_trail: list[dict[str, Any]] = []
             dynamic_lookback_min = max(
                 10,
                 min(FOCUS_TRAIL_LOOKBACK_MIN, int(math.ceil(float(trail_points) / 3.0))),
@@ -972,7 +1323,7 @@ async def livreur_focus(
             for ts_val, lat_v, lon_v, speed_v, status_v in reversed(rows):
                 if lat_v is None or lon_v is None:
                     continue
-                trail.append(
+                cold_trail.append(
                     {
                         "ts": ts_val.isoformat() if isinstance(ts_val, datetime) else str(ts_val),
                         "lat": float(lat_v),
@@ -981,7 +1332,13 @@ async def livreur_focus(
                         "status": _canonical_status(status_v),
                     }
                 )
-            await _focus_trail_cache_set(cache_key, trail)
+            trail = _merge_focus_trail_points(
+                cold_trail,
+                hot_trail,
+                position=position,
+                max_points=int(trail_points),
+            )
+            await _focus_trail_cache_set(cache_key, cold_trail)
 
     replay_status = await _run_redis(
         r.hgetall("copilot:replay:tlc:single:status"),
@@ -1021,16 +1378,18 @@ async def get_livreur(livreur_id: str):
             status_code=404,
             detail=f"'{livreur_id}' introuvable — TTL expiré ou livreur inexistant.",
         )
-    return LivreurPosition(
-        livreur_id=livreur_id,
-        lat=float(h.get("lat", 0)),
-        lon=float(h.get("lon", 0)),
-        speed_kmh=float(h.get("speed_kmh", 0)),
-        heading_deg=float(h.get("heading_deg", 0)),
-        status=_canonical_status(h.get("status")),
-        accuracy_m=float(h.get("accuracy_m", 0)),
-        battery_pct=float(h.get("battery_pct", 0)),
-        ts=h.get("ts", ""),
+    raw_track = await _run_redis(
+        r.lrange(f"{TRACK_KEY_PREFIX}{livreur_id}", 0, 5),
+        op_name=f"lrange recent-track {livreur_id}",
+        default=[],
+        strict=False,
+    )
+    return _build_livreur_position(
+        livreur_id,
+        h,
+        fallback_lat=0.0,
+        fallback_lon=0.0,
+        recent_track=_parse_recent_track(raw_track if isinstance(raw_track, list) else None),
     )
 
 
@@ -1073,7 +1432,8 @@ async def stats():
     # Source de vérité : sorted set GEO (purgé par _purge_ghosts_loop côté hot path).
     # On évite KEYS HASH_PREFIX:* qui est O(N) bloquant sur Redis et inclut les hashes
     # éphémères pas encore expirés alors que le livreur a déjà disparu de la flotte.
-    status_counts: dict[str, int] = {"available": 0, "delivering": 0, "idle": 0}
+    status_counts = _status_bucket_counts_template()
+    status_counts_detail = _status_detail_counts_template()
     status_sampled = 0
     livreur_ids: list[str] = []
     if redis_available and total_geo > 0:
@@ -1103,19 +1463,14 @@ async def stats():
         ) or []
         for s in statuses:
             canonical = _canonical_status(s)
-            if canonical in status_counts:
-                status_counts[canonical] += 1
+            detail_key = canonical if canonical in status_counts_detail else "unknown"
+            status_counts_detail[detail_key] += 1
+            bucket = _status_bucket(canonical)
+            if bucket in status_counts:
+                status_counts[bucket] += 1
     if status_sampled > 0 and total_geo > status_sampled:
-        ratio = total_geo / max(status_sampled, 1)
-        estimated: dict[str, int] = {}
-        for key in ("available", "delivering", "idle"):
-            estimated[key] = int(round(status_counts[key] * ratio))
-        estimated_total = sum(estimated.values())
-        if estimated_total != total_geo:
-            delta = total_geo - estimated_total
-            # Keep totals coherent for dashboards.
-            estimated["available"] = max(0, estimated["available"] + delta)
-        status_counts = estimated
+        status_counts = _scale_count_map(status_counts, total_geo, status_sampled)
+        status_counts_detail = _scale_count_map(status_counts_detail, total_geo, status_sampled)
 
     cold_snapshot = await _cold_path_snapshot_cached()
     parquet_files_count = int(cold_snapshot.get("cold_parquet_files", 0) or 0)
@@ -1126,6 +1481,7 @@ async def stats():
         "active_couriers": total_geo,
         "messages_processed": total_msgs,
         "status_counts": status_counts,
+        "status_counts_detail": status_counts_detail,
         "status_counts_sampled": status_sampled,
         "redis_available": redis_available,
         "cold_parquet_files": parquet_files_count,
@@ -1134,8 +1490,9 @@ async def stats():
             "livreurs_actifs":    total_geo,
             "messages_traites":   total_msgs,
             "statuts":            status_counts,
+            "statuts_detail":     status_counts_detail,
             "backend":            "Redis Stack (GEOSEARCH)",
-            "ttl_secondes":       30,
+            "ttl_secondes":       HOT_PATH_TTL_SECONDS,
             "redis_available":    redis_available,
         },
         "cold_path": {
@@ -1287,6 +1644,15 @@ async def history(
     window_start_iso = _dt_to_iso(window_start)
     window_end_iso = _dt_to_iso(ref_ts)
     scan_sql = _parquet_scan_sql(window_start, ref_ts)
+    cache_key = _analytics_cache_key(
+        "history",
+        livreur_id=livreur_id,
+        heures=int(heures),
+        reference_ts=(reference_ts or ""),
+    )
+    cached_entry = await _analytics_result_cache_get(cache_key, allow_stale=True)
+    cached_payload = cached_entry[0] if cached_entry else None
+    cached_at = cached_entry[1] if cached_entry else None
     try:
         rows = await _dq(
             f"""
@@ -1297,6 +1663,7 @@ async def history(
             ORDER BY ts
             """,
             [livreur_id, window_start_iso, window_end_iso],
+            timeout_sec=ANALYTICS_COLD_QUERY_TIMEOUT_SECONDS,
         )
 
         if not rows:
@@ -1326,13 +1693,64 @@ async def history(
             FROM ordered WHERE prev_lat IS NOT NULL
             """,
             [livreur_id, window_start_iso, window_end_iso],
+            timeout_sec=ANALYTICS_COLD_QUERY_TIMEOUT_SECONDS,
         )
         dist_row = dist_rows[0] if dist_rows else (0.0,)
 
-    except HTTPException:
-        raise
+    except HTTPException as exc:
+        if not _analytics_should_degrade(exc):
+            raise
+        detail = _analytics_exception_detail(
+            exc,
+            fallback_label="Historique trajectoire temporairement indisponible.",
+        )
+        if cached_payload:
+            return _analytics_status_payload(
+                cached_payload,
+                cold_path_available=False,
+                degraded=True,
+                source="stale_cache",
+                detail=detail + " Dernier snapshot analytique conserve.",
+                cached_at=cached_at,
+            )
+        return _analytics_status_payload(
+            {
+                "livreur_id": livreur_id,
+                "heures": heures,
+                "trajectory": [],
+                "time_reference": _build_time_reference(ref_meta, ref_ts, window_start),
+            },
+            cold_path_available=False,
+            degraded=True,
+            source="cold_path_fallback",
+            detail=detail,
+        )
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Erreur DuckDB : {exc}")
+        detail = _analytics_exception_detail(
+            exc,
+            fallback_label="Historique trajectoire temporairement indisponible.",
+        )
+        if cached_payload:
+            return _analytics_status_payload(
+                cached_payload,
+                cold_path_available=False,
+                degraded=True,
+                source="stale_cache",
+                detail=detail + " Dernier snapshot analytique conserve.",
+                cached_at=cached_at,
+            )
+        return _analytics_status_payload(
+            {
+                "livreur_id": livreur_id,
+                "heures": heures,
+                "trajectory": [],
+                "time_reference": _build_time_reference(ref_meta, ref_ts, window_start),
+            },
+            cold_path_available=False,
+            degraded=True,
+            source="cold_path_fallback",
+            detail=detail,
+        )
 
     speeds    = [r[2] for r in rows if r[2] is not None]
     statuses  = [r[4] for r in rows if r[4]]
@@ -1357,13 +1775,21 @@ async def history(
         for r in rows
     ]
 
-    return HistoryResponse(
-        livreur_id=livreur_id,
-        heures=heures,
-        resume=resume,
-        trajectory=trajectory,
-        time_reference=_build_time_reference(ref_meta, ref_ts, window_start),
+    payload = {
+        "livreur_id": livreur_id,
+        "heures": heures,
+        "resume": resume.model_dump(),
+        "trajectory": trajectory,
+        "time_reference": _build_time_reference(ref_meta, ref_ts, window_start),
+    }
+    payload = _analytics_status_payload(
+        payload,
+        cold_path_available=True,
+        degraded=False,
+        source="live",
     )
+    await _analytics_result_cache_set(cache_key, payload)
+    return payload
 
 
 @app.get(
@@ -1538,6 +1964,14 @@ async def fleet_insights(
     ref_ts, ref_meta = await _resolve_reference_ts(reference_ts)
     window_start = ref_ts - timedelta(hours=heures)
     scan_sql = _parquet_scan_sql(window_start, ref_ts)
+    cache_key = _analytics_cache_key(
+        "fleet-insights",
+        heures=int(heures),
+        reference_ts=(reference_ts or ""),
+    )
+    cached_entry = await _analytics_result_cache_get(cache_key, allow_stale=True)
+    cached_payload = cached_entry[0] if cached_entry else None
+    cached_at = cached_entry[1] if cached_entry else None
 
     # ── Hot Path : état instantané ───────────────────────────────────────────
     redis_available = bool(
@@ -1570,7 +2004,8 @@ async def fleet_insights(
                 strict=False,
             ) or []
         )
-    status_counts: dict[str, int] = {"available": 0, "delivering": 0, "idle": 0}
+    status_counts = _status_bucket_counts_template()
+    status_counts_detail = _status_detail_counts_template()
     idle_suspects: list[dict] = []
     low_battery: list[dict] = []
 
@@ -1584,19 +2019,43 @@ async def fleet_insights(
             default=[],
             strict=False,
         ) or []
-        for lid, vals in zip(livreur_ids, results):
+        pipe = r.pipeline(transaction=False)
+        for lid in livreur_ids:
+            pipe.lrange(f"{TRACK_KEY_PREFIX}{lid}", 0, FLEET_INSIGHTS_TRACK_POINTS - 1)
+        track_payloads = await _run_redis(
+            pipe.execute(),
+            op_name="pipeline recent-track fleet-insights",
+            default=[],
+            strict=False,
+        ) or []
+        if len(track_payloads) != len(livreur_ids):
+            track_payloads = [None] * len(livreur_ids)
+        for lid, vals, track_raw in zip(livreur_ids, results, track_payloads):
             status, speed, ts, lat, lon, battery = vals
             canonical_status = _canonical_status(status)
-            if canonical_status in status_counts:
-                status_counts[canonical_status] += 1
+            detail_key = canonical_status if canonical_status in status_counts_detail else "unknown"
+            status_counts_detail[detail_key] += 1
+            bucket = _status_bucket(canonical_status)
+            if bucket in status_counts:
+                status_counts[bucket] += 1
             try:
-                # Livreur "delivering" mais vitesse quasi nulle → suspect
-                if canonical_status == "delivering" and float(speed or 0) < 1.5:
+                recent_track = _parse_recent_track(track_raw if isinstance(track_raw, list) else None)
+                stationary_seconds, stationary_samples = _trailing_stationary_duration_seconds(
+                    recent_track,
+                    speed_threshold_kmh=FLEET_INSIGHTS_STATIONARY_SPEED_KMH,
+                )
+                if (
+                    canonical_status == "delivering"
+                    and stationary_seconds >= FLEET_INSIGHTS_STATIONARY_MIN_SECONDS
+                ):
                     idle_suspects.append({
                         "livreur_id": lid,
                         "status": canonical_status,
                         "speed_kmh": round(float(speed or 0), 1),
                         "ts": ts,
+                        "immobile_duration_s": int(round(stationary_seconds)),
+                        "immobile_duration_min": round(stationary_seconds / 60.0, 1),
+                        "samples": stationary_samples,
                     })
                 # Batterie faible (<20%) → alerte opérationnelle
                 batt = float(battery or 0)
@@ -1609,8 +2068,22 @@ async def fleet_insights(
             except (ValueError, TypeError):
                 pass
 
+    active_work_count = (
+        status_counts["delivering"]
+        + status_counts["pickup"]
+        + status_counts["repositioning"]
+    )
     utilisation_pct = round(
         status_counts["delivering"] / total_actifs * 100 if total_actifs else 0, 1
+    )
+    engagement_pct = round(
+        active_work_count / total_actifs * 100 if total_actifs else 0, 1
+    )
+    pickup_pct = round(
+        status_counts["pickup"] / total_actifs * 100 if total_actifs else 0, 1
+    )
+    repositioning_pct = round(
+        status_counts["repositioning"] / total_actifs * 100 if total_actifs else 0, 1
     )
     disponibilite_pct = round(
         status_counts["available"] / total_actifs * 100 if total_actifs else 0, 1
@@ -1628,6 +2101,9 @@ async def fleet_insights(
         "stops_suspects_total": 0,
     }
     cold_path_available = False
+    analytics_degraded = False
+    analytics_source = "live"
+    analytics_detail = ""
     try:
         rows = await _dq(
             f"""
@@ -1657,6 +2133,17 @@ async def fleet_insights(
             }
     except Exception as exc:
         log.warning("fleet-insights cold path error: %s", exc)
+        analytics_degraded = True
+        analytics_detail = _analytics_exception_detail(
+            exc,
+            fallback_label="Productivité historique temporairement indisponible.",
+        )
+        if cached_payload and isinstance(cached_payload.get("productivite_historique"), dict):
+            cold_stats = copy.deepcopy(cached_payload["productivite_historique"])
+            analytics_source = "stale_cache"
+            analytics_detail += " Dernier snapshot analytique conservé."
+        else:
+            analytics_source = "hot_only_fallback"
 
     # ── Score de santé opérationnelle (0-100) ────────────────────────────────
     score = 100
@@ -1672,7 +2159,7 @@ async def fleet_insights(
         score -= 10   # Trop de livreurs en batterie faible
     score = max(0, score)
 
-    return {
+    payload = {
         "periode_heures": heures,
         "sante_operationnelle": {
             "score": score,
@@ -1681,14 +2168,22 @@ async def fleet_insights(
         "flotte_temps_reel": {
             "total_actifs":        total_actifs,
             "statuts":             status_counts,
+            "statuts_detail":      status_counts_detail,
             "taux_utilisation_pct": utilisation_pct,
+            "taux_engagement_pct": engagement_pct,
+            "taux_pickup_pct":     pickup_pct,
+            "taux_reposition_pct": repositioning_pct,
             "taux_disponibilite_pct": disponibilite_pct,
             "taux_inactivite_pct": inactivite_pct,
             "redis_available":     redis_available,
         },
         "alertes": {
             "livreurs_immobiles_en_livraison": len(idle_suspects),
-            "detail_suspects": idle_suspects[:5],
+            "detail_suspects": sorted(
+                idle_suspects,
+                key=lambda item: item.get("immobile_duration_s", 0),
+                reverse=True,
+            )[:5],
             "livreurs_batterie_faible": len(low_battery),
             "detail_batterie": sorted(low_battery, key=lambda x: x["battery_pct"])[:5],
         },
@@ -1700,6 +2195,17 @@ async def fleet_insights(
         ),
         "time_reference": _build_time_reference(ref_meta, ref_ts, window_start),
     }
+    payload = _analytics_status_payload(
+        payload,
+        cold_path_available=cold_path_available,
+        degraded=analytics_degraded,
+        source=analytics_source,
+        detail=analytics_detail,
+        cached_at=cached_at if analytics_source == "stale_cache" else None,
+    )
+    if cold_path_available:
+        await _analytics_result_cache_set(cache_key, payload)
+    return payload
 
 
 def _build_recommendations(
@@ -1763,6 +2269,15 @@ async def driver_score(
     ref_ts, ref_meta = await _resolve_reference_ts(reference_ts)
     window_start = ref_ts - timedelta(hours=heures)
     scan_sql = _parquet_scan_sql(window_start, ref_ts)
+    cache_key = _analytics_cache_key(
+        "driver-score",
+        livreur_id=livreur_id,
+        heures=int(heures),
+        reference_ts=(reference_ts or ""),
+    )
+    cached_entry = await _analytics_result_cache_get(cache_key, allow_stale=True)
+    cached_payload = cached_entry[0] if cached_entry else None
+    cached_at = cached_entry[1] if cached_entry else None
     try:
         rows = await _dq(
             f"""
@@ -1800,10 +2315,61 @@ async def driver_score(
             SELECT * FROM stats
             """,
             [livreur_id, _dt_to_iso(window_start), _dt_to_iso(ref_ts)],
+            timeout_sec=ANALYTICS_COLD_QUERY_TIMEOUT_SECONDS,
         )
         row = rows[0] if rows else None
+    except HTTPException as exc:
+        if not _analytics_should_degrade(exc):
+            raise
+        detail = _analytics_exception_detail(
+            exc,
+            fallback_label="Score livreur temporairement indisponible.",
+        )
+        if cached_payload:
+            return _analytics_status_payload(
+                cached_payload,
+                cold_path_available=False,
+                degraded=True,
+                source="stale_cache",
+                detail=detail + " Dernier snapshot analytique conserve.",
+                cached_at=cached_at,
+            )
+        return _analytics_status_payload(
+            {
+                "livreur_id": livreur_id,
+                "periode_heures": heures,
+                "time_reference": _build_time_reference(ref_meta, ref_ts, window_start),
+            },
+            cold_path_available=False,
+            degraded=True,
+            source="cold_path_fallback",
+            detail=detail,
+        )
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Erreur DuckDB : {exc}")
+        detail = _analytics_exception_detail(
+            exc,
+            fallback_label="Score livreur temporairement indisponible.",
+        )
+        if cached_payload:
+            return _analytics_status_payload(
+                cached_payload,
+                cold_path_available=False,
+                degraded=True,
+                source="stale_cache",
+                detail=detail + " Dernier snapshot analytique conserve.",
+                cached_at=cached_at,
+            )
+        return _analytics_status_payload(
+            {
+                "livreur_id": livreur_id,
+                "periode_heures": heures,
+                "time_reference": _build_time_reference(ref_meta, ref_ts, window_start),
+            },
+            cold_path_available=False,
+            degraded=True,
+            source="cold_path_fallback",
+            detail=detail,
+        )
 
     if not row or row[0] == 0:
         raise HTTPException(
@@ -1843,7 +2409,7 @@ async def driver_score(
         "D" if score_total >= 40 else "E"
     )
 
-    return {
+    payload = {
         "livreur_id":    livreur_id,
         "periode_heures": heures,
         "score_global":  score_total,
@@ -1878,6 +2444,14 @@ async def driver_score(
         ),
         "time_reference": _build_time_reference(ref_meta, ref_ts, window_start),
     }
+    payload = _analytics_status_payload(
+        payload,
+        cold_path_available=True,
+        degraded=False,
+        source="live",
+    )
+    await _analytics_result_cache_set(cache_key, payload)
+    return payload
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -1906,6 +2480,15 @@ async def zone_coverage(
     ref_ts, ref_meta = await _resolve_reference_ts(reference_ts)
     window_start = ref_ts - timedelta(hours=heures)
     scan_sql = _parquet_scan_sql(window_start, ref_ts)
+    cache_key = _analytics_cache_key(
+        "zone-coverage",
+        resolution=round(float(resolution), 6),
+        heures=int(heures),
+        reference_ts=(reference_ts or ""),
+    )
+    cached_entry = await _analytics_result_cache_get(cache_key, allow_stale=True)
+    cached_payload = cached_entry[0] if cached_entry else None
+    cached_at = cached_entry[1] if cached_entry else None
 
     # ── Hot Path : positions actuelles → agrégation par cellule ─────────────
     raw = await _run_redis(
@@ -1929,6 +2512,7 @@ async def zone_coverage(
 
     # ── Cold Path : densité historique par cellule ───────────────────────────
     demand: dict[tuple, int] = {}
+    cold_path_error: Exception | None = None
     try:
         rows = await _dq(
             f"""
@@ -1946,13 +2530,27 @@ async def zone_coverage(
             demand[(lat_c, lon_c)] = passages
     except Exception as exc:
         log.warning("zone-coverage cold path error: %s", exc)
+        cold_path_error = exc
+
+    if cold_path_error is not None and cached_payload:
+        return _analytics_status_payload(
+            cached_payload,
+            cold_path_available=False,
+            degraded=True,
+            source="stale_cache",
+            detail=_analytics_exception_detail(
+                cold_path_error,
+                fallback_label="Couverture territoriale historique temporairement indisponible.",
+            )
+            + " Dernier snapshot analytique conservé.",
+            cached_at=cached_at,
+        )
 
     if not demand:
-        return {
+        payload = {
             "periode_heures": heures,
             "resolution_deg": resolution,
             "nb_zones_analysees": 0,
-            "cold_path_available": False,
             "resume": {
                 "zones_sous_couvertes": 0,
                 "zones_sur_couvertes": 0,
@@ -1963,9 +2561,23 @@ async def zone_coverage(
                 "zones_saturees": [],
             },
             "toutes_zones": [],
-            "detail": "Données historiques indisponibles (fallback hot-path).",
             "time_reference": _build_time_reference(ref_meta, ref_ts, window_start),
         }
+        detail = (
+            _analytics_exception_detail(
+                cold_path_error,
+                fallback_label="Données historiques indisponibles pour la couverture territoriale.",
+            )
+            if cold_path_error is not None
+            else "Aucune donnée historique exploitable sur la fenêtre demandée."
+        )
+        return _analytics_status_payload(
+            payload,
+            cold_path_available=False,
+            degraded=True,
+            source="hot_only_fallback" if cold_path_error is not None else "cold_path_empty",
+            detail=detail,
+        )
 
     # ── Calcul du ratio offre/demande par cellule ────────────────────────────
     max_demand = max(demand.values()) or 1
@@ -2000,11 +2612,10 @@ async def zone_coverage(
     sous_couvertes = [z for z in zones if z["statut"] == "sous-couverte"]
     sur_couvertes  = [z for z in zones if z["statut"] == "sur-couverte"]
 
-    return {
+    payload = {
         "periode_heures":   heures,
         "resolution_deg":   resolution,
         "nb_zones_analysees": len(zones),
-        "cold_path_available": True,
         "resume": {
             "zones_sous_couvertes": len(sous_couvertes),
             "zones_sur_couvertes":  len(sur_couvertes),
@@ -2017,6 +2628,14 @@ async def zone_coverage(
         "toutes_zones": zones,
         "time_reference": _build_time_reference(ref_meta, ref_ts, window_start),
     }
+    payload = _analytics_status_payload(
+        payload,
+        cold_path_available=True,
+        degraded=False,
+        source="live",
+    )
+    await _analytics_result_cache_set(cache_key, payload)
+    return payload
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -2040,7 +2659,8 @@ async def detect_anomalies(
     Détecte 3 types d'anomalies :
 
     - VITESSE_EXCESSIVE : dépassement du seuil configurable (défaut 50 km/h)
-    - IMMOBILISATION_SUSPECTE : livreur en 'delivering' quasi à l'arrêt > 2 min
+    - IMMOBILISATION_SUSPECTE : livreur en livraison réelle quasi à l'arrêt
+      pendant une durée minimale configurable (défaut 2 min)
     - DEVIATION_COMPORTEMENTALE : vitesse actuelle dévie fortement de sa propre baseline (z-score)
 
     Cas d'usage : sécurité routière, détection pannes/accidents, conformité assurance.
@@ -2049,6 +2669,19 @@ async def detect_anomalies(
     baseline_start = ref_ts - timedelta(minutes=fenetre_minutes * 2)
     analysis_start = ref_ts - timedelta(minutes=fenetre_minutes)
     scan_sql = _parquet_scan_sql(baseline_start, ref_ts, max_hours=24)
+    cache_key = _analytics_cache_key(
+        "anomalies",
+        fenetre_minutes=int(fenetre_minutes),
+        seuil_vitesse=round(float(seuil_vitesse), 3),
+        seuil_immobile=round(float(seuil_immobile), 3),
+        reference_ts=(reference_ts or ""),
+    )
+    cached_entry = await _analytics_result_cache_get(cache_key, allow_stale=True)
+    cached_payload = cached_entry[0] if cached_entry else None
+    cached_at = cached_entry[1] if cached_entry else None
+    delivering_statuses_sql = ", ".join(
+        _sql_quote_literal(status) for status in sorted(DELIVERING_STATUS_ALIASES)
+    )
     try:
         # Récupère les stats par livreur sur la fenêtre demandée
         rows = await _dq(
@@ -2072,7 +2705,18 @@ async def detect_anomalies(
                     MAX(speed_kmh)                                          AS speed_max_recent,
                     AVG(speed_kmh)                                          AS speed_moy_recent,
                     COUNT(*) FILTER (WHERE speed_kmh > ?)                   AS nb_exces_vitesse,
-                    COUNT(*) FILTER (WHERE speed_kmh < ? AND status = 'delivering') AS nb_immobile_delivering,
+                    COUNT(*) FILTER (
+                        WHERE speed_kmh < ?
+                          AND status IN ({delivering_statuses_sql})
+                    ) AS nb_immobile_delivering,
+                    MIN(ts) FILTER (
+                        WHERE speed_kmh < ?
+                          AND status IN ({delivering_statuses_sql})
+                    ) AS immobile_start_ts,
+                    MAX(ts) FILTER (
+                        WHERE speed_kmh < ?
+                          AND status IN ({delivering_statuses_sql})
+                    ) AS immobile_end_ts,
                     -- Z-score : déviation de la vitesse récente vs baseline personnelle
                     CASE
                         WHEN MAX(baseline_std) > 0
@@ -2084,10 +2728,20 @@ async def detect_anomalies(
                 WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
                 GROUP BY livreur_id
                 HAVING COUNT(*) >= 3
+            ),
+            scored AS (
+                SELECT
+                    *,
+                    CASE
+                        WHEN immobile_start_ts IS NOT NULL AND immobile_end_ts IS NOT NULL
+                        THEN EXTRACT(EPOCH FROM (immobile_end_ts - immobile_start_ts))
+                        ELSE 0
+                    END AS immobile_duration_s
+                FROM recent
             )
-            SELECT * FROM recent
+            SELECT * FROM scored
             WHERE nb_exces_vitesse > 0
-               OR nb_immobile_delivering >= 2
+               OR immobile_duration_s >= ?
                OR z_score > 2.5
             ORDER BY z_score DESC, nb_exces_vitesse DESC
             """,
@@ -2096,8 +2750,11 @@ async def detect_anomalies(
                 _dt_to_iso(ref_ts),
                 seuil_vitesse,
                 seuil_immobile,
+                seuil_immobile,
+                seuil_immobile,
                 _dt_to_iso(analysis_start),
                 _dt_to_iso(ref_ts),
+                ANOMALY_STATIONARY_MIN_SECONDS,
             ],
         )
         scanned_rows = await _dq(
@@ -2110,11 +2767,57 @@ async def detect_anomalies(
         )
         total_scanned = scanned_rows[0][0] if scanned_rows else 0
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Erreur DuckDB : {exc}")
+        log.warning("anomalies cold path error: %s", exc)
+        detail = _analytics_exception_detail(
+            exc,
+            fallback_label="Analyse des anomalies temporairement indisponible.",
+        )
+        if cached_payload:
+            return _analytics_status_payload(
+                cached_payload,
+                cold_path_available=False,
+                degraded=True,
+                source="stale_cache",
+                detail=detail + " Dernier snapshot analytique conservé.",
+                cached_at=cached_at,
+            )
+        fallback_payload = {
+            "fenetre_minutes":    fenetre_minutes,
+            "seuils": {
+                "vitesse_excessive_kmh":  seuil_vitesse,
+                "immobilisation_kmh_max": seuil_immobile,
+                "immobilisation_duree_min_secondes": ANOMALY_STATIONARY_MIN_SECONDS,
+                "z_score_deviation":      2.5,
+            },
+            "resume": {
+                "livreurs_scannes":    0,
+                "anomalies_detectees": 0,
+                "critiques":           0,
+                "warnings":            0,
+            },
+            "anomalies": [],
+            "methodologie": (
+                "z-score sur baseline individuelle (vitesse moyenne personnelle) + "
+                "seuils absolus vitesse/immobilisation avec durée minimale"
+            ),
+            "time_reference": _build_time_reference(
+                ref_meta,
+                ref_ts,
+                analysis_start,
+                {"baseline_window_start": _dt_to_iso(baseline_start)},
+            ),
+        }
+        return _analytics_status_payload(
+            fallback_payload,
+            cold_path_available=False,
+            degraded=True,
+            source="cold_path_fallback",
+            detail=detail,
+        )
 
     anomalies = []
     for row in rows:
-        lid, spd_max, spd_moy, nb_exces, nb_immob, z_score, last_ts = row
+        lid, spd_max, spd_moy, nb_exces, nb_immob, _immobile_start_ts, _immobile_end_ts, z_score, last_ts, immobile_duration_s = row
 
         types_anomalie = []
         niveau = "info"
@@ -2127,10 +2830,14 @@ async def detect_anomalies(
             })
             niveau = "critique" if spd_max > 70 else "warning"
 
-        if nb_immob >= 2:
+        if immobile_duration_s >= ANOMALY_STATIONARY_MIN_SECONDS:
             types_anomalie.append({
                 "type": "IMMOBILISATION_SUSPECTE",
-                "detail": f"Livreur en statut 'delivering' quasi à l'arrêt ({nb_immob} fois en {fenetre_minutes}min)",
+                "detail": (
+                    "Livreur en livraison réelle quasi à l'arrêt "
+                    f"pendant {round(float(immobile_duration_s) / 60.0, 1)} min "
+                    f"({nb_immob} point(s) sous {seuil_immobile} km/h)"
+                ),
                 "risque": "Accident possible, véhicule en panne, application gelée",
             })
             niveau = "critique"
@@ -2152,17 +2859,19 @@ async def detect_anomalies(
                 "vitesse_max_kmh":   round(spd_max, 1),
                 "vitesse_moy_kmh":   round(spd_moy, 1),
                 "z_score":           round(z_score, 2),
+                "immobile_duration_s": int(round(float(immobile_duration_s or 0.0))),
                 "derniere_position": str(last_ts),
             })
 
     nb_critique = sum(1 for a in anomalies if a["niveau"] == "critique")
     nb_warning  = sum(1 for a in anomalies if a["niveau"] == "warning")
 
-    return {
+    payload = {
         "fenetre_minutes":    fenetre_minutes,
         "seuils": {
             "vitesse_excessive_kmh":  seuil_vitesse,
             "immobilisation_kmh_max": seuil_immobile,
+            "immobilisation_duree_min_secondes": ANOMALY_STATIONARY_MIN_SECONDS,
             "z_score_deviation":      2.5,
         },
         "resume": {
@@ -2174,7 +2883,7 @@ async def detect_anomalies(
         "anomalies": anomalies,
         "methodologie": (
             "z-score sur baseline individuelle (vitesse moyenne personnelle) + "
-            "seuils absolus vitesse/immobilisation"
+            "seuils absolus vitesse/immobilisation avec durée minimale"
         ),
         "time_reference": _build_time_reference(
             ref_meta,
@@ -2183,6 +2892,14 @@ async def detect_anomalies(
             {"baseline_window_start": _dt_to_iso(baseline_start)},
         ),
     }
+    payload = _analytics_status_payload(
+        payload,
+        cold_path_available=True,
+        degraded=False,
+        source="live",
+    )
+    await _analytics_result_cache_set(cache_key, payload)
+    return payload
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -2217,6 +2934,16 @@ async def detect_gps_fraud(
     ref_ts, ref_meta = await _resolve_reference_ts(reference_ts)
     window_start = ref_ts - timedelta(minutes=fenetre_minutes)
     scan_sql = _parquet_scan_sql(window_start, ref_ts, max_hours=24)
+    cache_key = _analytics_cache_key(
+        "gps-fraud",
+        fenetre_minutes=int(fenetre_minutes),
+        seuil_teleport_km=round(float(seuil_teleport_km), 3),
+        vitesse_max_physique_kmh=round(float(vitesse_max_physique_kmh), 3),
+        reference_ts=(reference_ts or ""),
+    )
+    cached_entry = await _analytics_result_cache_get(cache_key, allow_stale=True)
+    cached_payload = cached_entry[0] if cached_entry else None
+    cached_at = cached_entry[1] if cached_entry else None
     try:
         rows = await _dq(
             f"""
@@ -2273,6 +3000,7 @@ async def detect_gps_fraud(
                 seuil_teleport_km,
                 vitesse_max_physique_kmh,
             ],
+            timeout_sec=ANALYTICS_COLD_QUERY_TIMEOUT_SECONDS,
         )
 
         # Positions figées : même lat/lon sur >5 mesures consécutives
@@ -2307,6 +3035,7 @@ async def detect_gps_fraud(
             LIMIT 20
             """,
             [_dt_to_iso(window_start), _dt_to_iso(ref_ts)],
+            timeout_sec=ANALYTICS_COLD_QUERY_TIMEOUT_SECONDS,
         )
 
         scanned_rows = await _dq(
@@ -2316,10 +3045,97 @@ async def detect_gps_fraud(
             WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
             """,
             [_dt_to_iso(window_start), _dt_to_iso(ref_ts)],
+            timeout_sec=ANALYTICS_COLD_QUERY_TIMEOUT_SECONDS,
         )
         total_scanned = scanned_rows[0][0] if scanned_rows else 0
+    except HTTPException as exc:
+        if not _analytics_should_degrade(exc):
+            raise
+        detail = _analytics_exception_detail(
+            exc,
+            fallback_label="Analyse fraude GPS temporairement indisponible.",
+        )
+        if cached_payload:
+            return _analytics_status_payload(
+                cached_payload,
+                cold_path_available=False,
+                degraded=True,
+                source="stale_cache",
+                detail=detail + " Dernier snapshot analytique conserve.",
+                cached_at=cached_at,
+            )
+        return _analytics_status_payload(
+            {
+                "fenetre_minutes": fenetre_minutes,
+                "seuils": {
+                    "teleportation_km": seuil_teleport_km,
+                    "vitesse_max_physique_kmh": vitesse_max_physique_kmh,
+                    "position_figee_min_rep": 5,
+                },
+                "resume": {
+                    "livreurs_scannes": 0,
+                    "teleportations": 0,
+                    "positions_figees": 0,
+                    "critiques": 0,
+                    "total_fraudes": 0,
+                },
+                "teleportations": [],
+                "positions_figees": [],
+                "methodologie": (
+                    "Haversine entre positions GPS consecutives par livreur. "
+                    "Si vitesse implicite (distance/temps) > seuil physique -> teleportation. "
+                    "Positions figees : memes coordonnees (arrondi 5 decimales) sur >=5 mesures."
+                ),
+                "time_reference": _build_time_reference(ref_meta, ref_ts, window_start),
+            },
+            cold_path_available=False,
+            degraded=True,
+            source="cold_path_fallback",
+            detail=detail,
+        )
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Erreur DuckDB : {exc}")
+        detail = _analytics_exception_detail(
+            exc,
+            fallback_label="Analyse fraude GPS temporairement indisponible.",
+        )
+        if cached_payload:
+            return _analytics_status_payload(
+                cached_payload,
+                cold_path_available=False,
+                degraded=True,
+                source="stale_cache",
+                detail=detail + " Dernier snapshot analytique conserve.",
+                cached_at=cached_at,
+            )
+        return _analytics_status_payload(
+            {
+                "fenetre_minutes": fenetre_minutes,
+                "seuils": {
+                    "teleportation_km": seuil_teleport_km,
+                    "vitesse_max_physique_kmh": vitesse_max_physique_kmh,
+                    "position_figee_min_rep": 5,
+                },
+                "resume": {
+                    "livreurs_scannes": 0,
+                    "teleportations": 0,
+                    "positions_figees": 0,
+                    "critiques": 0,
+                    "total_fraudes": 0,
+                },
+                "teleportations": [],
+                "positions_figees": [],
+                "methodologie": (
+                    "Haversine entre positions GPS consecutives par livreur. "
+                    "Si vitesse implicite (distance/temps) > seuil physique -> teleportation. "
+                    "Positions figees : memes coordonnees (arrondi 5 decimales) sur >=5 mesures."
+                ),
+                "time_reference": _build_time_reference(ref_meta, ref_ts, window_start),
+            },
+            cold_path_available=False,
+            degraded=True,
+            source="cold_path_fallback",
+            detail=detail,
+        )
 
     teleportations = []
     for row in rows:
@@ -2354,7 +3170,7 @@ async def detect_gps_fraud(
 
     nb_critique = sum(1 for t in teleportations if t["niveau"] == "critique")
 
-    return {
+    payload = {
         "fenetre_minutes":    fenetre_minutes,
         "seuils": {
             "teleportation_km":         seuil_teleport_km,
@@ -2377,6 +3193,14 @@ async def detect_gps_fraud(
         ),
         "time_reference": _build_time_reference(ref_meta, ref_ts, window_start),
     }
+    payload = _analytics_status_payload(
+        payload,
+        cold_path_available=True,
+        degraded=False,
+        source="live",
+    )
+    await _analytics_result_cache_set(cache_key, payload)
+    return payload
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -2409,6 +3233,14 @@ async def predict_demand(
     recent_start = ref_ts - timedelta(minutes=15)
     baseline_start = ref_ts - timedelta(hours=1)
     scan_sql = _parquet_scan_sql(baseline_start, ref_ts, max_hours=24)
+    cache_key = _analytics_cache_key(
+        "predict-demand",
+        horizon_minutes=int(horizon_minutes),
+        reference_ts=(reference_ts or ""),
+    )
+    cached_entry = await _analytics_result_cache_get(cache_key, allow_stale=True)
+    cached_payload = cached_entry[0] if cached_entry else None
+    cached_at = cached_entry[1] if cached_entry else None
     try:
         rows = await _dq(
             f"""
@@ -2454,9 +3286,88 @@ async def predict_demand(
                 _dt_to_iso(baseline_start),
                 _dt_to_iso(recent_start),
             ],
+            timeout_sec=ANALYTICS_COLD_QUERY_TIMEOUT_SECONDS,
+        )
+    except HTTPException as exc:
+        if not _analytics_should_degrade(exc):
+            raise
+        detail = _analytics_exception_detail(
+            exc,
+            fallback_label="Dispatch predictif temporairement indisponible.",
+        )
+        if cached_payload:
+            return _analytics_status_payload(
+                cached_payload,
+                cold_path_available=False,
+                degraded=True,
+                source="stale_cache",
+                detail=detail + " Dernier snapshot analytique conserve.",
+                cached_at=cached_at,
+            )
+        return _analytics_status_payload(
+            {
+                "horizon_minutes": horizon_minutes,
+                "methode": "Extrapolation tendancielle T-15min vs baseline T-1h",
+                "nb_zones_analysees": 0,
+                "resume": {
+                    "zones_en_hausse": 0,
+                    "zones_stables": 0,
+                    "zones_en_baisse": 0,
+                },
+                "dispatch_prioritaire": [],
+                "zones_a_decouvrir": [],
+                "toutes_zones": [],
+                "time_reference": _build_time_reference(
+                    ref_meta,
+                    ref_ts,
+                    recent_start,
+                    {"baseline_window_start": _dt_to_iso(baseline_start)},
+                ),
+            },
+            cold_path_available=False,
+            degraded=True,
+            source="cold_path_fallback",
+            detail=detail,
         )
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Erreur DuckDB : {exc}")
+        detail = _analytics_exception_detail(
+            exc,
+            fallback_label="Dispatch predictif temporairement indisponible.",
+        )
+        if cached_payload:
+            return _analytics_status_payload(
+                cached_payload,
+                cold_path_available=False,
+                degraded=True,
+                source="stale_cache",
+                detail=detail + " Dernier snapshot analytique conserve.",
+                cached_at=cached_at,
+            )
+        return _analytics_status_payload(
+            {
+                "horizon_minutes": horizon_minutes,
+                "methode": "Extrapolation tendancielle T-15min vs baseline T-1h",
+                "nb_zones_analysees": 0,
+                "resume": {
+                    "zones_en_hausse": 0,
+                    "zones_stables": 0,
+                    "zones_en_baisse": 0,
+                },
+                "dispatch_prioritaire": [],
+                "zones_a_decouvrir": [],
+                "toutes_zones": [],
+                "time_reference": _build_time_reference(
+                    ref_meta,
+                    ref_ts,
+                    recent_start,
+                    {"baseline_window_start": _dt_to_iso(baseline_start)},
+                ),
+            },
+            cold_path_available=False,
+            degraded=True,
+            source="cold_path_fallback",
+            detail=detail,
+        )
 
     zones = []
     for lat_c, lon_c, recent, speed, baseline, trend in rows:
@@ -2482,7 +3393,7 @@ async def predict_demand(
     cold  = [z for z in zones if z["signal"] == "baisse"]
     stable = [z for z in zones if z["signal"] == "stable"]
 
-    return {
+    payload = {
         "horizon_minutes":  horizon_minutes,
         "methode":          "Extrapolation tendancielle T-15min vs baseline T-1h",
         "nb_zones_analysees": len(zones),
@@ -2501,6 +3412,14 @@ async def predict_demand(
             {"baseline_window_start": _dt_to_iso(baseline_start)},
         ),
     }
+    payload = _analytics_status_payload(
+        payload,
+        cold_path_available=True,
+        degraded=False,
+        source="live",
+    )
+    await _analytics_result_cache_set(cache_key, payload)
+    return payload
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -2570,6 +3489,8 @@ async def surge_price(
     nb_total_zone = len(raw_drivers)
 
     nb_available = 0
+    nb_pickup = 0
+    nb_repositioning = 0
     nb_delivering = 0
     nb_idle = 0
     if raw_drivers:
@@ -2583,12 +3504,16 @@ async def surge_price(
             strict=False,
         ) or []
         for status in statuses:
-            canonical_status = _canonical_status(status)
-            if canonical_status == "available":
+            bucket = _status_bucket(status)
+            if bucket == "available":
                 nb_available += 1
-            elif canonical_status == "delivering":
+            elif bucket == "pickup":
+                nb_pickup += 1
+            elif bucket == "repositioning":
+                nb_repositioning += 1
+            elif bucket == "delivering":
                 nb_delivering += 1
-            elif canonical_status == "idle":
+            elif bucket == "idle":
                 nb_idle += 1
 
     # Pression offre : 0.0 (beaucoup de livreurs dispos) → 1.0 (aucun dispo)
@@ -2730,6 +3655,8 @@ async def surge_price(
             "source":            "Redis Hot Path (GEOSEARCH)",
             "livreurs_total":    nb_total_zone,
             "available":         nb_available,
+            "pickup":            nb_pickup,
+            "repositioning":     nb_repositioning,
             "delivering":        nb_delivering,
             "idle":              nb_idle,
             "scarcity_score":    supply_scarcity,

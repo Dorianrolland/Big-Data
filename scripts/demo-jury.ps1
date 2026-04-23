@@ -2,14 +2,15 @@
 # Usage:
 #   .\scripts\demo-jury.ps1
 #   .\scripts\demo-jury.ps1 -Fleet
+#   .\scripts\demo-jury.ps1 -Fleet:$false
 #   .\scripts\demo-jury.ps1 -KpisOnly
 
 param(
     [string]$ApiBase     = "http://localhost:8001",
     [int]$WarmupSec      = 45,
-    [int]$MinDrivers     = 1,
+    [int]$MinDrivers     = 140,
     [int]$BacktestMaxOffers = 5000,
-    [switch]$Fleet       = $false,
+    [switch]$Fleet       = $true,
     [switch]$SkipBuild   = $false,
     [switch]$KpisOnly    = $false
 )
@@ -89,12 +90,14 @@ $TotalSteps = 6
 
 Write-Step 1 $TotalSteps "Start Docker stack"
 Set-Location $Root
-$envArgs = if ($Fleet) { @("--env-file", "env/fleet_demo.env") } else { @() }
-$routingArgs = @()
-$osrmData = Join-Path $Root "data\osrm\new-york-latest.osrm"
+$envArgs = if ($Fleet) { @("--env-file", "env/fleet_jury.env") } else { @() }
+$routingArgs = @("--profile", "routing")
+$osrmData = Join-Path $Root "data\osrm\new-york-latest.osrm.properties"
 if (Test-Path $osrmData) {
-    $routingArgs = @("--profile", "routing")
     Write-Info "routing profile enabled (local OSRM data found)"
+} else {
+    Write-Fail "Missing OSRM dataset: $osrmData"
+    exit 1
 }
 if ($SkipBuild) {
     docker compose @envArgs @routingArgs up -d
@@ -150,8 +153,8 @@ $checks = [ordered]@{}
 
 $perf = Invoke-ApiSafe "$ApiBase/health/performance?samples=50"
 if ($perf) {
-    $checks["hot_path_p99_ms"] = [math]::Round([double]$perf.p99_ms, 2)
-    $checks["hot_path_ok"] = ([double]$perf.p99_ms -lt 10.0)
+    $checks["hot_path_p99_ms"] = [math]::Round([double]$perf.geosearch_benchmark.p99_ms, 2)
+    $checks["hot_path_ok"] = ([double]$perf.geosearch_benchmark.p99_ms -lt 10.0)
     if ($checks["hot_path_ok"]) {
         Write-Ok "Hot path p99 = $($checks['hot_path_p99_ms']) ms"
     } else {
@@ -164,8 +167,8 @@ if ($perf) {
 
 $scoreBody = '{"courier_id":"drv_demo_001","offer_id":"jury_offer_001","estimated_fare_eur":14.5,"estimated_distance_km":4.8,"estimated_duration_min":19,"zone_id":"Z01","demand_index":0.8,"supply_index":0.3}'
 $scoreResp = Invoke-ApiPostSafe "$ApiBase/copilot/score-offer" $scoreBody
-if ($scoreResp -and $null -ne $scoreResp.score) {
-    $checks["score_value"] = [math]::Round([double]$scoreResp.score, 3)
+if ($scoreResp -and $null -ne $scoreResp.accept_score) {
+    $checks["score_value"] = [math]::Round([double]$scoreResp.accept_score, 3)
     $checks["score_ok"] = $true
     Write-Ok "Score Copilot = $($checks['score_value']) / decision = $($scoreResp.decision)"
 } else {
@@ -177,6 +180,19 @@ $copilotHealth = Invoke-ApiSafe "$ApiBase/copilot/health"
 $checks["health_ok"] = ($null -ne $copilotHealth)
 if ($copilotHealth) {
     Write-Ok "Copilot health OK"
+    $replayHealth = $copilotHealth.tlc_replay
+    $routeLinearFallback = if ($null -ne $replayHealth -and $null -ne $replayHealth.route_linear_fallback) { [int]$replayHealth.route_linear_fallback } else { 0 }
+    $routeHoldFallback = if ($null -ne $replayHealth -and $null -ne $replayHealth.route_hold_fallback) { [int]$replayHealth.route_hold_fallback } else { 0 }
+    $routeOsrmErrors = if ($null -ne $replayHealth -and $null -ne $replayHealth.route_osrm_errors) { [int]$replayHealth.route_osrm_errors } else { 0 }
+    $checks["route_linear_fallback"] = $routeLinearFallback
+    $checks["route_hold_fallback"] = $routeHoldFallback
+    $checks["route_osrm_errors"] = $routeOsrmErrors
+    $checks["routing_quality_ok"] = ($routeLinearFallback -eq 0 -and $routeHoldFallback -eq 0 -and $routeOsrmErrors -eq 0)
+    if ($checks["routing_quality_ok"]) {
+        Write-Ok "Routing quality gate OK (linear=0, hold=0, errors=0)"
+    } else {
+        Write-Fail "Routing quality gate failed (linear=$routeLinearFallback, hold=$routeHoldFallback, errors=$routeOsrmErrors)"
+    }
 } else {
     Write-Fail "Copilot health unavailable"
 }
@@ -219,9 +235,15 @@ $snapPath = "$Root\data\reports\demo_jury_kpi_snapshot.json"
 $snapshot | ConvertTo-Json -Depth 5 | Set-Content $snapPath -Encoding UTF8
 Write-Ok "Snapshot: $snapPath"
 
+$allOk = (($checks.Values | Where-Object { $_ -is [bool] }) -notcontains $false)
+
 Write-Host ""
 Write-Host "========================================================" -ForegroundColor Cyan
-Write-Host "  DEMO READY - startup in ${elapsed}s" -ForegroundColor Cyan
+if ($allOk) {
+    Write-Host "  DEMO READY - startup in ${elapsed}s" -ForegroundColor Cyan
+} else {
+    Write-Host "  DEMO NOT READY - startup in ${elapsed}s" -ForegroundColor Red
+}
 Write-Host "========================================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "  URLs:"
@@ -239,10 +261,11 @@ Write-Host ""
 Write-Host "  Narration (5 min)  -> docs/demo-runbook.md" -ForegroundColor Yellow
 Write-Host ""
 
-$allOk = (($checks.Values | Where-Object { $_ -is [bool] }) -notcontains $false)
 if ($allOk) {
     Write-Host "  All critical checks are GREEN." -ForegroundColor Green
+    exit 0
 } else {
     Write-Host "  Some critical checks are RED. See details above." -ForegroundColor Red
+    exit 1
 }
 Write-Host ""
