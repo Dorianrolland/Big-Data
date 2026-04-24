@@ -43,7 +43,7 @@ def test_driver_profile_default_and_update_persistence():
             "/copilot/driver/drv_demo_001/profile",
             json={
                 "target_eur_h": 22.5,
-                "consommation_l_100": 8.2,
+                "vehicle_mpg": 28.7,
                 "aversion_risque": 0.71,
                 "max_eta": 14.0,
             },
@@ -52,7 +52,7 @@ def test_driver_profile_default_and_update_persistence():
         update_payload = update_resp.json()
         assert update_payload["source"] == "manual"
         assert update_payload["target_eur_h"] == 22.5
-        assert update_payload["consommation_l_100"] == 8.2
+        assert update_payload["vehicle_mpg"] == 28.7
         assert update_payload["aversion_risque"] == 0.71
         assert update_payload["max_eta"] == 14.0
 
@@ -61,7 +61,7 @@ def test_driver_profile_default_and_update_persistence():
         read_back = read_back_resp.json()
         assert read_back["source"] == "manual"
         assert read_back["target_eur_h"] == 22.5
-        assert read_back["consommation_l_100"] == 8.2
+        assert read_back["vehicle_mpg"] == 28.7
         assert read_back["aversion_risque"] == 0.71
         assert read_back["max_eta"] == 14.0
 
@@ -76,7 +76,7 @@ def test_driver_profile_partial_update_preserves_existing_values():
             "/copilot/driver/drv_demo_002/profile",
             json={
                 "target_eur_h": 20.0,
-                "consommation_l_100": 8.8,
+                "vehicle_mpg": 26.7,
                 "aversion_risque": 0.65,
                 "max_eta": 16.0,
             },
@@ -92,7 +92,7 @@ def test_driver_profile_partial_update_preserves_existing_values():
         assert second_update.status_code == 200
         payload = second_update.json()
         assert payload["target_eur_h"] == 20.0
-        assert payload["consommation_l_100"] == 8.8
+        assert payload["vehicle_mpg"] == 26.7
         assert payload["aversion_risque"] == 0.65
         assert payload["max_eta"] == 12.0
 
@@ -117,14 +117,14 @@ def test_rank_offers_changes_with_driver_profile_consumption():
         {
             router._driver_profile_key("drv_low_consumption"): {
                 "target_eur_h": "18.0",
-                "consommation_l_100": "5.0",
+                "vehicle_mpg": "47.0",
                 "aversion_risque": "0.3",
                 "max_eta": "20",
                 "source": "manual",
             },
             router._driver_profile_key("drv_high_consumption"): {
                 "target_eur_h": "18.0",
-                "consommation_l_100": "18.0",
+                "vehicle_mpg": "10.0",
                 "aversion_risque": "0.3",
                 "max_eta": "20",
                 "source": "manual",
@@ -203,8 +203,8 @@ def test_rank_offers_objective_weights_change_top_pick():
             "eta_to_pickup_min": 5.0,
             "demand_index": 1.5,
             "supply_index": 0.9,
-            "fuel_price_eur_l": 1.9,
-            "vehicle_consumption_l_100km": 11.0,
+            "fuel_price_usd_gallon": 3.8,
+            "vehicle_mpg": 21.4,
             "target_hourly_net_eur": 16.0,
         },
         {
@@ -217,8 +217,8 @@ def test_rank_offers_objective_weights_change_top_pick():
             "eta_to_pickup_min": 2.0,
             "demand_index": 1.2,
             "supply_index": 1.0,
-            "fuel_price_eur_l": 1.9,
-            "vehicle_consumption_l_100km": 7.5,
+            "fuel_price_usd_gallon": 3.8,
+            "vehicle_mpg": 31.4,
             "target_hourly_net_eur": 16.0,
         },
     ]
@@ -310,7 +310,7 @@ def test_instant_dispatch_uses_profile_when_query_params_not_overridden(monkeypa
         {
             router._driver_profile_key("drv_profile_001"): {
                 "target_eur_h": "21.0",
-                "consommation_l_100": "9.1",
+                "vehicle_mpg": "25.8",
                 "aversion_risque": "0.9",
                 "max_eta": "14.0",
                 "source": "manual",
@@ -320,7 +320,7 @@ def test_instant_dispatch_uses_profile_when_query_params_not_overridden(monkeypa
                 "lon": "-73.9855",
             },
             router.FUEL_CONTEXT_KEY: {
-                "fuel_price_eur_l": "1.82",
+                "fuel_price_usd_gallon": "3.64",
             },
         }
     )

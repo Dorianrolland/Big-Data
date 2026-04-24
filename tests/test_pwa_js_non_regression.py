@@ -180,7 +180,7 @@ const offerBase = {{
     {{ code: 'net_hourly', label: 'net hourly', impact: 'positive', value: 24.5, unit: 'eur_per_hour', source: 'target' }},
   ],
   costs: {{
-    fuel_cost_eur: 1.2,
+    fuel_cost_usd: 1.2,
     platform_fee_eur: 2.9,
     other_costs_eur: 0.3,
     estimated_net_eur: 8.6,
@@ -199,7 +199,7 @@ async function fetchStub(url, _opts) {{
       model_loaded: true,
       model_quality_gate: {{ accepted: true, reason: 'ok', trained_rows: 12345 }},
       model_metrics: {{ roc_auc: 0.81, average_precision: 0.79, brier_score: 0.12 }},
-      fuel_context: {{ fuel_price_eur_l: 1.71, source: 'stub', fuel_sync_status: 'ok' }},
+      fuel_context: {{ fuel_price_usd_gallon: 3.42, source: 'stub', fuel_sync_status: 'ok' }},
     }});
   }}
   if (path.endsWith('/mission-journal')) {{
@@ -236,7 +236,7 @@ async function fetchStub(url, _opts) {{
       return ok({{
         driver_id: 'drv_demo_001',
         target_eur_h: Number(lastProfilePutBody?.target_eur_h ?? 19.5),
-        consommation_l_100: Number(lastProfilePutBody?.consommation_l_100 ?? 7.1),
+        vehicle_mpg: Number(lastProfilePutBody?.vehicle_mpg ?? 32.0),
         aversion_risque: Number(lastProfilePutBody?.aversion_risque ?? 0.42),
         max_eta: Number(lastProfilePutBody?.max_eta ?? 18.0),
         source: 'manual',
@@ -246,7 +246,7 @@ async function fetchStub(url, _opts) {{
     return ok({{
       driver_id: 'drv_demo_001',
       target_eur_h: 18.0,
-      consommation_l_100: 7.5,
+      vehicle_mpg: 31.0,
       aversion_risque: 0.5,
       max_eta: 20.0,
       source: 'stored',
@@ -280,7 +280,7 @@ async function fetchStub(url, _opts) {{
         opportunity_score: 0.91,
         adjusted_opportunity_score: 0.86,
         distance_km: 2.1,
-        reposition_cost_eur: 1.4,
+        reposition_cost_usd: 1.4,
         reposition_time_min: 9.5,
         demand_index: 1.6,
         supply_index: 0.9,
@@ -315,7 +315,7 @@ async function fetchStub(url, _opts) {{
         estimated_potential_eur_h: 25.9,
         risk_adjusted_potential_eur_h: 23.8,
         net_gain_vs_stay_eur_h: 2.7,
-        travel_cost_eur: 1.0,
+        travel_cost_usd: 1.0,
         time_cost_eur: 1.8,
         risk_cost_eur: 0.7,
         reposition_total_cost_eur: 3.5,
@@ -647,7 +647,7 @@ async function main() {{
     realConsole.error('expected profile update payload to be captured');
     process.exit(1);
   }}
-  if (lastProfilePutBody.target_eur_h !== 150 || lastProfilePutBody.consommation_l_100 !== 7.5 || lastProfilePutBody.aversion_risque !== 0 || lastProfilePutBody.max_eta !== 60) {{
+  if (lastProfilePutBody.target_eur_h !== 150 || lastProfilePutBody.vehicle_mpg !== 31 || lastProfilePutBody.aversion_risque !== 0 || lastProfilePutBody.max_eta !== 60) {{
     realConsole.error('expected normalized profile payload, got', JSON.stringify(lastProfilePutBody));
     process.exit(1);
   }}

@@ -35,6 +35,8 @@ def test_fleet_map_uses_recent_track_timeline_when_available():
     assert "state.path = path;" in src
     assert "lv.route_source === 'hold'" in src
     assert "fleetTrack') || '48'" in src
+    assert "FLEET_FREEZE_JUMP_KM" in src
+    assert "const holdLat = acceptFrozenTarget ? Number(lv.lat) : current.lat;" in src
 
 
 def test_focus_mode_has_interpolated_glide_not_fixed_step():

@@ -63,8 +63,8 @@ class _FakeRedis:
     async def hgetall(self, key: str) -> dict[str, str]:
         if key == router.FUEL_CONTEXT_KEY:
             return {
-                "fuel_price_eur_l": "1.78",
-                "vehicle_consumption_l_100km": "7.4",
+                "fuel_price_usd_gallon": "3.56",
+                "vehicle_mpg": "31.8",
             }
         return {}
 
@@ -162,18 +162,18 @@ def test_shift_plan_endpoint_returns_sorted_candidates(monkeypatch):
         *,
         route_distance_km: float,
         eta_min: float,
-        fuel_price_eur_l: float,
-        vehicle_consumption_l_100km: float,
+        fuel_price_usd_gallon: float,
+        vehicle_mpg: float,
         target_hourly_net_eur: float,
         traffic_factor: float,
         forecast_volatility: float,
     ):
         _ = target_hourly_net_eur, traffic_factor, forecast_volatility
-        travel_cost = route_distance_km * (vehicle_consumption_l_100km / 100.0) * fuel_price_eur_l
+        travel_cost = (route_distance_km * 0.621371 / max(vehicle_mpg, 1.0)) * fuel_price_usd_gallon
         time_cost = (eta_min / 60.0) * 1.8
         total = travel_cost + time_cost
         return {
-            "travel_cost_eur": travel_cost,
+            "travel_cost_usd": travel_cost,
             "time_cost_eur": time_cost,
             "risk_cost_eur": 0.0,
             "reposition_total_cost_eur": total,

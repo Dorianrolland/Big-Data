@@ -41,7 +41,7 @@ def test_unchanged_when_driver_position_unknown():
     assert [z["zone_id"] for z in out] == ["40.7580_-73.9855", "40.7000_-74.0100"]
     assert out[0]["adjusted_opportunity_score"] == 1.5
     assert out[0]["distance_km"] is None
-    assert out[0]["reposition_cost_eur"] is None
+    assert out[0]["reposition_cost_usd"] is None
 
 
 def test_unchanged_when_distance_weight_zero():
@@ -102,15 +102,15 @@ def test_fuel_and_time_cost_are_computed_for_reached_zones():
         zones,
         driver_lat=40.7580,
         driver_lon=-73.9855,
-        fuel_price_eur_l=2.0,
-        consumption_l_100km=8.0,
+        fuel_price_usd_gallon=4.0,
+        vehicle_mpg=25.0,
     )
     assert len(out) == 1
     item = out[0]
     assert item["distance_km"] is not None and item["distance_km"] > 5.0
-    # Fuel cost = distance * 0.08 * 2.0 = 0.16 * distance
-    expected_fuel = round(item["distance_km"] * 0.08 * 2.0, 3)
-    assert abs(item["reposition_cost_eur"] - expected_fuel) < 1e-3
+    # Fuel cost = miles / mpg * USD/gallon.
+    expected_fuel = round((item["distance_km"] * 0.621371 / 25.0) * 4.0, 3)
+    assert abs(item["reposition_cost_usd"] - expected_fuel) < 1e-3
     assert item["reposition_time_min"] > 0.0
 
 

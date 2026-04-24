@@ -40,8 +40,8 @@ def test_reposition_cost_model_scales_with_time_and_risk():
     fast = reposition_cost_model(
         route_distance_km=2.0,
         eta_min=6.0,
-        fuel_price_eur_l=1.9,
-        vehicle_consumption_l_100km=8.0,
+        fuel_price_usd_gallon=3.8,
+        vehicle_mpg=29.4,
         target_hourly_net_eur=20.0,
         traffic_factor=1.0,
         forecast_volatility=0.1,
@@ -49,8 +49,8 @@ def test_reposition_cost_model_scales_with_time_and_risk():
     slow = reposition_cost_model(
         route_distance_km=2.0,
         eta_min=18.0,
-        fuel_price_eur_l=1.9,
-        vehicle_consumption_l_100km=8.0,
+        fuel_price_usd_gallon=3.8,
+        vehicle_mpg=29.4,
         target_hourly_net_eur=20.0,
         traffic_factor=1.4,
         forecast_volatility=0.8,

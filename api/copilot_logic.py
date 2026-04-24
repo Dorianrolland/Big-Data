@@ -29,6 +29,10 @@ FEATURE_COLUMNS = [
     "estimated_net_eur_h",
 ]
 
+KM_TO_MILES = 0.621371
+DEFAULT_FUEL_PRICE_USD_GALLON = 3.65
+DEFAULT_VEHICLE_MPG = 31.0
+
 
 def sigmoid(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-x))
@@ -46,6 +50,18 @@ def as_float(value: Any, default: float) -> float:
 
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(value, high))
+
+
+def fuel_cost_usd_from_km(
+    distance_km: float,
+    *,
+    vehicle_mpg: float,
+    fuel_price_usd_gallon: float,
+) -> float:
+    miles = max(float(distance_km), 0.0) * KM_TO_MILES
+    safe_mpg = max(float(vehicle_mpg), 1.0)
+    safe_price = max(float(fuel_price_usd_gallon), 0.0)
+    return (miles / safe_mpg) * safe_price
 
 
 DEFAULT_SCORE_WEIGHTS = {
@@ -151,7 +167,7 @@ def score_components(features: dict[str, float]) -> dict[str, float]:
     context_fallback_applied = 1.0 if float(features.get("context_fallback_applied", 0.0)) >= 0.5 else 0.0
     context_stale_sources = max(float(features.get("context_stale_sources", 0.0)), 0.0)
     estimated_fare = max(float(features.get("estimated_fare_eur", 0.0)), 0.0)
-    fuel_cost = max(float(features.get("fuel_cost_eur", 0.0)), 0.0)
+    fuel_cost = max(float(features.get("fuel_cost_usd", 0.0)), 0.0)
 
     fuel_share = fuel_cost / max(estimated_fare, 0.01)
     pressure_component = clamp((pressure_ratio - 0.75) / 1.0, 0.0, 1.0)
@@ -229,17 +245,21 @@ def build_feature_map(raw: dict[str, Any]) -> dict[str, float]:
     temporal_pressure = max(as_float(raw.get("temporal_pressure"), temporal_pressure_derived), 0.0)
     context_fallback_applied = 1.0 if as_float(raw.get("context_fallback_applied"), 0.0) >= 0.5 else 0.0
     context_stale_sources = max(as_float(raw.get("context_stale_sources"), 0.0), 0.0)
-    fuel_price_eur_l = max(as_float(raw.get("fuel_price_eur_l"), 1.85), 0.5)
-    vehicle_consumption_l_100km = max(as_float(raw.get("vehicle_consumption_l_100km"), 7.5), 2.0)
+    fuel_price_usd_gallon = max(as_float(raw.get("fuel_price_usd_gallon"), DEFAULT_FUEL_PRICE_USD_GALLON), 0.5)
+    vehicle_mpg = max(as_float(raw.get("vehicle_mpg"), DEFAULT_VEHICLE_MPG), 1.0)
     platform_fee_pct = min(max(as_float(raw.get("platform_fee_pct"), 25.0), 0.0), 60.0)
     other_costs_eur = max(as_float(raw.get("other_costs_eur"), 0.0), 0.0)
     target_hourly_net_eur = max(as_float(raw.get("target_hourly_net_eur"), 18.0), 0.0)
 
     total_distance_km = estimated_distance + distance_to_pickup
     total_duration_min = max(1.0, estimated_duration + eta_to_pickup)
-    fuel_cost_eur = total_distance_km * (vehicle_consumption_l_100km / 100.0) * fuel_price_eur_l
+    fuel_cost_usd = fuel_cost_usd_from_km(
+        total_distance_km,
+        vehicle_mpg=vehicle_mpg,
+        fuel_price_usd_gallon=fuel_price_usd_gallon,
+    )
     platform_fee_eur = estimated_fare * (platform_fee_pct / 100.0)
-    estimated_net_eur = estimated_fare - fuel_cost_eur - platform_fee_eur - other_costs_eur
+    estimated_net_eur = estimated_fare - fuel_cost_usd - platform_fee_eur - other_costs_eur
     pressure_ratio = demand_index / supply_index
     estimated_net_eur_h = (estimated_net_eur / total_duration_min) * 60.0
     target_gap_eur_h = estimated_net_eur_h - target_hourly_net_eur
@@ -268,11 +288,11 @@ def build_feature_map(raw: dict[str, Any]) -> dict[str, float]:
         "temporal_pressure": temporal_pressure,
         "context_fallback_applied": context_fallback_applied,
         "context_stale_sources": context_stale_sources,
-        "fuel_price_eur_l": fuel_price_eur_l,
-        "vehicle_consumption_l_100km": vehicle_consumption_l_100km,
+        "fuel_price_usd_gallon": fuel_price_usd_gallon,
+        "vehicle_mpg": vehicle_mpg,
         "platform_fee_pct": platform_fee_pct,
         "other_costs_eur": other_costs_eur,
-        "fuel_cost_eur": fuel_cost_eur,
+        "fuel_cost_usd": fuel_cost_usd,
         "platform_fee_eur": platform_fee_eur,
         "estimated_net_eur": estimated_net_eur,
         "target_hourly_net_eur": target_hourly_net_eur,
@@ -299,7 +319,7 @@ def heuristic_score(
     temporal_pressure = max(features.get("temporal_pressure", 0.0), 0.0)
     context_fallback_applied = 1.0 if float(features.get("context_fallback_applied", 0.0)) >= 0.5 else 0.0
     platform_fee_pct = max(features.get("platform_fee_pct", 0.0), 0.0)
-    fuel_cost_eur = max(features.get("fuel_cost_eur", 0.0), 0.0)
+    fuel_cost_usd = max(features.get("fuel_cost_usd", 0.0), 0.0)
     target_gap_eur_h = features.get("target_gap_eur_h", 0.0)
 
     eur_per_hour_net = features.get("estimated_net_eur_h", 0.0)
@@ -338,7 +358,7 @@ def heuristic_score(
         reasons.append("short_offer_efficiency")
     if platform_fee_pct >= 30:
         reasons.append("high_platform_fee")
-    if estimated_fare > 0 and fuel_cost_eur / estimated_fare > 0.2:
+    if estimated_fare > 0 and fuel_cost_usd / estimated_fare > 0.2:
         reasons.append("fuel_cost_penalty")
     if pickup_ratio > 0.45:
         reasons.append("long_pickup_detour")
@@ -354,7 +374,7 @@ def cost_breakdown(features: dict[str, float]) -> dict[str, float]:
         "estimated_fare_eur": round(float(features.get("estimated_fare_eur", 0.0)), 3),
         "total_distance_km": round(float(features.get("total_distance_km", 0.0)), 3),
         "total_duration_min": round(float(features.get("total_duration_min", 0.0)), 3),
-        "fuel_cost_eur": round(float(features.get("fuel_cost_eur", 0.0)), 3),
+        "fuel_cost_usd": round(float(features.get("fuel_cost_usd", 0.0)), 3),
         "platform_fee_eur": round(float(features.get("platform_fee_eur", 0.0)), 3),
         "other_costs_eur": round(float(features.get("other_costs_eur", 0.0)), 3),
         "estimated_net_eur": round(float(features.get("estimated_net_eur", 0.0)), 3),
@@ -370,7 +390,7 @@ def ranking_objective_components(features: dict[str, float], accept_score: float
     total_duration_min = max(float(features.get("total_duration_min", 1.0)), 1.0)
     target_gap = float(features.get("target_gap_eur_h", 0.0))
     estimated_fare = max(float(features.get("estimated_fare_eur", 0.0)), 0.0)
-    fuel_cost = max(float(features.get("fuel_cost_eur", 0.0)), 0.0)
+    fuel_cost = max(float(features.get("fuel_cost_usd", 0.0)), 0.0)
     fuel_share = fuel_cost / max(estimated_fare, 0.01)
 
     accept_component = max(0.0, min(float(accept_score), 1.0))
@@ -588,7 +608,7 @@ def hybrid_accept_threshold(
 ) -> float:
     target_gap = float(features.get("target_gap_eur_h", 0.0))
     estimated_fare = max(float(features.get("estimated_fare_eur", 0.0)), 0.0)
-    fuel_cost = max(float(features.get("fuel_cost_eur", 0.0)), 0.0)
+    fuel_cost = max(float(features.get("fuel_cost_usd", 0.0)), 0.0)
     fuel_share = fuel_cost / max(estimated_fare, 0.01)
 
     below_target_penalty = 0.0
@@ -655,7 +675,7 @@ def explanation_details(
     context_fallback_applied = 1.0 if float(features.get("context_fallback_applied", 0.0)) >= 0.5 else 0.0
     context_stale_sources = max(float(features.get("context_stale_sources", 0.0)), 0.0)
     estimated_fare = max(float(features.get("estimated_fare_eur", 0.0)), 0.0)
-    fuel_cost = max(float(features.get("fuel_cost_eur", 0.0)), 0.0)
+    fuel_cost = max(float(features.get("fuel_cost_usd", 0.0)), 0.0)
     fuel_share_pct = (fuel_cost / max(estimated_fare, 0.01)) * 100.0
 
     details: list[dict[str, Any]] = [
@@ -851,23 +871,30 @@ def reposition_cost_model(
     *,
     route_distance_km: float,
     eta_min: float,
-    fuel_price_eur_l: float,
-    vehicle_consumption_l_100km: float,
+    fuel_price_usd_gallon: float,
+    vehicle_mpg: float,
     target_hourly_net_eur: float,
     traffic_factor: float,
     forecast_volatility: float,
     time_cost_share: float = 0.32,
     risk_cost_share: float = 0.22,
 ) -> dict[str, float]:
-    fuel_cost_eur = max(0.0, route_distance_km * (vehicle_consumption_l_100km / 100.0) * fuel_price_eur_l)
+    fuel_cost_usd = max(
+        0.0,
+        fuel_cost_usd_from_km(
+            route_distance_km,
+            vehicle_mpg=vehicle_mpg,
+            fuel_price_usd_gallon=fuel_price_usd_gallon,
+        ),
+    )
     time_cost_eur = max(0.0, (eta_min / 60.0) * (max(target_hourly_net_eur, 8.0) * time_cost_share))
     congestion_risk = clamp(max(traffic_factor - 1.0, 0.0) * 0.8 + forecast_volatility, 0.0, 1.5)
     risk_cost_eur = max(0.0, time_cost_eur * risk_cost_share * (1.0 + congestion_risk))
-    total_cost_eur = fuel_cost_eur + time_cost_eur + risk_cost_eur
+    total_cost_eur = fuel_cost_usd + time_cost_eur + risk_cost_eur
     penalty = clamp(total_cost_eur / max(6.0, target_hourly_net_eur * 0.55), 0.0, 1.0)
 
     return {
-        "travel_cost_eur": float(fuel_cost_eur),
+        "travel_cost_usd": float(fuel_cost_usd),
         "time_cost_eur": float(time_cost_eur),
         "risk_cost_eur": float(risk_cost_eur),
         "reposition_total_cost_eur": float(total_cost_eur),

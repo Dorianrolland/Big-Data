@@ -109,8 +109,8 @@ def test_build_feature_map_with_cost_inputs():
             "distance_to_pickup_km": 2.0,
             "estimated_duration_min": 18.0,
             "eta_to_pickup_min": 6.0,
-            "fuel_price_eur_l": 1.9,
-            "vehicle_consumption_l_100km": 8.0,
+            "fuel_price_usd_gallon": 3.8,
+            "vehicle_mpg": 29.4,
             "platform_fee_pct": 22.0,
             "other_costs_eur": 1.5,
             "target_hourly_net_eur": 20.0,
@@ -158,7 +158,7 @@ def test_cost_breakdown_shape():
     features = build_feature_map({"estimated_fare_eur": 12.0, "estimated_distance_km": 3.0})
     breakdown = cost_breakdown(features)
     assert "estimated_net_eur_h" in breakdown
-    assert "fuel_cost_eur" in breakdown
+    assert "fuel_cost_usd" in breakdown
     assert isinstance(breakdown["estimated_net_eur"], float)
 
 
@@ -207,8 +207,8 @@ def test_recommendation_score_changes_with_objective_weights():
             "estimated_duration_min": 40.0,
             "eta_to_pickup_min": 7.0,
             "target_hourly_net_eur": 16.0,
-            "fuel_price_eur_l": 1.9,
-            "vehicle_consumption_l_100km": 10.5,
+            "fuel_price_usd_gallon": 10.0,
+            "vehicle_mpg": 8.0,
         }
     )
     gain_first, _, _ = recommendation_score(
@@ -362,8 +362,8 @@ def test_ranking_objective_score_extreme_weights_change_result():
             "estimated_duration_min": 44.0,
             "eta_to_pickup_min": 8.0,
             "target_hourly_net_eur": 18.0,
-            "fuel_price_eur_l": 1.9,
-            "vehicle_consumption_l_100km": 11.5,
+            "fuel_price_usd_gallon": 10.0,
+            "vehicle_mpg": 8.0,
         }
     )
     gain_score, _, _ = ranking_objective_score(
@@ -469,8 +469,8 @@ def test_hybrid_accept_threshold_penalizes_below_target_and_fuel():
             "estimated_fare_eur": 7.0,
             "estimated_distance_km": 7.0,
             "estimated_duration_min": 30.0,
-            "fuel_price_eur_l": 2.1,
-            "vehicle_consumption_l_100km": 11.0,
+            "fuel_price_usd_gallon": 4.2,
+            "vehicle_mpg": 21.4,
             "target_hourly_net_eur": 24.0,
         }
     )
@@ -491,8 +491,8 @@ def test_hybrid_accept_threshold_is_clamped_to_bounds():
             "estimated_fare_eur": 4.0,
             "estimated_distance_km": 8.0,
             "estimated_duration_min": 35.0,
-            "fuel_price_eur_l": 2.4,
-            "vehicle_consumption_l_100km": 15.0,
+            "fuel_price_usd_gallon": 4.8,
+            "vehicle_mpg": 15.7,
             "target_hourly_net_eur": 35.0,
         }
     )

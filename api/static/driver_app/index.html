@@ -12,29 +12,44 @@
   <meta name="apple-mobile-web-app-title" content="Driver Copilot" />
   <link rel="manifest" href="/static/driver_app/manifest.webmanifest" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet" />
   <style>
     :root {
-      --bg: #111111;
-      --bg-soft: #191919;
-      --panel: rgba(26, 26, 26, 0.86);
-      --panel-strong: rgba(38, 38, 38, 0.96);
-      --line: rgba(255, 255, 255, 0.08);
-      --ink: #f4f1e8;
-      --ink-soft: #c8c2b4;
-      --muted: #978f81;
-      --amber: #ffb100;
-      --amber-soft: rgba(255, 177, 0, 0.16);
-      --cyan: #36d4d2;
-      --cyan-soft: rgba(54, 212, 210, 0.16);
-      --good: #51d98b;
-      --warn: #ff9d57;
-      --bad: #ff6f6f;
-      --radius-xl: 28px;
-      --radius-lg: 22px;
-      --radius-md: 16px;
-      --shadow: 0 22px 60px rgba(0, 0, 0, 0.42);
-      --font-ui: "Space Grotesk", "Avenir Next", "Segoe UI", sans-serif;
-      --font-display: "Space Grotesk", "Trebuchet MS", sans-serif;
+      --bg: #0a0b10;
+      --bg-soft: #10121a;
+      --panel: rgba(20, 23, 30, 0.86);
+      --panel-strong: rgba(26, 30, 39, 0.96);
+      --panel-raised: rgba(255, 255, 255, 0.03);
+      --line: rgba(255, 255, 255, 0.06);
+      --line-strong: rgba(255, 255, 255, 0.12);
+      --ink: #eef0f4;
+      --ink-soft: #b6bbc5;
+      --muted: #7c8390;
+      --amber: #ffb020;
+      --amber-soft: rgba(255, 176, 32, 0.12);
+      --amber-strong: rgba(255, 176, 32, 0.32);
+      --cyan: #22d3ee;
+      --cyan-soft: rgba(34, 211, 238, 0.12);
+      --emerald: #34d399;
+      --emerald-soft: rgba(52, 211, 153, 0.12);
+      --violet: #a78bfa;
+      --violet-soft: rgba(167, 139, 250, 0.14);
+      --rose: #f87171;
+      --rose-soft: rgba(248, 113, 113, 0.12);
+      --good: var(--emerald);
+      --warn: var(--amber);
+      --bad: var(--rose);
+      --radius-xl: 20px;
+      --radius-lg: 14px;
+      --radius-md: 10px;
+      --radius-sm: 8px;
+      --shadow: 0 18px 40px rgba(0, 0, 0, 0.50);
+      --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.35);
+      --font-ui: "Inter", "Space Grotesk", -apple-system, "Segoe UI", sans-serif;
+      --font-display: "Space Grotesk", "Inter", sans-serif;
+      --font-mono: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
     }
 
     * { box-sizing: border-box; }
@@ -43,11 +58,14 @@
       margin: 0;
       min-height: 100%;
       background:
-        radial-gradient(circle at 18% 10%, rgba(255, 177, 0, 0.18), transparent 28%),
-        radial-gradient(circle at 84% 18%, rgba(54, 212, 210, 0.16), transparent 30%),
-        linear-gradient(180deg, #121212 0%, #0b0b0b 100%);
+        radial-gradient(ellipse 60% 40% at 20% 0%, rgba(167, 139, 250, 0.08), transparent 70%),
+        radial-gradient(ellipse 50% 40% at 90% 0%, rgba(34, 211, 238, 0.06), transparent 70%),
+        linear-gradient(180deg, #0b0c12 0%, #08090e 100%);
       color: var(--ink);
       font-family: var(--font-ui);
+      font-feature-settings: "cv11", "ss01", "ss03";
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
     }
 
     body {
@@ -120,13 +138,15 @@
     .brand-title {
       font-family: var(--font-display);
       font-size: 1.02rem;
-      font-weight: 800;
-      letter-spacing: 0.02em;
+      font-weight: 700;
+      letter-spacing: -0.015em;
+      color: var(--ink);
     }
 
     .brand-subtitle {
       font-size: 0.78rem;
-      color: var(--ink-soft);
+      color: var(--muted);
+      font-weight: 500;
     }
 
     .topbar-actions {
@@ -154,33 +174,58 @@
     }
 
     .ghost-button {
-      background: rgba(255, 255, 255, 0.06);
-      color: var(--ink);
-      padding: 10px 12px;
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--ink-soft);
+      padding: 9px 14px;
       font-size: 0.8rem;
-      border: 1px solid rgba(255, 255, 255, 0.08);
+      font-weight: 500;
+      border: 1px solid var(--line);
+      letter-spacing: -0.005em;
+    }
+    .ghost-button:hover {
+      color: var(--ink);
+      background: rgba(255, 255, 255, 0.07);
+      border-color: var(--line-strong);
     }
 
     .solid-button {
-      background: linear-gradient(135deg, #ffbe1b 0%, #ef8e00 100%);
-      color: #18120a;
-      padding: 14px 16px;
+      background: var(--amber);
+      color: #1a1305;
+      padding: 13px 20px;
       font-size: 0.92rem;
-      font-weight: 800;
-      box-shadow: 0 16px 30px rgba(255, 177, 0, 0.22);
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      box-shadow: 0 8px 20px rgba(255, 176, 32, 0.20), inset 0 1px 0 rgba(255, 255, 255, 0.28);
+    }
+    .solid-button:hover {
+      background: #ffbf3f;
+      box-shadow: 0 10px 24px rgba(255, 176, 32, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.32);
     }
 
     .solid-button.secondary {
-      background: linear-gradient(135deg, #47d8d5 0%, #1592b2 100%);
-      color: #061518;
-      box-shadow: 0 16px 30px rgba(54, 212, 210, 0.18);
+      background: transparent;
+      color: var(--ink);
+      border: 1px solid var(--line-strong);
+      box-shadow: none;
+      font-weight: 600;
+    }
+    .solid-button.secondary:hover {
+      background: rgba(255, 255, 255, 0.04);
+      border-color: rgba(255, 255, 255, 0.22);
     }
 
     .solid-button.subtle {
-      background: rgba(255, 255, 255, 0.08);
-      color: var(--ink);
+      background: rgba(255, 255, 255, 0.035);
+      color: var(--ink-soft);
       box-shadow: none;
-      border: 1px solid rgba(255, 255, 255, 0.08);
+      border: 1px solid var(--line);
+      font-weight: 500;
+      padding: 10px 14px;
+      font-size: 0.84rem;
+    }
+    .solid-button.subtle:hover {
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--ink);
     }
 
     .screen {
@@ -218,8 +263,13 @@
     .view-title {
       margin: 0;
       font-family: var(--font-display);
-      line-height: 0.98;
-      letter-spacing: -0.03em;
+      line-height: 1.05;
+      letter-spacing: -0.035em;
+      font-weight: 700;
+    }
+
+    .view-title {
+      font-size: 1.4rem;
     }
 
     .hero h1 {
@@ -311,8 +361,9 @@
 
     .headline-card {
       background:
-        linear-gradient(165deg, rgba(255, 177, 0, 0.16), rgba(54, 212, 210, 0.08)),
+        linear-gradient(140deg, rgba(255, 176, 32, 0.08), rgba(167, 139, 250, 0.04) 55%, transparent 80%),
         var(--panel-strong);
+      border-color: rgba(255, 176, 32, 0.18);
     }
 
     .chip-row,
@@ -329,17 +380,51 @@
       display: inline-flex;
       gap: 6px;
       align-items: center;
-      padding: 8px 10px;
+      padding: 5px 11px;
       border-radius: 999px;
-      font-size: 0.75rem;
-      background: rgba(255, 255, 255, 0.06);
-      border: 1px solid rgba(255, 255, 255, 0.08);
+      font-size: 0.74rem;
+      font-weight: 500;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--line);
       color: var(--ink-soft);
+      letter-spacing: -0.005em;
     }
 
-    .chip.good { color: var(--good); }
-    .chip.warn { color: var(--warn); }
-    .chip.bad { color: var(--bad); }
+    .chip strong {
+      font-weight: 600;
+      color: var(--ink);
+    }
+
+    .chip.good {
+      background: var(--emerald-soft);
+      border-color: rgba(52, 211, 153, 0.28);
+      color: #6ee7b7;
+    }
+    .chip.warn {
+      background: var(--amber-soft);
+      border-color: rgba(255, 176, 32, 0.28);
+      color: #fcd34d;
+    }
+    .chip.bad {
+      background: var(--rose-soft);
+      border-color: rgba(248, 113, 113, 0.28);
+      color: #fca5a5;
+    }
+    .chip.info {
+      background: var(--cyan-soft);
+      border-color: rgba(34, 211, 238, 0.28);
+      color: #67e8f9;
+    }
+    .chip.violet {
+      background: var(--violet-soft);
+      border-color: rgba(167, 139, 250, 0.28);
+      color: #c4b5fd;
+    }
+    .chip.good strong,
+    .chip.warn strong,
+    .chip.bad strong,
+    .chip.info strong,
+    .chip.violet strong { color: inherit; }
 
     .metric-grid {
       display: grid;
@@ -348,57 +433,95 @@
     }
 
     .metric {
-      padding: 12px;
-      border-radius: 18px;
-      background: rgba(255, 255, 255, 0.04);
-      border: 1px solid rgba(255, 255, 255, 0.06);
+      padding: 12px 14px;
+      border-radius: var(--radius-md);
+      background: var(--panel-raised);
+      border: 1px solid var(--line);
+      transition: border-color 140ms ease;
+    }
+    .metric:hover { border-color: var(--line-strong); }
+
+    .metric.primary {
+      background: linear-gradient(140deg, var(--amber-soft), rgba(255, 255, 255, 0.02));
+      border-color: rgba(255, 176, 32, 0.24);
     }
 
     .metric-label {
       color: var(--muted);
-      font-size: 0.76rem;
+      font-size: 0.66rem;
+      font-weight: 600;
       text-transform: uppercase;
-      letter-spacing: 0.05em;
+      letter-spacing: 0.1em;
       margin-bottom: 6px;
     }
 
     .metric-value {
-      font-size: 1.12rem;
+      font-family: var(--font-mono);
+      font-size: 1.2rem;
+      font-weight: 700;
       line-height: 1.08;
+      letter-spacing: -0.01em;
+      color: var(--ink);
     }
+    .metric-value.accent { color: var(--amber); }
+    .metric-value.good { color: var(--emerald); }
 
     .reason-list .chip {
-      background: var(--amber-soft);
-      border-color: rgba(255, 177, 0, 0.16);
-      color: #ffd98f;
+      background: rgba(255, 255, 255, 0.03);
+      border-color: var(--line);
+      color: var(--ink-soft);
+      padding: 7px 12px;
+      font-weight: 500;
     }
 
     .warning {
       padding: 12px 14px;
-      border-radius: 16px;
-      background: rgba(255, 157, 87, 0.12);
-      border: 1px solid rgba(255, 157, 87, 0.22);
-      color: #ffcba3;
+      border-radius: var(--radius-md);
+      background: var(--amber-soft);
+      border: 1px solid rgba(255, 176, 32, 0.24);
+      color: #fcd9a3;
       font-size: 0.84rem;
-      line-height: 1.45;
+      line-height: 1.5;
     }
 
     .map {
       width: 100%;
-      min-height: 220px;
-      border-radius: 22px;
+      min-height: 240px;
+      border-radius: var(--radius-lg);
       overflow: hidden;
-      border: 1px solid rgba(255, 255, 255, 0.08);
-      background: #0f172a;
+      border: 1px solid var(--line);
+      background: #06070b;
     }
+    .map .leaflet-control-attribution {
+      background: rgba(10, 11, 16, 0.7);
+      color: var(--muted);
+      font-size: 10px;
+    }
+    .map .leaflet-control-attribution a { color: var(--ink-soft); }
 
     .list-item {
       display: grid;
-      gap: 10px;
-      padding: 14px;
-      border-radius: 18px;
-      background: rgba(255, 255, 255, 0.04);
-      border: 1px solid rgba(255, 255, 255, 0.06);
+      gap: 12px;
+      padding: 16px;
+      border-radius: var(--radius-lg);
+      background: var(--panel-raised);
+      border: 1px solid var(--line);
+      transition: border-color 160ms ease, background 160ms ease;
+    }
+    .list-item:hover { border-color: var(--line-strong); }
+
+    /* Top pick = first ranked recommendation gets the amber accent */
+    #ordersList > .list-item:first-child,
+    .list-item.top-pick {
+      background:
+        linear-gradient(140deg, rgba(255, 176, 32, 0.08), rgba(255, 176, 32, 0.01) 60%),
+        var(--panel-raised);
+      border-color: rgba(255, 176, 32, 0.28);
+      box-shadow: 0 0 0 1px rgba(255, 176, 32, 0.06), 0 10px 30px rgba(255, 176, 32, 0.06);
+    }
+    #ordersList > .list-item:first-child .list-title,
+    .list-item.top-pick .list-title {
+      color: var(--amber);
     }
 
     .list-item-top {
@@ -409,13 +532,17 @@
     }
 
     .list-title {
-      font-weight: 800;
+      font-weight: 700;
       font-size: 0.96rem;
+      letter-spacing: -0.01em;
+      color: var(--ink);
     }
 
     .list-subtitle {
       font-size: 0.82rem;
       color: var(--ink-soft);
+      margin-top: 2px;
+      line-height: 1.45;
     }
 
     .mini-grid {
@@ -425,24 +552,293 @@
     }
 
     .mini-stat {
-      padding: 10px;
-      border-radius: 14px;
-      background: rgba(255, 255, 255, 0.03);
-      border: 1px solid rgba(255, 255, 255, 0.04);
-      min-height: 68px;
+      padding: 10px 12px;
+      border-radius: var(--radius-md);
+      background: rgba(255, 255, 255, 0.025);
+      border: 1px solid var(--line);
+      min-height: 64px;
     }
 
     .mini-stat .metric-label {
       margin-bottom: 4px;
     }
+    .mini-stat .metric-value {
+      font-size: 1rem;
+    }
 
     .empty-state {
       padding: 18px;
-      border-radius: 18px;
-      background: rgba(255, 255, 255, 0.04);
+      border-radius: var(--radius-lg);
+      background: rgba(255, 255, 255, 0.025);
       color: var(--ink-soft);
       line-height: 1.5;
-      border: 1px dashed rgba(255, 255, 255, 0.08);
+      border: 1px dashed var(--line);
+      font-size: 0.86rem;
+    }
+
+    /* ══════════════════════════════════════════════════════
+       Zones section (Hot / Calm / Best reposition)
+       ══════════════════════════════════════════════════════ */
+    .zone-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 1fr);
+      gap: 14px;
+    }
+
+    .zone-column {
+      display: grid;
+      gap: 10px;
+      padding: 14px;
+      border-radius: var(--radius-lg);
+      background: var(--panel-raised);
+      border: 1px solid var(--line);
+      min-width: 0;
+    }
+    .zone-column--best {
+      background: linear-gradient(160deg, rgba(167, 139, 250, 0.07), rgba(167, 139, 250, 0.01) 70%), var(--panel-raised);
+      border-color: rgba(167, 139, 250, 0.22);
+    }
+
+    .zone-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .zone-header-title {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 600;
+      font-size: 0.82rem;
+      color: var(--ink);
+      letter-spacing: -0.005em;
+    }
+
+    .zone-header-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      box-shadow: 0 0 10px currentColor;
+    }
+    .zone-dot-amber { background: var(--amber); color: var(--amber); }
+    .zone-dot-cyan { background: var(--cyan); color: var(--cyan); }
+    .zone-dot-violet { background: var(--violet); color: var(--violet); }
+
+    .zone-header-meta {
+      font-size: 0.72rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-weight: 600;
+    }
+
+    .zone-header-chips {
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+    }
+
+    .zone-count {
+      padding: 3px 9px;
+      font-variant-numeric: tabular-nums;
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      background: rgba(255, 255, 255, 0.05);
+      color: var(--ink-soft);
+      font-weight: 600;
+    }
+
+    /* Compact zone item card */
+    .zone-item {
+      display: grid;
+      gap: 8px;
+      padding: 11px 12px;
+      border-radius: var(--radius-md);
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid var(--line);
+      transition: border-color 160ms ease, background 160ms ease;
+    }
+    .zone-item:hover {
+      border-color: var(--line-strong);
+      background: rgba(255, 255, 255, 0.035);
+    }
+
+    .zone-item-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .zone-id {
+      font-weight: 600;
+      font-size: 0.9rem;
+      color: var(--ink);
+      letter-spacing: -0.01em;
+      font-variant-numeric: tabular-nums;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .zone-score {
+      font-family: var(--font-mono);
+      font-size: 0.98rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      font-variant-numeric: tabular-nums;
+      color: var(--amber);
+      white-space: nowrap;
+    }
+    .zone-score.low { color: var(--cyan); }
+
+    .zone-bar {
+      position: relative;
+      height: 4px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.05);
+      overflow: hidden;
+    }
+    .zone-bar-fill {
+      position: absolute;
+      top: 0; left: 0; bottom: 0;
+      border-radius: 999px;
+      background: linear-gradient(90deg, var(--amber), #ffc860);
+      width: 0%;
+      transition: width 260ms ease;
+    }
+    .zone-bar-fill.low { background: linear-gradient(90deg, var(--cyan), #7dd3fc); }
+
+    .zone-stats {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      font-size: 0.72rem;
+      color: var(--muted);
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+      flex-wrap: wrap;
+    }
+    .zone-stats .stat {
+      display: inline-flex;
+      gap: 5px;
+      align-items: baseline;
+    }
+    .zone-stats .stat .k {
+      font-size: 0.62rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-weight: 600;
+    }
+    .zone-stats .stat .v {
+      color: var(--ink-soft);
+      font-weight: 600;
+    }
+
+    /* Best reposition (inside zone-column--best) gets special treatment */
+    #bestRepositionCard .list-item {
+      padding: 14px;
+    }
+    #bestRepositionCard .list-item .mini-grid {
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 6px;
+    }
+    #bestRepositionCard .list-item .mini-stat {
+      padding: 8px 10px;
+      min-height: 58px;
+    }
+    #bestRepositionCard .list-item .mini-stat .metric-value {
+      font-size: 0.92rem;
+    }
+    #bestRepositionCard .list-item .reason-list .chip {
+      padding: 6px 10px;
+      font-size: 0.72rem;
+    }
+
+    @media (max-width: 1180px) {
+      .zone-grid {
+        grid-template-columns: minmax(0, 1fr);
+      }
+    }
+
+    /* ══════════════════════════════════════════════════════
+       Shift section
+       ══════════════════════════════════════════════════════ */
+    .shift-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+    }
+
+    .shift-split {
+      display: grid;
+      grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr);
+      gap: 14px;
+      align-items: start;
+    }
+
+    .shift-moves {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .shift-moves .list-item {
+      padding: 14px;
+      min-width: 0;
+    }
+    .shift-moves .list-item .mini-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px;
+    }
+
+    .shift-journal {
+      padding: 14px;
+      border-radius: var(--radius-lg);
+      background: var(--panel-raised);
+      border: 1px solid var(--line);
+      display: grid;
+      gap: 10px;
+    }
+
+    .shift-journal-head {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 600;
+      font-size: 0.82rem;
+      color: var(--ink);
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .shift-journal .stack {
+      gap: 8px;
+    }
+    .shift-journal .list-item {
+      padding: 12px;
+      gap: 6px;
+    }
+    .shift-journal .list-item .list-title {
+      font-size: 0.86rem;
+    }
+    .shift-journal .list-item .list-subtitle {
+      font-size: 0.76rem;
+    }
+
+    @media (max-width: 1180px) {
+      .shift-split {
+        grid-template-columns: minmax(0, 1fr);
+      }
+      .shift-moves {
+        grid-template-columns: minmax(0, 1fr);
+      }
     }
 
     .tabbar {
@@ -457,19 +853,37 @@
     }
 
     .tab-button {
+      min-height: 38px;
+      padding: 9px 16px;
+      background: transparent;
+      color: var(--muted);
+      border: 1px solid transparent;
+      font-size: 0.82rem;
+      font-weight: 500;
+      letter-spacing: -0.005em;
+      transition: color 140ms ease, background 140ms ease, border-color 140ms ease;
+    }
+    .tab-button:hover { color: var(--ink-soft); }
+
+    .tab-button.active {
+      background: var(--amber-soft);
+      color: var(--amber);
+      border-color: rgba(255, 176, 32, 0.32);
+      font-weight: 600;
+    }
+
+    .tabbar .tab-button {
       min-height: 52px;
       padding: 10px 12px;
       background: rgba(255, 255, 255, 0.04);
-      color: var(--ink-soft);
-      border: 1px solid rgba(255, 255, 255, 0.06);
-      font-size: 0.8rem;
-      font-weight: 700;
+      border: 1px solid var(--line);
+      font-size: 0.78rem;
+      font-weight: 600;
     }
-
-    .tab-button.active {
-      background: linear-gradient(135deg, rgba(255, 177, 0, 0.2), rgba(54, 212, 210, 0.14));
-      color: var(--ink);
-      border-color: rgba(255, 177, 0, 0.2);
+    .tabbar .tab-button.active {
+      background: var(--amber-soft);
+      color: var(--amber);
+      border-color: rgba(255, 176, 32, 0.32);
     }
 
     .sheet {
@@ -644,11 +1058,11 @@
     }
 
     #tabZones {
-      grid-column: 1 / span 7;
+      grid-column: 1 / -1;
     }
 
     #tabShift {
-      grid-column: 8 / span 5;
+      grid-column: 1 / -1;
     }
 
     #screenApp .footer-note {
@@ -840,8 +1254,8 @@
                     <span class="chip good" id="recommendationKind">Offer</span>
                   </div>
                   <div class="metric-grid">
-                    <div class="metric"><div class="metric-label">Score</div><div class="metric-value" id="metricScore">-</div></div>
-                    <div class="metric"><div class="metric-label">Net EUR/h</div><div class="metric-value" id="metricProfit">-</div></div>
+                    <div class="metric primary"><div class="metric-label">Score</div><div class="metric-value accent" id="metricScore">-</div></div>
+                    <div class="metric primary"><div class="metric-label">Net EUR/h</div><div class="metric-value accent" id="metricProfit">-</div></div>
                     <div class="metric"><div class="metric-label">Trip net</div><div class="metric-value" id="metricTripNet">-</div></div>
                     <div class="metric"><div class="metric-label">Fuel cost</div><div class="metric-value" id="metricFuel">-</div></div>
                     <div class="metric"><div class="metric-label">Pickup ETA</div><div class="metric-value" id="metricPickupEta">-</div></div>
@@ -902,33 +1316,62 @@
                   </div>
                 </div>
                 <div class="map" id="zonesMap"></div>
-                <div class="detail-grid">
-                  <div class="card">
-                    <div class="list-title">Hot right now</div>
-                    <div class="stack" id="hotZonesList"></div>
-                  </div>
-                  <div class="card">
-                    <div class="list-title">Calm / low demand</div>
-                    <div class="stack" id="calmZonesList"></div>
-                  </div>
-                  <div class="card">
-                    <div class="list-title">Best reposition</div>
+                <div class="zone-grid">
+                  <section class="zone-column zone-column--best">
+                    <header class="zone-header">
+                      <div class="zone-header-title">
+                        <span class="zone-header-dot zone-dot-violet"></span>
+                        <span>Best reposition</span>
+                      </div>
+                      <span class="zone-header-meta" id="bestZoneMeta">Top market move</span>
+                    </header>
                     <div class="stack" id="bestRepositionCard"></div>
-                  </div>
+                  </section>
+                  <section class="zone-column">
+                    <header class="zone-header">
+                      <div class="zone-header-title">
+                        <span class="zone-header-dot zone-dot-amber"></span>
+                        <span>Hot right now</span>
+                      </div>
+                      <div class="zone-header-chips">
+                        <span class="chip zone-count" id="hotZonesCount">0</span>
+                        <span class="chip warn" id="hotZonesState" hidden>stale</span>
+                      </div>
+                    </header>
+                    <div class="stack" id="hotZonesList"></div>
+                  </section>
+                  <section class="zone-column">
+                    <header class="zone-header">
+                      <div class="zone-header-title">
+                        <span class="zone-header-dot zone-dot-cyan"></span>
+                        <span>Calm / low demand</span>
+                      </div>
+                      <div class="zone-header-chips">
+                        <span class="chip zone-count" id="calmZonesCount">0</span>
+                        <span class="chip warn" id="calmZonesState" hidden>stale</span>
+                      </div>
+                    </header>
+                    <div class="stack" id="calmZonesList"></div>
+                  </section>
                 </div>
               </section>
 
               <section class="card" id="tabShift">
-                <div class="list-item-top">
+                <div class="shift-header">
                   <div>
                     <div class="list-title">Shift plan</div>
                     <div class="list-subtitle">60-minute outlook plus the local mission journal.</div>
                   </div>
                 </div>
-                <div class="stack" id="shiftList"></div>
-                <div class="card">
-                  <div class="list-title">Mission journal</div>
-                  <div class="stack" id="journalList"></div>
+                <div class="shift-split">
+                  <div class="shift-moves" id="shiftList"></div>
+                  <div class="shift-journal">
+                    <div class="shift-journal-head">
+                      <span class="zone-header-dot zone-dot-violet"></span>
+                      <span>Mission journal</span>
+                    </div>
+                    <div class="stack" id="journalList"></div>
+                  </div>
                 </div>
               </section>
 
@@ -983,7 +1426,7 @@
     </div>
     <div class="sheet-grid">
       <label class="label">Target EUR/h<input class="input" id="profileTarget" type="number" step="0.1" min="0" max="150" /></label>
-      <label class="label">Fuel consumption (L/100 km)<input class="input" id="profileFuel" type="number" step="0.1" min="2" max="30" /></label>
+      <label class="label">Fuel economy (MPG)<input class="input" id="profileFuel" type="number" step="0.1" min="1" max="120" /></label>
       <label class="label">Risk aversion (0 to 1)<input class="input" id="profileRisk" type="number" step="0.01" min="0" max="1" /></label>
       <label class="label">Max ETA (min)<input class="input" id="profileEta" type="number" step="0.1" min="3" max="60" /></label>
       <button class="solid-button" id="saveProfileButton" type="button">Save profile</button>

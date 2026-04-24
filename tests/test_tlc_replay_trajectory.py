@@ -734,6 +734,106 @@ def test_emit_trip_progress_uses_reposition_route_before_pickup(monkeypatch):
     assert round(pos.lat, 4) != round(trip.dropoff_lat, 4)
 
 
+def test_hold_reposition_is_not_reanchored_to_pickup():
+    replay = replay_main.TLCReplay("2024-01")
+    trip = _make_trip(trip_key="blocked_reposition_alignment")
+    origin = (40.7060, -74.0090)
+    trip.reposition_start_lat = origin[0]
+    trip.reposition_start_lon = origin[1]
+    trip.reposition_start_zone_id = 231
+    trip.reposition_source = "hold"
+    trip.reposition_geometry = [origin]
+    trip.reposition_cumulative_km = [0.0]
+    trip_route = [
+        (trip.pickup_lat, trip.pickup_lon),
+        (40.7500, -73.9790),
+        (trip.dropoff_lat, trip.dropoff_lon),
+    ]
+
+    replay._apply_trip_route(
+        trip,
+        "osrm_public",
+        trip_route,
+        replay_main.cumulative_route_distances_km(trip_route),
+    )
+
+    assert trip.reposition_blocked is True
+    assert trip.reposition_start_lat == pytest.approx(origin[0], abs=1e-6)
+    assert trip.reposition_start_lon == pytest.approx(origin[1], abs=1e-6)
+    assert trip.reposition_geometry == [origin]
+    assert replay._trip_needs_reposition(trip) is True
+
+
+def test_blocked_reposition_keeps_driver_at_last_known_point(monkeypatch):
+    replay = replay_main.TLCReplay("2024-01")
+    trip = _make_trip(trip_key="blocked_reposition_motion")
+    origin = (40.7060, -74.0090)
+    trip.reposition_start_lat = origin[0]
+    trip.reposition_start_lon = origin[1]
+    trip.reposition_start_zone_id = 231
+    trip.reposition_source = "hold"
+    trip.reposition_geometry = [origin]
+    trip.reposition_cumulative_km = [0.0]
+    trip_route = [
+        (trip.pickup_lat, trip.pickup_lon),
+        (40.7500, -73.9790),
+        (trip.dropoff_lat, trip.dropoff_lon),
+    ]
+    replay._apply_trip_route(
+        trip,
+        "osrm_public",
+        trip_route,
+        replay_main.cumulative_route_distances_km(trip_route),
+    )
+
+    sent: list[tuple[str, bytes]] = []
+
+    async def _capture(topic, _key, value):  # noqa: ANN001
+        sent.append((topic, value))
+
+    monkeypatch.setattr(replay, "_send", _capture)
+    asyncio.run(replay._emit_trip_start(trip))
+    asyncio.run(replay._emit_trip_progress(trip, trip.pickup_ts + timedelta(minutes=4)))
+    asyncio.run(replay._emit_trip_finish(trip))
+
+    courier_positions = []
+    for topic, raw in sent:
+        if topic != replay_main.COURIER_TOPIC:
+            continue
+        pos = replay_main.CourierPositionV1()
+        pos.ParseFromString(raw)
+        courier_positions.append(pos)
+
+    assert [pos.status for pos in courier_positions] == [
+        "repositioning",
+        "repositioning",
+        "available",
+    ]
+    assert all(pos.lat == pytest.approx(origin[0], abs=1e-6) for pos in courier_positions)
+    assert all(pos.lon == pytest.approx(origin[1], abs=1e-6) for pos in courier_positions)
+    assert all(pos.speed_kmh == 0.0 for pos in courier_positions)
+    assert all(pos.source_platform.endswith("|route=hold") for pos in courier_positions)
+
+
+def test_blocked_reposition_keeps_fleet_state_at_origin():
+    replay = replay_main.TLCReplay("2024-01")
+    replay.fleet_pool_enabled = True
+    trip = _make_trip(trip_key="blocked_reposition_state")
+    trip.courier_id = "drv_demo_001"
+    trip.reposition_start_lat = 40.7060
+    trip.reposition_start_lon = -74.0090
+    trip.reposition_start_zone_id = 231
+    trip.reposition_source = "hold"
+    trip.reposition_blocked = True
+
+    replay._mark_fleet_driver_available(trip)
+
+    state = replay.fleet_driver_state[str(trip.courier_id)]
+    assert state[1] == pytest.approx(40.7060, abs=1e-6)
+    assert state[2] == pytest.approx(-74.0090, abs=1e-6)
+    assert state[3] == 231
+
+
 def test_emit_trip_progress_emits_dense_samples_along_geometry(monkeypatch):
     replay = replay_main.TLCReplay("2024-01")
     trip = _make_trip(trip_key="dense_progress_case")

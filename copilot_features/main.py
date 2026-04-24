@@ -29,7 +29,9 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 
 OFFER_TTL_SECONDS = int(os.getenv("COPILOT_OFFER_TTL_SECONDS", "21600"))
 MAX_OFFERS_PER_DRIVER = int(os.getenv("COPILOT_MAX_OFFERS_PER_DRIVER", "100"))
-FUEL_COST_EUR_PER_KM = float(os.getenv("FUEL_COST_EUR_PER_KM", "0.35"))
+KM_TO_MILES = 0.621371
+FUEL_PRICE_USD_GALLON = float(os.getenv("COPILOT_FUEL_PRICE_USD_GALLON", "3.65"))
+VEHICLE_MPG = float(os.getenv("COPILOT_VEHICLE_MPG", "31.0"))
 CONSUMER_GROUP = "copilot-features"
 
 COURIER_HASH_PREFIX = "fleet:livreur:"
@@ -197,8 +199,8 @@ async def enrich_offer(redis_client: aioredis.Redis, offer: OrderOfferV1) -> dic
     demand_index = demand_index + gbfs_demand_boost
 
     distance_total_km = distance_to_pickup_km + max(_safe_float(offer.estimated_distance_km), 0.0)
-    variable_cost_eur = distance_total_km * FUEL_COST_EUR_PER_KM
-    net_revenue_eur = max(-2.0, _safe_float(offer.estimated_fare_eur) - variable_cost_eur)
+    fuel_cost_usd = (distance_total_km * KM_TO_MILES / max(VEHICLE_MPG, 1.0)) * max(FUEL_PRICE_USD_GALLON, 0.0)
+    net_revenue_eur = max(-2.0, _safe_float(offer.estimated_fare_eur) - fuel_cost_usd)
 
     total_trip_time_min = max(1.0, _safe_float(offer.estimated_duration_min) + eta_to_pickup_min)
     eur_per_hour_net = (net_revenue_eur / total_trip_time_min) * 60
@@ -270,6 +272,7 @@ async def enrich_offer(redis_client: aioredis.Redis, offer: OrderOfferV1) -> dic
         "stale_weather": int(stale_weather),
         "stale_events": int(stale_events),
         "pressure_ratio": round(pressure_ratio, 3),
+        "fuel_cost_usd": round(fuel_cost_usd, 3),
         "eur_per_hour_net": round(eur_per_hour_net, 3),
         "accept_score_heuristic": round(accept_score, 4),
         "explanation": json.dumps(explanation),

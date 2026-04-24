@@ -695,7 +695,9 @@ class Trip:
         "reposition_start_ts",
         "reposition_start_lat",
         "reposition_start_lon",
+        "reposition_start_zone_id",
         "reposition_source",
+        "reposition_blocked",
         "reposition_geometry",
         "reposition_cumulative_km",
         "route_source",
@@ -746,7 +748,9 @@ class Trip:
         self.reposition_start_ts = request_ts
         self.reposition_start_lat = pickup_lat
         self.reposition_start_lon = pickup_lon
+        self.reposition_start_zone_id = None
         self.reposition_source = "linear"
+        self.reposition_blocked = False
         self.reposition_geometry = [(pickup_lat, pickup_lon)]
         self.reposition_cumulative_km = [0.0]
         self.route_source = "linear"
@@ -1143,6 +1147,19 @@ class TLCReplay:
     def _align_reposition_with_route(self, trip: Trip) -> None:
         pickup_lat, pickup_lon = self._trip_pickup_anchor(trip)
         if len(trip.reposition_geometry) <= 1:
+            distance_to_pickup_km = haversine_km(
+                trip.reposition_start_lat,
+                trip.reposition_start_lon,
+                pickup_lat,
+                pickup_lon,
+            )
+            if trip.reposition_source == "hold" and distance_to_pickup_km >= 0.05:
+                trip.reposition_blocked = True
+                trip.reposition_geometry = [(trip.reposition_start_lat, trip.reposition_start_lon)]
+                trip.reposition_cumulative_km = [0.0]
+                return
+
+            trip.reposition_blocked = False
             trip.reposition_start_lat = pickup_lat
             trip.reposition_start_lon = pickup_lon
             trip.reposition_source = "identity"
@@ -1154,6 +1171,7 @@ class TLCReplay:
         aligned_geometry[-1] = (pickup_lat, pickup_lon)
         trip.reposition_geometry = aligned_geometry
         trip.reposition_cumulative_km = cumulative_route_distances_km(aligned_geometry)
+        trip.reposition_blocked = False
 
     def _apply_trip_route(
         self,
@@ -1258,12 +1276,17 @@ class TLCReplay:
         dropoff_ts = trip.dropoff_ts
         if dropoff_ts.tzinfo is None:
             dropoff_ts = dropoff_ts.replace(tzinfo=timezone.utc)
-        dropoff_lat, dropoff_lon = self._trip_dropoff_anchor(trip)
+        if trip.reposition_blocked:
+            dropoff_lat, dropoff_lon = trip.reposition_start_lat, trip.reposition_start_lon
+            zone_id = trip.reposition_start_zone_id if trip.reposition_start_zone_id is not None else trip.pu_loc
+        else:
+            dropoff_lat, dropoff_lon = self._trip_dropoff_anchor(trip)
+            zone_id = trip.do_loc
         self.fleet_driver_state[cid] = (
             dropoff_ts,
             dropoff_lat,
             dropoff_lon,
-            int(trip.do_loc),
+            int(zone_id),
         )
 
     async def _prepare_fleet_reposition(self, trip: Trip) -> None:
@@ -1274,13 +1297,14 @@ class TLCReplay:
         if not cid or state is None:
             return
 
-        available_at, last_lat, last_lon, _ = self._fleet_driver_state_parts(state)
+        available_at, last_lat, last_lon, last_zone_id = self._fleet_driver_state_parts(state)
         if available_at.tzinfo is None:
             available_at = available_at.replace(tzinfo=timezone.utc)
 
         trip.reposition_start_ts = available_at if available_at > trip.request_ts else trip.request_ts
         trip.reposition_start_lat = last_lat
         trip.reposition_start_lon = last_lon
+        trip.reposition_start_zone_id = last_zone_id
 
         if (
             trip.reposition_start_ts >= trip.pickup_ts
@@ -1289,7 +1313,9 @@ class TLCReplay:
             trip.reposition_start_ts = trip.request_ts
             trip.reposition_start_lat = trip.pickup_lat
             trip.reposition_start_lon = trip.pickup_lon
+            trip.reposition_start_zone_id = int(trip.pu_loc)
             trip.reposition_source = "identity"
+            trip.reposition_blocked = False
             trip.reposition_geometry = [(trip.pickup_lat, trip.pickup_lon)]
             trip.reposition_cumulative_km = [0.0]
             return
@@ -1349,6 +1375,15 @@ class TLCReplay:
             geometry,
             trip.reposition_start_lat,
             trip.reposition_start_lon,
+        )
+        trip.reposition_blocked = (
+            source == "hold"
+            and haversine_km(
+                trip.reposition_start_lat,
+                trip.reposition_start_lon,
+                trip.pickup_lat,
+                trip.pickup_lon,
+            ) >= 0.05
         )
 
     def _route_fetch_in_cooldown(self) -> bool:
@@ -2161,7 +2196,7 @@ class TLCReplay:
                 trip.reposition_start_lon,
                 trip.reposition_start_ts,
                 "repositioning",
-                speed_kmh_override=TLC_FLEET_REPOSITION_KMH,
+                speed_kmh_override=0.0 if trip.reposition_blocked else TLC_FLEET_REPOSITION_KMH,
                 route_source_override=trip.reposition_source,
             )
         else:
@@ -2176,6 +2211,21 @@ class TLCReplay:
         if last_position_ts.tzinfo is None:
             last_position_ts = last_position_ts.replace(tzinfo=timezone.utc)
         if now <= last_position_ts:
+            return
+
+        if trip.reposition_blocked:
+            pos = self._build_position(
+                trip,
+                trip.reposition_start_lat,
+                trip.reposition_start_lon,
+                now,
+                "repositioning",
+                speed_kmh_override=0.0,
+                route_source_override=trip.reposition_source,
+            )
+            await self._send(COURIER_TOPIC, trip.courier_id, pos.SerializeToString())
+            self.stats_emitted_positions += 1
+            trip.last_position_ts = now
             return
 
         if self._trip_needs_reposition(trip):
@@ -2210,8 +2260,20 @@ class TLCReplay:
         )
 
     async def _emit_trip_finish(self, trip: Trip) -> None:
-        dropoff_lat, dropoff_lon = self._trip_dropoff_anchor(trip)
-        pos = self._build_position(trip, dropoff_lat, dropoff_lon, trip.dropoff_ts, "available")
+        if trip.reposition_blocked:
+            dropoff_lat, dropoff_lon = trip.reposition_start_lat, trip.reposition_start_lon
+            route_source_override = trip.reposition_source
+        else:
+            dropoff_lat, dropoff_lon = self._trip_dropoff_anchor(trip)
+            route_source_override = None
+        pos = self._build_position(
+            trip,
+            dropoff_lat,
+            dropoff_lon,
+            trip.dropoff_ts,
+            "available",
+            route_source_override=route_source_override,
+        )
         await self._send(COURIER_TOPIC, trip.courier_id, pos.SerializeToString())
         self.stats_emitted_positions += 1
         trip.last_position_ts = trip.dropoff_ts

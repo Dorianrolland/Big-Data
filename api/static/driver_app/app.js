@@ -14,9 +14,9 @@ const STORAGE_KEYS = Object.freeze({
 });
 
 const PRESETS = Object.freeze({
-  max_earnings: { target_eur_h: 22, consommation_l_100: 7.5, aversion_risque: 0.25, max_eta: 18 },
-  balanced: { target_eur_h: 18, consommation_l_100: 7.0, aversion_risque: 0.5, max_eta: 16 },
-  low_fuel: { target_eur_h: 16, consommation_l_100: 6.2, aversion_risque: 0.65, max_eta: 12 },
+  max_earnings: { target_eur_h: 22, vehicle_mpg: 31, aversion_risque: 0.25, max_eta: 18 },
+  balanced: { target_eur_h: 18, vehicle_mpg: 34, aversion_risque: 0.5, max_eta: 16 },
+  low_fuel: { target_eur_h: 16, vehicle_mpg: 40, aversion_risque: 0.65, max_eta: 12 },
 });
 
 const POLL_INTERVAL_MS = 8000;
@@ -94,6 +94,11 @@ function fmtSigned(value, digits = 1) {
 function fmtCurrency(value, digits = 2) {
   const num = Number(value);
   return Number.isFinite(num) ? `${num.toFixed(digits)} EUR` : '-';
+}
+
+function fmtFuelCost(value, digits = 2) {
+  const num = Number(value);
+  return Number.isFinite(num) ? `$${num.toFixed(digits)}` : '-';
 }
 
 function fmtMinutes(value) {
@@ -280,7 +285,7 @@ function renderHome() {
   setText('metricScore', recommendation ? fmtPercent(recommendation.accept_score) : '-');
   setText('metricProfit', recommendation ? fmtCurrency(recommendation.eur_per_hour_net, 1) : '-');
   setText('metricTripNet', recommendation ? fmtCurrency(recommendation.estimated_net_eur, 2) : '-');
-  setText('metricFuel', recommendation ? fmtCurrency(recommendation.fuel_cost_eur, 2) : '-');
+  setText('metricFuel', recommendation ? fmtFuelCost(recommendation.fuel_cost_usd, 2) : '-');
   setText('metricPickupEta', recommendation ? fmtMinutes(recommendation.pickup_eta_min) : '-');
   setText('metricFullEta', recommendation ? fmtMinutes(recommendation.full_eta_min) : '-');
   setText('metricTraffic', recommendation?.traffic_level || '-');
@@ -312,7 +317,7 @@ function renderHome() {
 
   setText('railDecision', recommendation?.decision_badge || 'Hold');
   setText('railTraffic', recommendation?.traffic_level || '-');
-  setText('railFuel', recommendation ? fmtCurrency(recommendation.fuel_cost_eur, 2) : '-');
+  setText('railFuel', recommendation ? fmtFuelCost(recommendation.fuel_cost_usd, 2) : '-');
   setText('railEta', recommendation ? fmtMinutes(recommendation.full_eta_min) : '-');
   setText('railNarration', recommendationNarration(recommendation, demoContext));
   const takeButton = $('takeJobButton');
@@ -333,7 +338,7 @@ function renderOrderCard(rec, index) {
       </div>
       <div class="mini-grid">
         <div class="mini-stat"><div class="metric-label">Profit</div><div class="metric-value">${escapeHtml(fmtCurrency(rec.eur_per_hour_net, 1))}</div></div>
-        <div class="mini-stat"><div class="metric-label">Fuel</div><div class="metric-value">${escapeHtml(fmtCurrency(rec.fuel_cost_eur, 2))}</div></div>
+        <div class="mini-stat"><div class="metric-label">Fuel</div><div class="metric-value">${escapeHtml(fmtFuelCost(rec.fuel_cost_usd, 2))}</div></div>
         <div class="mini-stat"><div class="metric-label">ETA</div><div class="metric-value">${escapeHtml(fmtMinutes(rec.full_eta_min))}</div></div>
         <div class="mini-stat"><div class="metric-label">Risk</div><div class="metric-value">${escapeHtml(rec.traffic_level || '-') }</div></div>
       </div>
@@ -354,32 +359,59 @@ function renderOrders() {
     : '<div class="empty-state">No ranked options are available yet. The app will keep the last valid snapshot instead of blanking out.</div>';
 }
 
-function renderZoneItem(zone) {
+function renderZoneItem(zone, maxScore, variant) {
+  const score = Number(zone.market_score) || 0;
+  const demand = Number(zone.demand_index) || 0;
+  const supply = Number(zone.supply_index) || 0;
+  const traffic = Number(zone.traffic_factor) || 0;
+  const ratio = maxScore > 0 ? Math.min(100, Math.max(6, (score / maxScore) * 100)) : 0;
+  const low = variant === 'calm';
   return `
-    <article class="list-item">
-      <div class="list-item-top">
-        <div>
-          <div class="list-title">${escapeHtml(zone.zone_id || 'zone')}</div>
-          <div class="list-subtitle">${escapeHtml(zone.label || 'Market signal')}</div>
-        </div>
-        <span class="chip ${zone.stale ? 'warn' : 'good'}">${zone.stale ? 'stale' : 'fresh'}</span>
+    <article class="zone-item">
+      <div class="zone-item-head">
+        <span class="zone-id">${escapeHtml(zone.zone_id || 'zone')}</span>
+        <span class="zone-score${low ? ' low' : ''}">${escapeHtml(fmtNumber(score, 2))}</span>
       </div>
-      <div class="mini-grid">
-        <div class="mini-stat"><div class="metric-label">Score</div><div class="metric-value">${escapeHtml(fmtNumber(zone.market_score, 2))}</div></div>
-        <div class="mini-stat"><div class="metric-label">Demand</div><div class="metric-value">${escapeHtml(fmtNumber(zone.demand_index, 2))}</div></div>
-        <div class="mini-stat"><div class="metric-label">Supply</div><div class="metric-value">${escapeHtml(fmtNumber(zone.supply_index, 2))}</div></div>
-        <div class="mini-stat"><div class="metric-label">Traffic</div><div class="metric-value">${escapeHtml(fmtNumber(zone.traffic_factor, 2))}</div></div>
+      <div class="zone-bar"><div class="zone-bar-fill${low ? ' low' : ''}" style="width:${ratio.toFixed(1)}%"></div></div>
+      <div class="zone-stats">
+        <span class="stat"><span class="k">D</span><span class="v">${escapeHtml(fmtNumber(demand, 2))}</span></span>
+        <span class="stat"><span class="k">S</span><span class="v">${escapeHtml(fmtNumber(supply, 2))}</span></span>
+        <span class="stat"><span class="k">T</span><span class="v">${escapeHtml(fmtNumber(traffic, 2))}</span></span>
       </div>
     </article>
   `;
+}
+
+function updateZoneHeader(countId, stateId, list) {
+  const countEl = $(countId);
+  if (countEl) countEl.textContent = String(list.length || 0);
+  const stateEl = $(stateId);
+  if (stateEl) {
+    const anyStale = list.some((z) => z && z.stale);
+    stateEl.hidden = !anyStale;
+  }
 }
 
 function renderZones() {
   const hot = state.brief?.zones?.hot_zones || [];
   const calm = state.brief?.zones?.calm_zones || [];
   const reposition = state.brief?.zones?.best_reposition || null;
-  setHtml('hotZonesList', hot.length ? hot.map(renderZoneItem).join('') : '<div class="empty-state">Live market zones are still warming up. The site keeps the latest useful snapshot on screen.</div>');
-  setHtml('calmZonesList', calm.length ? calm.map(renderZoneItem).join('') : '<div class="empty-state">Calm zones will appear as soon as full market context is available.</div>');
+  const maxHot = Math.max(1, ...hot.map((z) => Number(z.market_score) || 0));
+  const maxCalm = Math.max(1, ...calm.map((z) => Number(z.market_score) || 0));
+  setHtml('hotZonesList', hot.length
+    ? hot.map((zone) => renderZoneItem(zone, maxHot, 'hot')).join('')
+    : '<div class="empty-state">Live market zones are still warming up.</div>');
+  setHtml('calmZonesList', calm.length
+    ? calm.map((zone) => renderZoneItem(zone, maxCalm, 'calm')).join('')
+    : '<div class="empty-state">Calm zones will appear as soon as full market context is available.</div>');
+  updateZoneHeader('hotZonesCount', 'hotZonesState', hot);
+  updateZoneHeader('calmZonesCount', 'calmZonesState', calm);
+  const bestMetaEl = $('bestZoneMeta');
+  if (bestMetaEl) {
+    bestMetaEl.textContent = reposition?.zone_id
+      ? `Target · ${reposition.zone_id}`
+      : 'Top market move';
+  }
   setHtml('bestRepositionCard', reposition
     ? renderOrderCard(reposition, 0)
     : '<div class="empty-state">No reposition move currently beats staying put.</div>');
@@ -429,7 +461,7 @@ function renderShift() {
 function populateProfileSheet() {
   const profile = state.brief?.driver?.profile || PRESETS.balanced;
   $('profileTarget').value = String(profile.target_eur_h ?? PRESETS.balanced.target_eur_h);
-  $('profileFuel').value = String(profile.consommation_l_100 ?? PRESETS.balanced.consommation_l_100);
+  $('profileFuel').value = String(profile.vehicle_mpg ?? PRESETS.balanced.vehicle_mpg);
   $('profileRisk').value = String(profile.aversion_risque ?? PRESETS.balanced.aversion_risque);
   $('profileEta').value = String(profile.max_eta ?? PRESETS.balanced.max_eta);
 }
@@ -443,15 +475,19 @@ function closeProfileSheet() {
   $('profileSheet').classList.remove('open');
 }
 
+const DARK_TILE_URL = 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
+const DARK_TILE_OPTS = {
+  maxZoom: 19,
+  subdomains: 'abcd',
+  attribution: '&copy; OpenStreetMap &copy; CARTO',
+};
+
 function ensureMap(targetId) {
   if (typeof L === 'undefined') return null;
   if (targetId === 'homeMap') {
     if (!state.homeMap) {
       state.homeMap = L.map(targetId, { zoomControl: false }).setView(DEFAULT_CENTER, 12);
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        maxZoom: 19,
-        attribution: '&copy; OpenStreetMap',
-      }).addTo(state.homeMap);
+      L.tileLayer(DARK_TILE_URL, DARK_TILE_OPTS).addTo(state.homeMap);
       state.homeLayer = L.layerGroup().addTo(state.homeMap);
     }
     setTimeout(() => state.homeMap.invalidateSize(), 60);
@@ -459,10 +495,7 @@ function ensureMap(targetId) {
   }
   if (!state.zonesMap) {
     state.zonesMap = L.map(targetId, { zoomControl: false }).setView(DEFAULT_CENTER, 11);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 19,
-      attribution: '&copy; OpenStreetMap',
-    }).addTo(state.zonesMap);
+    L.tileLayer(DARK_TILE_URL, DARK_TILE_OPTS).addTo(state.zonesMap);
     state.zonesLayer = L.layerGroup().addTo(state.zonesMap);
   }
   setTimeout(() => state.zonesMap.invalidateSize(), 60);
@@ -512,9 +545,9 @@ async function renderHomeMap() {
     previewPoints.forEach((pair, index) => {
       L.circleMarker(pair, {
         radius: index === 0 ? 10 : 8,
-        color: index === 0 ? '#ffb100' : '#36d4d2',
+        color: index === 0 ? '#ffb020' : '#22d3ee',
         weight: 2,
-        fillColor: index === 0 ? '#ffb100' : '#36d4d2',
+        fillColor: index === 0 ? '#ffb020' : '#22d3ee',
         fillOpacity: 0.72,
       }).addTo(state.homeLayer).bindTooltip(index === 0 ? 'Best live hot zone' : 'Live market zone');
     });
@@ -547,9 +580,9 @@ async function renderHomeMap() {
   if (origin) {
     L.circleMarker([origin.lat, origin.lon], {
       radius: 7,
-      color: '#36d4d2',
+      color: '#22d3ee',
       weight: 2,
-      fillColor: '#36d4d2',
+      fillColor: '#22d3ee',
       fillOpacity: 0.8,
     }).addTo(state.homeLayer).bindTooltip('Driver');
   }
@@ -557,9 +590,9 @@ async function renderHomeMap() {
   if (pickup) {
     L.circleMarker([pickup.lat, pickup.lon], {
       radius: 7,
-      color: '#ffb100',
+      color: '#ffb020',
       weight: 2,
-      fillColor: '#ffb100',
+      fillColor: '#ffb020',
       fillOpacity: 0.85,
     }).addTo(state.homeLayer).bindTooltip(recommendation?.kind === 'reposition' ? 'Target zone' : 'Pickup');
   }
@@ -567,16 +600,16 @@ async function renderHomeMap() {
   if (dropoff && recommendation?.kind === 'offer') {
     L.circleMarker([dropoff.lat, dropoff.lon], {
       radius: 7,
-      color: '#51d98b',
+      color: '#34d399',
       weight: 2,
-      fillColor: '#51d98b',
+      fillColor: '#34d399',
       fillOpacity: 0.82,
     }).addTo(state.homeLayer).bindTooltip('Dropoff');
   }
 
   if (latLngs.length >= 2) {
     L.polyline(latLngs, {
-      color: recommendation?.kind === 'reposition' ? '#36d4d2' : '#ffb100',
+      color: recommendation?.kind === 'reposition' ? '#22d3ee' : '#ffb020',
       weight: 4,
       opacity: 0.92,
     }).addTo(state.homeLayer);
@@ -604,9 +637,9 @@ function renderZonesMap() {
   hot.forEach((zone) => {
     const marker = L.circleMarker([zone.lat, zone.lon], {
       radius: 10,
-      color: '#ffb100',
+      color: '#ffb020',
       weight: 2,
-      fillColor: '#ffb100',
+      fillColor: '#ffb020',
       fillOpacity: 0.75,
     });
     marker.bindTooltip(`${zone.zone_id} - hot`);
@@ -617,9 +650,9 @@ function renderZonesMap() {
   calm.forEach((zone) => {
     const marker = L.circleMarker([zone.lat, zone.lon], {
       radius: 8,
-      color: '#68707e',
+      color: '#8b93a3',
       weight: 2,
-      fillColor: '#68707e',
+      fillColor: '#8b93a3',
       fillOpacity: 0.48,
     });
     marker.bindTooltip(`${zone.zone_id} - calm`);
@@ -630,9 +663,9 @@ function renderZonesMap() {
   if (best?.zone?.lat && best?.zone?.lon) {
     const marker = L.circleMarker([best.zone.lat, best.zone.lon], {
       radius: 12,
-      color: '#36d4d2',
+      color: '#22d3ee',
       weight: 2,
-      fillColor: '#36d4d2',
+      fillColor: '#22d3ee',
       fillOpacity: 0.82,
     });
     marker.bindTooltip(`Best reposition - ${best.zone_id || best.zone.zone_id || 'zone'}`);
@@ -643,9 +676,9 @@ function renderZonesMap() {
   if (position?.lat && position?.lon) {
     const marker = L.circleMarker([Number(position.lat), Number(position.lon)], {
       radius: 9,
-      color: '#36d4d2',
+      color: '#22d3ee',
       weight: 2,
-      fillColor: '#36d4d2',
+      fillColor: '#22d3ee',
       fillOpacity: 0.88,
     });
     marker.bindTooltip('Driver');
@@ -823,7 +856,7 @@ async function stopMission() {
 async function saveProfile() {
   const payload = {
     target_eur_h: Number($('profileTarget').value),
-    consommation_l_100: Number($('profileFuel').value),
+    vehicle_mpg: Number($('profileFuel').value),
     aversion_risque: Number($('profileRisk').value),
     max_eta: Number($('profileEta').value),
   };

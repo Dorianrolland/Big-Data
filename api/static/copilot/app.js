@@ -156,13 +156,13 @@ const API_RETRY_GET = 1;
 const UI_STATE_TYPES = ['loading', 'error', 'empty', 'success'];
 const DRIVER_PROFILE_DEFAULTS = Object.freeze({
   target_eur_h: 18,
-  consommation_l_100: 7.5,
+  vehicle_mpg: 31,
   aversion_risque: 0.5,
   max_eta: 20,
 });
 const DRIVER_PROFILE_LIMITS = Object.freeze({
   target_eur_h: { min: 0, max: 150, digits: 1 },
-  consommation_l_100: { min: 2, max: 30, digits: 1 },
+  vehicle_mpg: { min: 1, max: 120, digits: 1 },
   aversion_risque: { min: 0, max: 1, digits: 2 },
   max_eta: { min: 3, max: 60, digits: 1 },
 });
@@ -528,11 +528,11 @@ function offerMetricsHtml(offer) {
   const eta = Number(offer?.route_duration_min);
   const netHourly = Number(offer?.eur_per_hour_net);
   const netTrip = Number(offer?.estimated_net_eur);
-  const fuel = Number(costs.fuel_cost_eur);
+  const fuel = Number(costs.fuel_cost_usd);
   const platform = Number(costs.platform_fee_eur);
   const targetGap = Number(offer?.target_gap_eur_h);
   const costTotal = Number.isFinite(fuel) || Number.isFinite(platform)
-    ? `${fmt(fuel, 2)} / ${fmt(platform, 2)}`
+    ? `$${fmt(fuel, 2)} / ${fmt(platform, 2)} EUR`
     : '-';
   const gapText = Number.isFinite(targetGap) ? fmtSigned(targetGap, 1) : '-';
 
@@ -815,7 +815,7 @@ function buildDispatchMapPayload(plan) {
         distance_km: Number(z.route_distance_km || 0),
         potential: Number(z.estimated_potential_eur_h || 0),
         risk_potential: Number(z.risk_adjusted_potential_eur_h || z.estimated_potential_eur_h || 0),
-        total_cost: Number(z.reposition_total_cost_eur || z.travel_cost_eur || 0),
+        total_cost: Number(z.reposition_total_cost_eur || z.travel_cost_usd || 0),
       };
     })
     .filter(Boolean);
@@ -1583,7 +1583,7 @@ function renderHealth() {
   if (Number.isFinite(Number(metrics.average_precision))) items.push({ txt: `AP ${fmt(metrics.average_precision, 3)}`, cls: 'chip' });
   if (Number.isFinite(Number(metrics.brier_score))) items.push({ txt: `Brier ${fmt(metrics.brier_score, 3)}`, cls: 'chip' });
   if (Number.isFinite(Number(gate.trained_rows))) items.push({ txt: `rows ${gate.trained_rows}`, cls: 'chip' });
-  if (Number.isFinite(Number(fuel.fuel_price_eur_l))) items.push({ txt: `fuel ${fmt(fuel.fuel_price_eur_l, 3)} EUR/L`, cls: 'chip' });
+  if (Number.isFinite(Number(fuel.fuel_price_usd_gallon))) items.push({ txt: `fuel $${fmt(fuel.fuel_price_usd_gallon, 3)}/gal`, cls: 'chip' });
   if (fuel.source) items.push({ txt: `fuel src ${fuel.source}`, cls: 'chip' });
   if (fuel.fuel_sync_status) items.push({ txt: `fuel sync ${fuel.fuel_sync_status}`, cls: 'chip' });
 
@@ -1847,7 +1847,7 @@ function renderDispatch() {
         <div class="offer-metric"><div class="k">Reposition Cost</div><div class="v">${fmt(move.reposition_total_cost_eur, 2)}</div></div>
       </div>
       <div class="muted">Gross ${fmt(move.estimated_potential_eur_h, 1)} EUR/h - Risk-adjusted ${fmt(move.risk_adjusted_potential_eur_h, 1)} EUR/h - net gain vs stay ${fmt(move.net_gain_vs_stay_eur_h, 1)} EUR/h</div>
-      <div class="muted">fuel ${fmt(move.travel_cost_eur, 2)} EUR - time ${fmt(move.time_cost_eur, 2)} EUR - risk ${fmt(move.risk_cost_eur, 2)} EUR - total ${fmt(move.reposition_total_cost_eur, 2)} EUR</div>
+      <div class="muted">fuel $${fmt(move.travel_cost_usd, 2)} - time ${fmt(move.time_cost_eur, 2)} EUR - risk ${fmt(move.risk_cost_eur, 2)} EUR - total ${fmt(move.reposition_total_cost_eur, 2)} EUR</div>
       <div class="muted">demand ${fmt(move.demand_index, 2)} / supply ${fmt(move.supply_index, 2)} - forecast pressure ${fmt(move.forecast_pressure_ratio, 2)} - opportunity ${fmt(move.opportunity_score, 2)}</div>
       <div class="zone-meter"><div style="width:${Math.max(6, Math.min(100, Number(move.dispatch_score || 0) * 100))}%"></div></div>
       <div class="offer-actions">
@@ -1904,12 +1904,12 @@ function renderZones() {
     const meter = Math.max(6, Math.min(100, (adjustedScore / maxScore) * 100));
 
     const distance = Number(zone.distance_km);
-    const fuelCost = Number(zone.reposition_cost_eur);
+    const fuelCost = Number(zone.reposition_cost_usd);
     const repoTime = Number(zone.reposition_time_min);
 
     const costLine =
       Number.isFinite(distance)
-        ? `<div class="muted">${fmt(distance, 2)} km away - ~${fmt(repoTime, 0)} min, fuel ${fmt(fuelCost, 2)} EUR</div>`
+        ? `<div class="muted">${fmt(distance, 2)} km away - ~${fmt(repoTime, 0)} min, fuel $${fmt(fuelCost, 2)}</div>`
         : '';
 
     const adjustedLine =
@@ -2578,15 +2578,15 @@ function normalizeProfileValue(rawValue, fallback, limits) {
 function normalizedProfilePayloadFromInputs() {
   const current = state.driverProfile || {};
   const fallbackTarget = asFloatOrNull(current.target_eur_h) ?? DRIVER_PROFILE_DEFAULTS.target_eur_h;
-  const fallbackConsumption = asFloatOrNull(current.consommation_l_100) ?? DRIVER_PROFILE_DEFAULTS.consommation_l_100;
+  const fallbackMpg = asFloatOrNull(current.vehicle_mpg) ?? DRIVER_PROFILE_DEFAULTS.vehicle_mpg;
   const fallbackRisk = asFloatOrNull(current.aversion_risque) ?? DRIVER_PROFILE_DEFAULTS.aversion_risque;
   const fallbackMaxEta = asFloatOrNull(current.max_eta) ?? DRIVER_PROFILE_DEFAULTS.max_eta;
   return {
     target_eur_h: normalizeProfileValue(profileTargetEurHInput?.value, fallbackTarget, DRIVER_PROFILE_LIMITS.target_eur_h),
-    consommation_l_100: normalizeProfileValue(
+    vehicle_mpg: normalizeProfileValue(
       profileConsumptionInput?.value,
-      fallbackConsumption,
-      DRIVER_PROFILE_LIMITS.consommation_l_100
+      fallbackMpg,
+      DRIVER_PROFILE_LIMITS.vehicle_mpg
     ),
     aversion_risque: normalizeProfileValue(
       profileRiskAversionInput?.value,
@@ -2600,7 +2600,7 @@ function normalizedProfilePayloadFromInputs() {
 function syncProfileInputs(payload) {
   if (!payload || typeof payload !== 'object') return;
   if (profileTargetEurHInput) profileTargetEurHInput.value = String(payload.target_eur_h);
-  if (profileConsumptionInput) profileConsumptionInput.value = String(payload.consommation_l_100);
+  if (profileConsumptionInput) profileConsumptionInput.value = String(payload.vehicle_mpg);
   if (profileRiskAversionInput) profileRiskAversionInput.value = String(payload.aversion_risque);
   if (profileMaxEtaInput) profileMaxEtaInput.value = String(payload.max_eta);
 }
@@ -2629,10 +2629,10 @@ function renderDriverProfile() {
       DRIVER_PROFILE_DEFAULTS.target_eur_h,
       DRIVER_PROFILE_LIMITS.target_eur_h
     ),
-    consommation_l_100: normalizeProfileValue(
-      profile.consommation_l_100,
-      DRIVER_PROFILE_DEFAULTS.consommation_l_100,
-      DRIVER_PROFILE_LIMITS.consommation_l_100
+    vehicle_mpg: normalizeProfileValue(
+      profile.vehicle_mpg,
+      DRIVER_PROFILE_DEFAULTS.vehicle_mpg,
+      DRIVER_PROFILE_LIMITS.vehicle_mpg
     ),
     aversion_risque: normalizeProfileValue(
       profile.aversion_risque,
@@ -2767,7 +2767,7 @@ function objectiveScoreFromOffer(offer, weights) {
   const timeComponent = 1 - clamp((durationMin - 14.0) / 32.0, 0, 1);
 
   const fare = Number(offer?.costs?.estimated_fare_eur);
-  const fuel = Number(offer?.costs?.fuel_cost_eur);
+  const fuel = Number(offer?.costs?.fuel_cost_usd);
   const fuelShare = Number.isFinite(fare) && fare > 0 && Number.isFinite(fuel) ? fuel / fare : 0.16;
   const fuelComponent = 1 - clamp((fuelShare - 0.06) / 0.25, 0, 1);
 

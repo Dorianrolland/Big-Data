@@ -340,6 +340,7 @@ const FLEET_TRACK_POINTS = Math.max(8, Math.min(64, Number(_urlParams.get('fleet
 const FLEET_INTERP_MIN_MS = 550;
 const FLEET_INTERP_MAX_MS = 18000;
 const FLEET_INTERP_TARGET_KMH = Number(_urlParams.get('fleetKmh') || '24');
+const FLEET_FREEZE_JUMP_KM = Math.max(0.08, Number(_urlParams.get('fleetFreezeJumpKm') || '0.25'));
 const FLEET_REMOVE_GRACE_MS = Math.max(4000, Number(_urlParams.get('fleetKeepMs') || '12000'));
 
 setTimeout(() => {
@@ -751,6 +752,7 @@ function upsertFleetMotion(lv, now) {
   const s = STATUS[lv.status] || defaultStatus;
   const nextServerTsMs = parseIsoTimestampMs(lv.ts);
   const freezeMarker = lv.route_source === 'hold' || lv.anomaly_state === 'anomalous';
+  let acceptServerTimestamp = true;
   let state = fleetMotion.get(lv.livreur_id);
   if (!state) {
     const initPath = [
@@ -771,17 +773,23 @@ function upsertFleetMotion(lv, now) {
     marker.setLatLng([lv.lat, lv.lon]);
     halo?.setLatLng([lv.lat, lv.lon]);
   } else if (freezeMarker) {
+    const current = fleetInterpolatedPosition(state, now);
+    const jumpKm = haversineKm(current.lat, current.lon, Number(lv.lat), Number(lv.lon));
+    const acceptFrozenTarget = jumpKm <= FLEET_FREEZE_JUMP_KM;
+    const holdLat = acceptFrozenTarget ? Number(lv.lat) : current.lat;
+    const holdLon = acceptFrozenTarget ? Number(lv.lon) : current.lon;
     state.path = [
-      { lat: lv.lat, lon: lv.lon },
-      { lat: lv.lat, lon: lv.lon },
+      { lat: holdLat, lon: holdLon },
+      { lat: holdLat, lon: holdLon },
     ];
     state.totalKm = 0;
-    state.targetLat = lv.lat;
-    state.targetLon = lv.lon;
+    state.targetLat = holdLat;
+    state.targetLon = holdLon;
     state.startWall = now;
     state.targetWall = now + FLEET_INTERP_MIN_MS;
-    marker.setLatLng([lv.lat, lv.lon]);
-    halo?.setLatLng([lv.lat, lv.lon]);
+    marker.setLatLng([holdLat, holdLon]);
+    halo?.setLatLng([holdLat, holdLon]);
+    if (!acceptFrozenTarget) acceptServerTimestamp = false;
   } else {
     const current = fleetInterpolatedPosition(state, now);
     const path = buildFleetPath(state, lv, current, now);
@@ -794,7 +802,7 @@ function upsertFleetMotion(lv, now) {
     state.targetWall = now + fleetDurationMs(totalKm);
   }
 
-  if (nextServerTsMs != null) state.lastServerTsMs = nextServerTsMs;
+  if (nextServerTsMs != null && acceptServerTimestamp) state.lastServerTsMs = nextServerTsMs;
   state.payload = lv;
   applyFleetQualityStyle(marker, halo, lv, s);
   if (marker.isPopupOpen()) marker.setPopupContent(buildPopup(lv));

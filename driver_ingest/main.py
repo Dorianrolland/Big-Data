@@ -109,7 +109,16 @@ class PositionIn(BaseModel):
     lon: float = Field(..., ge=-180.0, le=180.0)
     speed_kmh: float = Field(0.0, ge=0.0, le=300.0)
     heading_deg: float = Field(0.0, ge=0.0, le=360.0)
-    status: Literal["available", "delivering", "idle", "pickup_arrived", "unknown"] = "unknown"
+    status: Literal[
+        "available",
+        "delivering",
+        "idle",
+        "pickup_assigned",
+        "pickup_en_route",
+        "pickup_arrived",
+        "repositioning",
+        "unknown",
+    ] = "unknown"
     accuracy_m: float = Field(8.0, ge=0.0, le=10000.0)
     battery_pct: float = Field(100.0, ge=0.0, le=100.0)
     source_platform: str = Field("driver_ingest", min_length=2, max_length=64)

@@ -99,7 +99,7 @@ SELECT
     zone_id,
     ROUND(AVG(net_eur_h), 2) AS avg_net_eur_h,
     ROUND(AVG(net_eur), 2) AS avg_net_eur,
-    ROUND(AVG(fuel_cost_eur), 2) AS avg_fuel,
+    ROUND(AVG(fuel_cost_usd), 2) AS avg_fuel_usd,
     COUNT(*) AS offers
 FROM 'data/marts/copilot/fact_offers.parquet'
 GROUP BY zone_id

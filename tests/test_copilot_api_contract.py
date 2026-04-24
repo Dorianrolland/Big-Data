@@ -400,7 +400,7 @@ def test_driver_profile_response_contract():
     payload = DriverProfileResponse(
         driver_id="drv_demo_001",
         target_eur_h=19.5,
-        consommation_l_100=7.2,
+        vehicle_mpg=32.7,
         aversion_risque=0.45,
         max_eta=18.0,
         source="manual",
@@ -409,7 +409,7 @@ def test_driver_profile_response_contract():
     out = payload.model_dump()
     assert out["driver_id"] == "drv_demo_001"
     assert out["target_eur_h"] == 19.5
-    assert out["consommation_l_100"] == 7.2
+    assert out["vehicle_mpg"] == 32.7
     assert out["aversion_risque"] == 0.45
     assert out["max_eta"] == 18.0
     assert out["source"] == "manual"

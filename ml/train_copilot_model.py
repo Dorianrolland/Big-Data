@@ -62,8 +62,9 @@ FEATURES = [
     "estimated_net_eur_h",
 ]
 
-DEFAULT_FUEL_PRICE_EUR_L = 1.85
-DEFAULT_VEHICLE_CONSUMPTION_L_100KM = 7.5
+KM_TO_MILES = 0.621371
+DEFAULT_FUEL_PRICE_USD_GALLON = 3.65
+DEFAULT_VEHICLE_MPG = 31.0
 DEFAULT_PLATFORM_FEE_PCT = 25.0
 
 
@@ -288,18 +289,18 @@ def build_training_frame(
     ).clip(lower=0.0, upper=1.0)
     event_count_nearby = np.rint(event_pressure * 5.0).clip(0, 8).astype(float)
 
-    fuel_cost_eur = (
-        df["estimated_distance_km"] * (DEFAULT_VEHICLE_CONSUMPTION_L_100KM / 100.0) * DEFAULT_FUEL_PRICE_EUR_L
+    fuel_cost_usd = (
+        df["estimated_distance_km"] * KM_TO_MILES / max(DEFAULT_VEHICLE_MPG, 1.0) * DEFAULT_FUEL_PRICE_USD_GALLON
     )
     platform_fee_est = df["estimated_fare_eur"] * (DEFAULT_PLATFORM_FEE_PCT / 100.0)
-    estimated_net_eur = df["estimated_fare_eur"] - platform_fee_est - fuel_cost_eur
+    estimated_net_eur = df["estimated_fare_eur"] - platform_fee_est - fuel_cost_usd
     estimated_net_eur_h = (estimated_net_eur / df["estimated_duration_min"]) * 60.0
 
     realized_net_eur_h = pd.Series(np.nan, index=df.index, dtype=float)
     actual_mask = df["actual_fare_eur"].notna()
     if actual_mask.any():
         platform_fee_actual = df.loc[actual_mask, "actual_fare_eur"] * (DEFAULT_PLATFORM_FEE_PCT / 100.0)
-        realized_net = df.loc[actual_mask, "actual_fare_eur"] - platform_fee_actual - fuel_cost_eur.loc[actual_mask]
+        realized_net = df.loc[actual_mask, "actual_fare_eur"] - platform_fee_actual - fuel_cost_usd.loc[actual_mask]
         realized_net_eur_h.loc[actual_mask] = (realized_net / df.loc[actual_mask, "estimated_duration_min"]) * 60.0
 
     df["temporal_hour_local"] = local_hour.astype(float)

@@ -23,6 +23,8 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from copilot_logic import (
+    DEFAULT_FUEL_PRICE_USD_GALLON as LOGIC_DEFAULT_FUEL_PRICE_USD_GALLON,
+    DEFAULT_VEHICLE_MPG as LOGIC_DEFAULT_VEHICLE_MPG,
     FEATURE_COLUMNS,
     build_feature_map,
     cost_breakdown,
@@ -30,6 +32,7 @@ from copilot_logic import (
     dispatch_strategy_profile,
     explanation_details,
     forecast_zone_metrics,
+    fuel_cost_usd_from_km,
     heuristic_score,
     hybrid_accept_decision,
     model_score,
@@ -94,8 +97,10 @@ SINGLE_REPLAY_STATUS_KEY = "copilot:replay:tlc:single:status"
 MISSION_JOURNAL_PREFIX = "copilot:mission:journal:"
 MISSION_JOURNAL_MAX_ITEMS = int(os.getenv("COPILOT_MISSION_JOURNAL_MAX_ITEMS", "200"))
 FUEL_CONTEXT_TTL_SECONDS = int(os.getenv("COPILOT_FUEL_CONTEXT_TTL_SECONDS", "86400"))
-DEFAULT_FUEL_PRICE_EUR_L = float(os.getenv("COPILOT_FUEL_PRICE_EUR_L", "1.85"))
-DEFAULT_CONSUMPTION_L_100KM = float(os.getenv("COPILOT_CONSUMPTION_L_100KM", "7.5"))
+DEFAULT_FUEL_PRICE_USD_GALLON = _env_float(
+    "COPILOT_FUEL_PRICE_USD_GALLON", LOGIC_DEFAULT_FUEL_PRICE_USD_GALLON
+)
+DEFAULT_VEHICLE_MPG = _env_float("COPILOT_VEHICLE_MPG", LOGIC_DEFAULT_VEHICLE_MPG)
 DEFAULT_PLATFORM_FEE_PCT = float(os.getenv("COPILOT_PLATFORM_FEE_PCT", "25.0"))
 OSRM_SCORE_TIMEOUT_S = float(os.getenv("COPILOT_OSRM_TIMEOUT_SECONDS", "4.0"))
 DUCKDB_QUERY_TIMEOUT_SECONDS = float(os.getenv("COPILOT_DUCKDB_QUERY_TIMEOUT_SECONDS", "12.0"))
@@ -109,9 +114,7 @@ FUEL_PRICE_PROVIDER_URL = os.getenv(
 )
 FUEL_PRICE_PROVIDER_TIMEOUT_S = float(os.getenv("COPILOT_FUEL_PROVIDER_TIMEOUT_SECONDS", "10.0"))
 FUEL_REFRESH_INTERVAL_S = int(os.getenv("COPILOT_FUEL_REFRESH_SECONDS", "1800"))
-FUEL_USD_TO_EUR_RATE = float(os.getenv("COPILOT_USD_TO_EUR_RATE", "0.92"))
 FUEL_GRADE = os.getenv("COPILOT_FUEL_GRADE", "regular").strip().lower()
-GALLON_TO_LITER = 3.785411784
 
 # Quality alert thresholds — exposed in /copilot/health so PWA and runbook
 # display consistent, actionable indicators without hardcoding values client-side.
@@ -150,9 +153,7 @@ SHIFT_PLAN_TOP_K_DEFAULT = _env_int("COPILOT_SHIFT_PLAN_TOP_K_DEFAULT", 6, min_v
 SHIFT_PLAN_REFERENCE_KM = _env_float("COPILOT_SHIFT_PLAN_REFERENCE_KM", 15.0)
 SHIFT_PLAN_DEFAULT_TARGET_EUR_H = max(0.0, _env_float("COPILOT_SHIFT_PLAN_TARGET_EUR_H", 18.0))
 DRIVER_PROFILE_DEFAULT_TARGET_EUR_H = max(0.0, _env_float("COPILOT_DRIVER_PROFILE_TARGET_EUR_H", 18.0))
-DRIVER_PROFILE_DEFAULT_CONSUMPTION_L_100 = max(
-    2.0, _env_float("COPILOT_DRIVER_PROFILE_CONSUMPTION_L_100", DEFAULT_CONSUMPTION_L_100KM)
-)
+DRIVER_PROFILE_DEFAULT_VEHICLE_MPG = max(1.0, _env_float("COPILOT_DRIVER_PROFILE_VEHICLE_MPG", DEFAULT_VEHICLE_MPG))
 DRIVER_PROFILE_DEFAULT_RISK_AVERSION = min(
     1.0, max(0.0, _env_float("COPILOT_DRIVER_PROFILE_RISK_AVERSION", 0.5))
 )
@@ -230,8 +231,8 @@ class ScoreOfferRequest(BaseModel):
     temporal_pressure: float | None = Field(None, ge=0, le=2)
     context_fallback_applied: bool | None = None
     context_stale_sources: int | None = Field(None, ge=0, le=12)
-    fuel_price_eur_l: float | None = Field(None, ge=0.5, le=5.0)
-    vehicle_consumption_l_100km: float | None = Field(None, ge=2.0, le=30.0)
+    fuel_price_usd_gallon: float | None = Field(None, ge=0.5, le=12.0)
+    vehicle_mpg: float | None = Field(None, ge=1.0, le=120.0)
     platform_fee_pct: float | None = Field(None, ge=0.0, le=60.0)
     other_costs_eur: float | None = Field(None, ge=0.0, le=100.0)
     target_hourly_net_eur: float | None = Field(None, ge=0.0, le=150.0)
@@ -399,7 +400,7 @@ class ShiftPlanResponse(BaseModel):
 
 class DriverProfileUpdateRequest(BaseModel):
     target_eur_h: float | None = Field(None, ge=0.0, le=150.0)
-    consommation_l_100: float | None = Field(None, ge=2.0, le=30.0)
+    vehicle_mpg: float | None = Field(None, ge=1.0, le=120.0)
     aversion_risque: float | None = Field(None, ge=0.0, le=1.0)
     max_eta: float | None = Field(None, ge=3.0, le=60.0)
 
@@ -409,7 +410,7 @@ class DriverProfileResponse(BaseModel):
 
     driver_id: str
     target_eur_h: float
-    consommation_l_100: float
+    vehicle_mpg: float
     aversion_risque: float
     max_eta: float
     source: str
@@ -417,8 +418,8 @@ class DriverProfileResponse(BaseModel):
 
 
 class FuelContextUpdateRequest(BaseModel):
-    fuel_price_eur_l: float = Field(..., ge=0.5, le=5.0)
-    vehicle_consumption_l_100km: float = Field(..., ge=2.0, le=30.0)
+    fuel_price_usd_gallon: float = Field(..., ge=0.5, le=12.0)
+    vehicle_mpg: float = Field(..., ge=1.0, le=120.0)
     platform_fee_pct: float = Field(..., ge=0.0, le=60.0)
     source: str = Field("manual", min_length=2, max_length=40)
     lock_manual: bool = False
@@ -517,7 +518,7 @@ def _as_bool(value: Any, default: bool = False) -> bool:
 def _driver_profile_defaults() -> dict[str, Any]:
     return {
         "target_eur_h": round(float(DRIVER_PROFILE_DEFAULT_TARGET_EUR_H), 3),
-        "consommation_l_100": round(float(DRIVER_PROFILE_DEFAULT_CONSUMPTION_L_100), 3),
+        "vehicle_mpg": round(float(DRIVER_PROFILE_DEFAULT_VEHICLE_MPG), 3),
         "aversion_risque": round(float(DRIVER_PROFILE_DEFAULT_RISK_AVERSION), 3),
         "max_eta": round(float(DRIVER_PROFILE_DEFAULT_MAX_ETA), 3),
         "source": "default",
@@ -534,7 +535,7 @@ def _normalize_driver_profile(
     defaults = _driver_profile_defaults()
     payload = raw or {}
     target = _clamp(_as_float(payload.get("target_eur_h"), defaults["target_eur_h"]), 0.0, 150.0)
-    consumption = _clamp(_as_float(payload.get("consommation_l_100"), defaults["consommation_l_100"]), 2.0, 30.0)
+    vehicle_mpg = _clamp(_as_float(payload.get("vehicle_mpg"), defaults["vehicle_mpg"]), 1.0, 120.0)
     risk = _clamp(_as_float(payload.get("aversion_risque"), defaults["aversion_risque"]), 0.0, 1.0)
     max_eta = _clamp(_as_float(payload.get("max_eta"), defaults["max_eta"]), 3.0, 60.0)
     source = str(source_hint or payload.get("source") or ("stored" if raw else defaults["source"]))
@@ -542,7 +543,7 @@ def _normalize_driver_profile(
     return {
         "driver_id": str(driver_id),
         "target_eur_h": round(float(target), 3),
-        "consommation_l_100": round(float(consumption), 3),
+        "vehicle_mpg": round(float(vehicle_mpg), 3),
         "aversion_risque": round(float(risk), 3),
         "max_eta": round(float(max_eta), 3),
         "source": source,
@@ -575,10 +576,8 @@ def _apply_driver_profile_to_payload(payload: dict[str, Any], profile: dict[str,
         return payload
     if payload.get("target_hourly_net_eur") in (None, ""):
         payload["target_hourly_net_eur"] = _as_float(profile.get("target_eur_h"), DRIVER_PROFILE_DEFAULT_TARGET_EUR_H)
-    if payload.get("vehicle_consumption_l_100km") in (None, ""):
-        payload["vehicle_consumption_l_100km"] = _as_float(
-            profile.get("consommation_l_100"), DRIVER_PROFILE_DEFAULT_CONSUMPTION_L_100
-        )
+    if payload.get("vehicle_mpg") in (None, ""):
+        payload["vehicle_mpg"] = _as_float(profile.get("vehicle_mpg"), DRIVER_PROFILE_DEFAULT_VEHICLE_MPG)
     if payload.get("driver_risk_aversion") in (None, ""):
         payload["driver_risk_aversion"] = _as_float(profile.get("aversion_risque"), DRIVER_PROFILE_DEFAULT_RISK_AVERSION)
     if payload.get("driver_max_eta_min") in (None, ""):
@@ -945,12 +944,6 @@ def _parse_fuel_price_usd_gallon(xml_text: str, grade: str) -> float:
     raise ValueError("fuel_price_grade_not_found")
 
 
-def _usd_gallon_to_eur_liter(usd_per_gallon: float, usd_to_eur_rate: float) -> float:
-    safe_usd_gallon = max(float(usd_per_gallon), 0.0)
-    safe_fx = max(float(usd_to_eur_rate), 0.01)
-    return (safe_usd_gallon * safe_fx) / GALLON_TO_LITER
-
-
 def _load_nyc_zone_centroids() -> dict[str, tuple[float, float]]:
     global _NYC_ZONE_CENTROIDS
     if _NYC_ZONE_CENTROIDS is not None:
@@ -1202,7 +1195,7 @@ def _coach_reasons_from_offer(offer: dict[str, Any]) -> list[str]:
     reasons: list[str] = []
     accept_score = _as_float(offer.get("accept_score"), 0.0)
     target_gap = _as_float(offer.get("target_gap_eur_h"), 0.0)
-    fuel_cost = _as_float((offer.get("costs") or {}).get("fuel_cost_eur"), -1.0)
+    fuel_cost = _as_float((offer.get("costs") or {}).get("fuel_cost_usd"), -1.0)
     route_duration = _as_float(offer.get("route_duration_min"), 0.0)
     distance_to_pickup = _as_float(offer.get("distance_to_pickup_km"), 0.0)
     traffic_factor = max(_as_float(offer.get("traffic_factor"), 1.0), 0.2)
@@ -1212,7 +1205,7 @@ def _coach_reasons_from_offer(offer: dict[str, Any]) -> list[str]:
     if target_gap >= 0.5:
         _append_unique_reason(reasons, f"Above your target by {round(target_gap, 1)} EUR/h.")
     if fuel_cost >= 0.0 and fuel_cost <= 1.8:
-        _append_unique_reason(reasons, f"Estimated fuel cost stays low at {round(fuel_cost, 2)} EUR.")
+        _append_unique_reason(reasons, f"Estimated fuel cost stays low at ${round(fuel_cost, 2)}.")
     if route_duration > 0.0 and route_duration <= 18.0:
         _append_unique_reason(reasons, f"Fast full route ({round(route_duration, 1)} min total).")
     if distance_to_pickup > 0.0 and distance_to_pickup <= 1.5:
@@ -1245,7 +1238,7 @@ def _coach_reasons_from_offer(offer: dict[str, Any]) -> list[str]:
 
 def _coach_warning_from_offer(offer: dict[str, Any]) -> str | None:
     target_gap = _as_float(offer.get("target_gap_eur_h"), 0.0)
-    fuel_cost = _as_float((offer.get("costs") or {}).get("fuel_cost_eur"), -1.0)
+    fuel_cost = _as_float((offer.get("costs") or {}).get("fuel_cost_usd"), -1.0)
     traffic_factor = max(_as_float(offer.get("traffic_factor"), 1.0), 0.2)
     route_source = str(offer.get("route_source") or "estimated")
     if traffic_factor >= 1.22:
@@ -1341,7 +1334,7 @@ async def _build_offer_driver_brief(
     traffic = max(_as_float(traffic_factor if traffic_factor is not None else offer.get("traffic_factor"), 1.0), 0.2)
     pickup_eta = _as_float(offer.get("eta_to_pickup_min"), _as_float(offer.get("distance_to_pickup_km"), 0.0) * 4.0)
     full_eta = _as_float(offer.get("route_duration_min"), pickup_eta)
-    fuel_cost = _as_float((offer.get("costs") or {}).get("fuel_cost_eur"), 0.0)
+    fuel_cost = _as_float((offer.get("costs") or {}).get("fuel_cost_usd"), 0.0)
     return {
         "kind": "offer",
         "offer_id": offer.get("offer_id"),
@@ -1355,7 +1348,7 @@ async def _build_offer_driver_brief(
         "eur_per_hour_net": round(_as_float(offer.get("eur_per_hour_net"), 0.0), 2),
         "estimated_net_eur": round(_as_float(offer.get("estimated_net_eur"), 0.0), 2),
         "target_gap_eur_h": round(_as_float(offer.get("target_gap_eur_h"), 0.0), 2),
-        "fuel_cost_eur": round(fuel_cost, 2),
+        "fuel_cost_usd": round(fuel_cost, 2),
         "pickup_eta_min": round(pickup_eta, 2),
         "full_eta_min": round(full_eta, 2),
         "traffic_factor": round(traffic, 3),
@@ -1420,7 +1413,7 @@ def _build_reposition_driver_brief(reposition: dict[str, Any]) -> dict[str, Any]
         "eur_per_hour_net": round(_as_float(reposition.get("risk_adjusted_potential_eur_h"), 0.0), 2),
         "estimated_net_eur": round(_as_float(reposition.get("net_gain_vs_stay_eur_h"), 0.0), 2),
         "target_gap_eur_h": round(net_gain, 2),
-        "fuel_cost_eur": round(_as_float(reposition.get("travel_cost_eur"), 0.0), 2),
+        "fuel_cost_usd": round(_as_float(reposition.get("travel_cost_usd"), 0.0), 2),
         "pickup_eta_min": round(eta_min, 2),
         "full_eta_min": round(eta_min, 2),
         "traffic_factor": round(traffic, 3),
@@ -1446,7 +1439,7 @@ def _build_reposition_driver_brief(reposition: dict[str, Any]) -> dict[str, Any]
                 "forecast_pressure_ratio",
                 "forecast_volatility",
                 "reposition_total_cost_eur",
-                "travel_cost_eur",
+                "travel_cost_usd",
                 "time_cost_eur",
                 "risk_adjusted_potential_eur_h",
                 "net_gain_vs_stay_eur_h",
@@ -1472,7 +1465,7 @@ def _build_hold_driver_brief(next_zone: dict[str, Any] | None, *, warning: str |
         "eur_per_hour_net": 0.0,
         "estimated_net_eur": 0.0,
         "target_gap_eur_h": 0.0,
-        "fuel_cost_eur": 0.0,
+        "fuel_cost_usd": 0.0,
         "pickup_eta_min": None,
         "full_eta_min": None,
         "traffic_factor": round(_as_float((next_zone or {}).get("traffic_factor"), 1.0), 3),
@@ -1627,8 +1620,8 @@ def _build_market_reposition_driver_brief(
     zone: dict[str, Any] | None,
     *,
     target_hourly_eur: float,
-    fuel_price_eur_l: float,
-    consumption_l_100km: float,
+    fuel_price_usd_gallon: float,
+    vehicle_mpg: float,
     warning: str | None = None,
 ) -> dict[str, Any] | None:
     if not isinstance(zone, dict):
@@ -1644,9 +1637,13 @@ def _build_market_reposition_driver_brief(
     if eta_min <= 0.0 and distance_km > 0.0:
         eta_min = (distance_km / max(REPOSITION_BASE_SPEED_KMH, 1.0)) * 60.0
 
-    fuel_cost = _as_float(zone.get("reposition_cost_eur"), _as_float(zone.get("travel_cost_eur"), 0.0))
+    fuel_cost = _as_float(zone.get("reposition_cost_usd"), _as_float(zone.get("travel_cost_usd"), 0.0))
     if fuel_cost <= 0.0 and distance_km > 0.0:
-        fuel_cost = distance_km * (consumption_l_100km / 100.0) * fuel_price_eur_l
+        fuel_cost = fuel_cost_usd_from_km(
+            distance_km,
+            vehicle_mpg=vehicle_mpg,
+            fuel_price_usd_gallon=fuel_price_usd_gallon,
+        )
 
     uplift = max((market_score - 1.0) * 7.0, 0.5 if market_score >= 1.08 else 0.0)
     potential_eur_h = max(target_hourly_eur + uplift, target_hourly_eur)
@@ -1662,7 +1659,7 @@ def _build_market_reposition_driver_brief(
         "dispatch_score": round(dispatch_score, 4),
         "risk_adjusted_potential_eur_h": round(potential_eur_h, 2),
         "net_gain_vs_stay_eur_h": round(max(potential_eur_h - target_hourly_eur, 0.0), 2),
-        "travel_cost_eur": round(max(fuel_cost, 0.0), 2),
+        "travel_cost_usd": round(max(fuel_cost, 0.0), 2),
         "eta_min": round(max(eta_min, 0.0), 2),
         "route_distance_km": round(max(distance_km, 0.0), 3),
         "route_source": "market_fallback",
@@ -1835,8 +1832,8 @@ def _reposition_cost_model(
     *,
     route_distance_km: float,
     eta_min: float,
-    fuel_price_eur_l: float,
-    vehicle_consumption_l_100km: float,
+    fuel_price_usd_gallon: float,
+    vehicle_mpg: float,
     target_hourly_net_eur: float,
     traffic_factor: float,
     forecast_volatility: float,
@@ -1844,8 +1841,8 @@ def _reposition_cost_model(
     return reposition_cost_model(
         route_distance_km=route_distance_km,
         eta_min=eta_min,
-        fuel_price_eur_l=fuel_price_eur_l,
-        vehicle_consumption_l_100km=vehicle_consumption_l_100km,
+        fuel_price_usd_gallon=fuel_price_usd_gallon,
+        vehicle_mpg=vehicle_mpg,
         target_hourly_net_eur=target_hourly_net_eur,
         traffic_factor=traffic_factor,
         forecast_volatility=forecast_volatility,
@@ -1895,8 +1892,8 @@ async def _merge_cost_context(redis_client: aioredis.Redis, payload: dict[str, A
         context = {}
 
     defaults = {
-        "fuel_price_eur_l": DEFAULT_FUEL_PRICE_EUR_L,
-        "vehicle_consumption_l_100km": DEFAULT_CONSUMPTION_L_100KM,
+        "fuel_price_usd_gallon": DEFAULT_FUEL_PRICE_USD_GALLON,
+        "vehicle_mpg": DEFAULT_VEHICLE_MPG,
         "platform_fee_pct": DEFAULT_PLATFORM_FEE_PCT,
     }
     for key, fallback in defaults.items():
@@ -2113,24 +2110,21 @@ async def _refresh_fuel_context_once(
         response = await http_client.get(FUEL_PRICE_PROVIDER_URL)
         response.raise_for_status()
         usd_per_gallon = _parse_fuel_price_usd_gallon(response.text, FUEL_GRADE)
-        eur_per_liter = _usd_gallon_to_eur_liter(usd_per_gallon, FUEL_USD_TO_EUR_RATE)
 
-        vehicle_consumption = _as_float(current.get("vehicle_consumption_l_100km"), DEFAULT_CONSUMPTION_L_100KM)
+        vehicle_mpg = _as_float(current.get("vehicle_mpg"), DEFAULT_VEHICLE_MPG)
         platform_fee_pct = _as_float(current.get("platform_fee_pct"), DEFAULT_PLATFORM_FEE_PCT)
         lock_manual = _as_bool(current.get("lock_manual"), False)
 
         await redis_client.hset(
             FUEL_CONTEXT_KEY,
             mapping={
-                "fuel_price_eur_l": round(float(eur_per_liter), 3),
                 "fuel_price_usd_gallon": round(float(usd_per_gallon), 3),
-                "vehicle_consumption_l_100km": round(float(vehicle_consumption), 3),
+                "vehicle_mpg": round(float(vehicle_mpg), 3),
                 "platform_fee_pct": round(float(platform_fee_pct), 3),
                 "source": "fueleconomy_us",
                 "provider": "fueleconomy",
                 "provider_url": FUEL_PRICE_PROVIDER_URL,
                 "fuel_grade": FUEL_GRADE,
-                "usd_to_eur_rate": round(float(FUEL_USD_TO_EUR_RATE), 4),
                 "lock_manual": "1" if lock_manual else "0",
                 "fuel_sync_status": "ok",
                 "fuel_sync_checked_at": now_iso,
@@ -2141,7 +2135,6 @@ async def _refresh_fuel_context_once(
         return {
             "updated": True,
             "status": "ok",
-            "fuel_price_eur_l": round(float(eur_per_liter), 3),
             "fuel_price_usd_gallon": round(float(usd_per_gallon), 3),
             "fuel_grade": FUEL_GRADE,
         }
@@ -2791,7 +2784,7 @@ async def update_driver_profile(
     updates = body.model_dump(exclude_none=True)
     next_payload = {
         "target_eur_h": updates.get("target_eur_h", current["target_eur_h"]),
-        "consommation_l_100": updates.get("consommation_l_100", current["consommation_l_100"]),
+        "vehicle_mpg": updates.get("vehicle_mpg", current["vehicle_mpg"]),
         "aversion_risque": updates.get("aversion_risque", current["aversion_risque"]),
         "max_eta": updates.get("max_eta", current["max_eta"]),
         "source": "manual",
@@ -2802,7 +2795,7 @@ async def update_driver_profile(
         _driver_profile_key(normalized_driver_id),
         mapping={
             "target_eur_h": normalized["target_eur_h"],
-            "consommation_l_100": normalized["consommation_l_100"],
+            "vehicle_mpg": normalized["vehicle_mpg"],
             "aversion_risque": normalized["aversion_risque"],
             "max_eta": normalized["max_eta"],
             "source": normalized["source"],
@@ -3303,8 +3296,8 @@ async def instant_dispatch(
     zones = [zone for zone in zones_raw if isinstance(zone, dict)]
 
     fuel_context = await redis_client.hgetall(FUEL_CONTEXT_KEY)
-    fuel_price = _as_float(fuel_context.get("fuel_price_eur_l"), DEFAULT_FUEL_PRICE_EUR_L)
-    consumption = _as_float(driver_profile.get("consommation_l_100"), DEFAULT_CONSUMPTION_L_100KM)
+    fuel_price = _as_float(fuel_context.get("fuel_price_usd_gallon"), DEFAULT_FUEL_PRICE_USD_GALLON)
+    vehicle_mpg = _as_float(driver_profile.get("vehicle_mpg"), DEFAULT_VEHICLE_MPG)
 
     target_hourly = target_hourly_net_eur
     if target_hourly is None and local_best is not None:
@@ -3405,8 +3398,8 @@ async def instant_dispatch(
             cost_model = _reposition_cost_model(
                 route_distance_km=route_distance_km,
                 eta_min=eta_min,
-                fuel_price_eur_l=fuel_price,
-                vehicle_consumption_l_100km=consumption,
+                fuel_price_usd_gallon=fuel_price,
+                vehicle_mpg=vehicle_mpg,
                 target_hourly_net_eur=float(target_hourly),
                 traffic_factor=traffic,
                 forecast_volatility=forecast["forecast_volatility"],
@@ -3448,7 +3441,7 @@ async def instant_dispatch(
                     "route_distance_km": round(float(route_distance_km), 3),
                     "eta_min": round(float(eta_min), 2),
                     "route_source": route_source,
-                    "travel_cost_eur": round(float(cost_model["travel_cost_eur"]), 2),
+                    "travel_cost_usd": round(float(cost_model["travel_cost_usd"]), 2),
                     "time_cost_eur": round(float(cost_model["time_cost_eur"]), 2),
                     "risk_cost_eur": round(float(cost_model["risk_cost_eur"]), 2),
                     "reposition_total_cost_eur": round(float(cost_model["reposition_total_cost_eur"]), 2),
@@ -3516,9 +3509,7 @@ async def instant_dispatch(
         "use_osrm": use_osrm,
         "driver_profile": {
             "target_eur_h": round(_as_float(driver_profile.get("target_eur_h"), DRIVER_PROFILE_DEFAULT_TARGET_EUR_H), 2),
-            "consommation_l_100": round(
-                _as_float(driver_profile.get("consommation_l_100"), DRIVER_PROFILE_DEFAULT_CONSUMPTION_L_100), 2
-            ),
+            "vehicle_mpg": round(_as_float(driver_profile.get("vehicle_mpg"), DRIVER_PROFILE_DEFAULT_VEHICLE_MPG), 2),
             "aversion_risque": round(risk_aversion, 3),
             "max_eta": round(_as_float(driver_profile.get("max_eta"), DEFAULT_MAX_REPOSITION_ETA_MIN), 2),
         },
@@ -3541,8 +3532,8 @@ def _rank_zone_recommendations(
     max_distance_km: float | None = None,
     distance_weight: float = 0.0,
     reference_km: float = 15.0,
-    fuel_price_eur_l: float = DEFAULT_FUEL_PRICE_EUR_L,
-    consumption_l_100km: float = DEFAULT_CONSUMPTION_L_100KM,
+    fuel_price_usd_gallon: float = DEFAULT_FUEL_PRICE_USD_GALLON,
+    vehicle_mpg: float = DEFAULT_VEHICLE_MPG,
 ) -> list[dict[str, Any]]:
     """Enrich zone dicts with distance/fuel/homeward metadata and sort by adjusted score.
 
@@ -3566,7 +3557,7 @@ def _rank_zone_recommendations(
 
         item = dict(zone)
         item["distance_km"] = None
-        item["reposition_cost_eur"] = None
+        item["reposition_cost_usd"] = None
         item["reposition_time_min"] = None
         item["homeward_factor"] = None
         item["distance_penalty_pct"] = 0.0
@@ -3582,7 +3573,11 @@ def _rank_zone_recommendations(
         if max_distance_km is not None and distance_km > float(max_distance_km):
             continue
 
-        fuel_cost = distance_km * (consumption_l_100km / 100.0) * fuel_price_eur_l
+        fuel_cost = fuel_cost_usd_from_km(
+            distance_km,
+            vehicle_mpg=vehicle_mpg,
+            fuel_price_usd_gallon=fuel_price_usd_gallon,
+        )
         reposition_min = (distance_km / max(REPOSITION_BASE_SPEED_KMH, 1.0)) * 60.0
 
         normalized = min(distance_km / max(reference_km, 0.5), 1.0)
@@ -3600,7 +3595,7 @@ def _rank_zone_recommendations(
         adjusted = max(0.0, base * (1.0 - penalty_pct + gain_pct))
 
         item["distance_km"] = round(distance_km, 3)
-        item["reposition_cost_eur"] = round(fuel_cost, 3)
+        item["reposition_cost_usd"] = round(fuel_cost, 3)
         item["reposition_time_min"] = round(reposition_min, 2)
         item["distance_penalty_pct"] = round(penalty_pct, 4)
         item["homeward_factor"] = round(homeward_factor, 3) if homeward_factor is not None else None
@@ -3834,8 +3829,8 @@ async def shift_plan(
         }
 
     fuel_context = await redis_client.hgetall(FUEL_CONTEXT_KEY)
-    fuel_price = _as_float(fuel_context.get("fuel_price_eur_l"), DEFAULT_FUEL_PRICE_EUR_L)
-    consumption = _as_float(driver_profile.get("consommation_l_100"), DEFAULT_CONSUMPTION_L_100KM)
+    fuel_price = _as_float(fuel_context.get("fuel_price_usd_gallon"), DEFAULT_FUEL_PRICE_USD_GALLON)
+    vehicle_mpg = _as_float(driver_profile.get("vehicle_mpg"), DEFAULT_VEHICLE_MPG)
     target_hourly = float(
         target_hourly_net_eur
         if target_hourly_net_eur is not None
@@ -3899,8 +3894,8 @@ async def shift_plan(
             reposition = _reposition_cost_model(
                 route_distance_km=route_distance_km,
                 eta_min=eta_min,
-                fuel_price_eur_l=fuel_price,
-                vehicle_consumption_l_100km=consumption,
+                fuel_price_usd_gallon=fuel_price,
+                vehicle_mpg=vehicle_mpg,
                 target_hourly_net_eur=target_hourly,
                 traffic_factor=traffic,
                 forecast_volatility=forecast["forecast_volatility"],
@@ -3975,8 +3970,8 @@ async def next_best_zone(
                 driver_lon = lon_val
 
     fuel_context = await redis_client.hgetall(FUEL_CONTEXT_KEY)
-    fuel_price = _as_float(fuel_context.get("fuel_price_eur_l"), DEFAULT_FUEL_PRICE_EUR_L)
-    consumption = _as_float(fuel_context.get("vehicle_consumption_l_100km"), DEFAULT_CONSUMPTION_L_100KM)
+    fuel_price = _as_float(fuel_context.get("fuel_price_usd_gallon"), DEFAULT_FUEL_PRICE_USD_GALLON)
+    vehicle_mpg = _as_float(fuel_context.get("vehicle_mpg"), DEFAULT_VEHICLE_MPG)
 
     enriched = _rank_zone_recommendations(
         zones,
@@ -3986,8 +3981,8 @@ async def next_best_zone(
         home_lon=home_lon,
         max_distance_km=max_distance_km,
         distance_weight=distance_weight,
-        fuel_price_eur_l=fuel_price,
-        consumption_l_100km=consumption,
+        fuel_price_usd_gallon=fuel_price,
+        vehicle_mpg=vehicle_mpg,
     )
 
     return {
@@ -4165,8 +4160,8 @@ async def driver_copilot_brief(request: Request, driver_id: str):
     fuel_payload = fuel_result["data"] if fuel_result["ok"] and isinstance(fuel_result["data"], dict) else {}
     health_payload = health_result["data"] if health_result["ok"] and isinstance(health_result["data"], dict) else {}
     target_hourly_eur = _as_float(profile.get("target_eur_h"), DRIVER_PROFILE_DEFAULT_TARGET_EUR_H)
-    consumption_l_100km = _as_float(profile.get("consommation_l_100"), DRIVER_PROFILE_DEFAULT_CONSUMPTION_L_100)
-    fuel_price_eur_l = _as_float(fuel_payload.get("fuel_price_eur_l"), DEFAULT_FUEL_PRICE_EUR_L)
+    vehicle_mpg = _as_float(profile.get("vehicle_mpg"), DRIVER_PROFILE_DEFAULT_VEHICLE_MPG)
+    fuel_price_usd_gallon = _as_float(fuel_payload.get("fuel_price_usd_gallon"), DEFAULT_FUEL_PRICE_USD_GALLON)
 
     fresh_zone_contexts = [zone for zone in zone_contexts if _resolve_zone_coordinates(str(zone.get("zone_id") or ""))]
     fresh_zones = [zone for zone in fresh_zone_contexts if _zone_is_fresh(zone)]
@@ -4237,8 +4232,8 @@ async def driver_copilot_brief(request: Request, driver_id: str):
         best_reposition = _build_market_reposition_driver_brief(
             next_zone_items[0] if next_zone_items else (hot_zones[0] if hot_zones else None),
             target_hourly_eur=target_hourly_eur,
-            fuel_price_eur_l=fuel_price_eur_l,
-            consumption_l_100km=consumption_l_100km,
+            fuel_price_usd_gallon=fuel_price_usd_gallon,
+            vehicle_mpg=vehicle_mpg,
             warning=market_warning,
         )
 
@@ -4292,8 +4287,8 @@ async def driver_copilot_brief(request: Request, driver_id: str):
                 fallback_brief = _build_market_reposition_driver_brief(
                     zone,
                     target_hourly_eur=target_hourly_eur,
-                    fuel_price_eur_l=fuel_price_eur_l,
-                    consumption_l_100km=consumption_l_100km,
+                    fuel_price_usd_gallon=fuel_price_usd_gallon,
+                    vehicle_mpg=vehicle_mpg,
                     warning=market_warning,
                 )
                 if fallback_brief is not None:
@@ -4772,25 +4767,13 @@ async def fuel_context(request: Request):
     redis_client: aioredis.Redis = request.app.state.redis
     raw = await redis_client.hgetall(FUEL_CONTEXT_KEY)
     return {
-        "fuel_price_eur_l": round(_as_float(raw.get("fuel_price_eur_l"), DEFAULT_FUEL_PRICE_EUR_L), 3),
-        "fuel_price_usd_gallon": (
-            round(_as_float(raw.get("fuel_price_usd_gallon"), 0.0), 3)
-            if raw.get("fuel_price_usd_gallon") not in (None, "")
-            else None
-        ),
-        "vehicle_consumption_l_100km": round(
-            _as_float(raw.get("vehicle_consumption_l_100km"), DEFAULT_CONSUMPTION_L_100KM), 3
-        ),
+        "fuel_price_usd_gallon": round(_as_float(raw.get("fuel_price_usd_gallon"), DEFAULT_FUEL_PRICE_USD_GALLON), 3),
+        "vehicle_mpg": round(_as_float(raw.get("vehicle_mpg"), DEFAULT_VEHICLE_MPG), 3),
         "platform_fee_pct": round(_as_float(raw.get("platform_fee_pct"), DEFAULT_PLATFORM_FEE_PCT), 3),
         "source": raw.get("source", "default"),
         "provider": raw.get("provider"),
         "provider_url": raw.get("provider_url"),
         "fuel_grade": raw.get("fuel_grade"),
-        "usd_to_eur_rate": (
-            round(_as_float(raw.get("usd_to_eur_rate"), FUEL_USD_TO_EUR_RATE), 4)
-            if raw.get("usd_to_eur_rate") not in (None, "")
-            else None
-        ),
         "lock_manual": _as_bool(raw.get("lock_manual"), False),
         "fuel_sync_status": raw.get("fuel_sync_status"),
         "fuel_sync_checked_at": raw.get("fuel_sync_checked_at"),
@@ -4808,14 +4791,13 @@ async def update_fuel_context(request: Request, body: FuelContextUpdateRequest):
     await redis_client.hset(
         FUEL_CONTEXT_KEY,
         mapping={
-            "fuel_price_eur_l": round(float(body.fuel_price_eur_l), 3),
-            "vehicle_consumption_l_100km": round(float(body.vehicle_consumption_l_100km), 3),
+            "fuel_price_usd_gallon": round(float(body.fuel_price_usd_gallon), 3),
+            "vehicle_mpg": round(float(body.vehicle_mpg), 3),
             "platform_fee_pct": round(float(body.platform_fee_pct), 3),
             "source": body.source,
             "provider": "manual",
             "provider_url": "",
             "fuel_grade": current_grade,
-            "usd_to_eur_rate": round(float(FUEL_USD_TO_EUR_RATE), 4),
             "lock_manual": "1" if lock_manual else "0",
             "fuel_sync_status": "manual_override",
             "fuel_sync_checked_at": now_iso,
@@ -4877,24 +4859,14 @@ async def copilot_health(request: Request):
             "updated_at": events_context.get("updated_at"),
         },
         "fuel_context": {
-            "fuel_price_eur_l": round(_as_float(fuel.get("fuel_price_eur_l"), DEFAULT_FUEL_PRICE_EUR_L), 3),
-            "fuel_price_usd_gallon": (
-                round(_as_float(fuel.get("fuel_price_usd_gallon"), 0.0), 3)
-                if fuel.get("fuel_price_usd_gallon") not in (None, "")
-                else None
+            "fuel_price_usd_gallon": round(
+                _as_float(fuel.get("fuel_price_usd_gallon"), DEFAULT_FUEL_PRICE_USD_GALLON), 3
             ),
-            "vehicle_consumption_l_100km": round(
-                _as_float(fuel.get("vehicle_consumption_l_100km"), DEFAULT_CONSUMPTION_L_100KM), 3
-            ),
+            "vehicle_mpg": round(_as_float(fuel.get("vehicle_mpg"), DEFAULT_VEHICLE_MPG), 3),
             "platform_fee_pct": round(_as_float(fuel.get("platform_fee_pct"), DEFAULT_PLATFORM_FEE_PCT), 3),
             "source": fuel.get("source", "default"),
             "provider": fuel.get("provider"),
             "fuel_grade": fuel.get("fuel_grade"),
-            "usd_to_eur_rate": (
-                round(_as_float(fuel.get("usd_to_eur_rate"), FUEL_USD_TO_EUR_RATE), 4)
-                if fuel.get("usd_to_eur_rate") not in (None, "")
-                else None
-            ),
             "lock_manual": _as_bool(fuel.get("lock_manual"), False),
             "fuel_sync_status": fuel.get("fuel_sync_status"),
             "fuel_sync_checked_at": fuel.get("fuel_sync_checked_at"),

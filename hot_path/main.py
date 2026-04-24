@@ -63,7 +63,7 @@ GPS_GUARD_FROZEN_EPSILON_M = max(
 GPS_GUARD_FROZEN_STREAK = max(2, int(os.getenv("GPS_GUARD_FROZEN_STREAK", "4") or "4"))
 
 EARTH_RADIUS_KM = 6371.0
-MOVING_STATUSES = {"delivering", "pickup_arrived", "repositioning"}
+MOVING_STATUSES = {"delivering", "pickup_assigned", "pickup_en_route", "pickup_arrived", "repositioning"}
 
 
 class Position(BaseModel):
@@ -72,9 +72,16 @@ class Position(BaseModel):
     lon: float = Field(..., ge=-180.0, le=180.0)
     speed_kmh: float = Field(0.0, ge=0.0, le=300.0)
     heading_deg: float = Field(0.0, ge=0.0, le=360.0)
-    status: Literal["available", "delivering", "idle", "pickup_arrived", "repositioning", "unknown"] = (
-        "unknown"
-    )
+    status: Literal[
+        "available",
+        "delivering",
+        "idle",
+        "pickup_assigned",
+        "pickup_en_route",
+        "pickup_arrived",
+        "repositioning",
+        "unknown",
+    ] = "unknown"
     accuracy_m: float = Field(0.0, ge=0.0, le=10000.0)
     battery_pct: float = Field(0.0, ge=0.0, le=100.0)
     ts: str = Field(..., min_length=1)

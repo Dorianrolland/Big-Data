@@ -30,13 +30,14 @@ import pyarrow.parquet as pq
 _ROOT = Path(__file__).resolve().parent.parent
 _VALID_TOPIC_FILES_CACHE: dict[tuple[str, str], list[Path]] = {}
 
-FUEL_PRICE_EUR_L = 1.85
-CONSUMPTION_L_100KM = 7.5
+KM_TO_MILES = 0.621371
+FUEL_PRICE_USD_GALLON = 3.65
+VEHICLE_MPG = 31.0
 PLATFORM_FEE_PCT = 25.0
 
 
-def _fuel_cost_sql() -> str:
-    return f"(estimated_distance_km / 100.0 * {CONSUMPTION_L_100KM} * {FUEL_PRICE_EUR_L})"
+def _fuel_cost_sql(distance_col: str = "estimated_distance_km") -> str:
+    return f"(({distance_col}) * {KM_TO_MILES} / {VEHICLE_MPG} * {FUEL_PRICE_USD_GALLON})"
 
 
 def _net_eur_sql() -> str:
@@ -251,7 +252,7 @@ def build_mart(parquet_dir: Path, out_dir: Path) -> dict[str, int]:
                         COALESCE(demand_index / NULLIF(supply_index, 0), 0.0) AS pressure_ratio,
                         {_net_eur_sql()} AS net_eur,
                         {_net_eur_h_sql()} AS net_eur_h,
-                        {_fuel_cost_sql()} AS fuel_cost_eur,
+                        {_fuel_cost_sql()} AS fuel_cost_usd,
                         status
                     FROM src
                 ) TO '{_duck_path(path)}' (FORMAT PARQUET, COMPRESSION SNAPPY)
@@ -417,13 +418,13 @@ def build_mart(parquet_dir: Path, out_dir: Path) -> dict[str, int]:
                         CASE
                             WHEN e.actual_fare_eur IS NULL OR e.actual_distance_km IS NULL THEN NULL
                             ELSE (e.actual_fare_eur * (1.0 - {PLATFORM_FEE_PCT} / 100.0)
-                                  - (e.actual_distance_km / 100.0 * {CONSUMPTION_L_100KM} * {FUEL_PRICE_EUR_L}))
+                                  - {_fuel_cost_sql("e.actual_distance_km")})
                         END AS realized_net_eur,
                         CASE
                             WHEN e.actual_fare_eur IS NULL OR e.actual_distance_km IS NULL OR COALESCE(e.actual_duration_min, 0) <= 0 THEN NULL
                             ELSE (
                                 (e.actual_fare_eur * (1.0 - {PLATFORM_FEE_PCT} / 100.0)
-                                 - (e.actual_distance_km / 100.0 * {CONSUMPTION_L_100KM} * {FUEL_PRICE_EUR_L}))
+                                 - {_fuel_cost_sql("e.actual_distance_km")})
                                 / (e.actual_duration_min / 60.0)
                             )
                         END AS realized_net_eur_h,
@@ -471,13 +472,13 @@ def build_mart(parquet_dir: Path, out_dir: Path) -> dict[str, int]:
                         CASE
                             WHEN actual_fare_eur IS NULL OR actual_distance_km IS NULL THEN NULL
                             ELSE (actual_fare_eur * (1.0 - {PLATFORM_FEE_PCT} / 100.0)
-                                  - (actual_distance_km / 100.0 * {CONSUMPTION_L_100KM} * {FUEL_PRICE_EUR_L}))
+                                  - {_fuel_cost_sql("actual_distance_km")})
                         END AS realized_net_eur,
                         CASE
                             WHEN actual_fare_eur IS NULL OR actual_distance_km IS NULL OR COALESCE(actual_duration_min, 0) <= 0 THEN NULL
                             ELSE (
                                 (actual_fare_eur * (1.0 - {PLATFORM_FEE_PCT} / 100.0)
-                                 - (actual_distance_km / 100.0 * {CONSUMPTION_L_100KM} * {FUEL_PRICE_EUR_L}))
+                                 - {_fuel_cost_sql("actual_distance_km")})
                                 / (actual_duration_min / 60.0)
                             )
                         END AS realized_net_eur_h,

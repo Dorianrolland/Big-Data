@@ -29,8 +29,10 @@ _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT / "ml"))
 
 from backtest_copilot import (
-    FUEL_PRICE_EUR_L,
+    FUEL_PRICE_USD_GALLON,
+    KM_TO_MILES,
     PLATFORM_FEE_PCT,
+    VEHICLE_MPG,
     _generate_synthetic_offers,
     _net_eur_h,
     run_backtest,
@@ -112,16 +114,16 @@ def apply_modifiers(df: pd.DataFrame, mods: dict, rng: np.random.Generator) -> p
     if "temporal_pressure_add" in mods:
         df["temporal_pressure"] = np.clip(df["temporal_pressure"] + mods["temporal_pressure_add"], 0.0, 1.0)
 
-    # Fuel price modifier: recalculate net_eur_h with adjusted fuel cost
+    # Fuel price modifier: recalculate net_eur_h with adjusted USD/gallon fuel cost.
     fuel_mul = mods.get("fuel_price_mul", 1.0)
     if fuel_mul != 1.0:
-        effective_fuel = FUEL_PRICE_EUR_L * fuel_mul
-        from backtest_copilot import CONSUMPTION_L_100KM
+        effective_fuel = FUEL_PRICE_USD_GALLON * fuel_mul
+
         def _net_h_adj(r):
             fare = float(r["estimated_fare_eur"] or 0)
             dist = float(r["estimated_distance_km"] or 1)
             dur = float(r["estimated_duration_min"] or 1)
-            fuel_cost = dist / 100.0 * CONSUMPTION_L_100KM * effective_fuel
+            fuel_cost = (dist * KM_TO_MILES / max(VEHICLE_MPG, 1.0)) * effective_fuel
             net = fare * (1.0 - PLATFORM_FEE_PCT / 100.0) - fuel_cost
             return net / (max(dur, 1.0) / 60.0)
         df["estimated_net_eur_h"] = df.apply(_net_h_adj, axis=1)

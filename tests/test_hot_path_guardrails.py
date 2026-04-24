@@ -161,6 +161,24 @@ def test_parse_position_accepts_repositioning_and_source_platform():
     assert pos.source_platform.endswith("route=hold")
 
 
+def test_parse_position_accepts_pickup_en_route_status():
+    msg = hot_main.CourierPositionV1()
+    msg.courier_id = "drv_demo_pickup"
+    msg.lat = 40.75
+    msg.lon = -73.98
+    msg.speed_kmh = 9.0
+    msg.heading_deg = 180.0
+    msg.status = "pickup_en_route"
+    msg.ts = "2024-01-01T12:00:00+00:00"
+    msg.source_platform = "driver_ingest"
+
+    pos, reject = hot_main.parse_position(msg.SerializeToString())
+
+    assert reject is None
+    assert pos is not None
+    assert pos.status == "pickup_en_route"
+
+
 def test_flush_to_redis_stores_recent_track_and_quality_fields():
     redis = _FakeRedis()
     pos = _make_position(source_platform="tlc_hvfhv|route=hold")

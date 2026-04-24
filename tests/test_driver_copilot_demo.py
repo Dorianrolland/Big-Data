@@ -65,7 +65,7 @@ def test_driver_copilot_brief_prefers_best_offer_and_enriches_blocks(monkeypatch
         return {
             "driver_id": driver_id,
             "target_eur_h": 18.0,
-            "consommation_l_100": 7.0,
+            "vehicle_mpg": 34.0,
             "aversion_risque": 0.5,
             "max_eta": 16.0,
             "source": "manual",
@@ -101,7 +101,7 @@ def test_driver_copilot_brief_prefers_best_offer_and_enriches_blocks(monkeypatch
                     "route_distance_km": 4.6,
                     "route_source": "osrm",
                     "reason_codes": ["GAIN_STRONG", "TIME_EFFICIENT"],
-                    "costs": {"fuel_cost_eur": 1.24},
+                    "costs": {"fuel_cost_usd": 1.24},
                     "explanation": ["above_target_hourly_goal"],
                     "explanation_details": [
                         {"label": "Net hourly yield", "impact": "positive"},
@@ -122,7 +122,7 @@ def test_driver_copilot_brief_prefers_best_offer_and_enriches_blocks(monkeypatch
                 "dispatch_score": 0.62,
                 "risk_adjusted_potential_eur_h": 19.2,
                 "net_gain_vs_stay_eur_h": 1.3,
-                "travel_cost_eur": 1.1,
+                "travel_cost_usd": 1.1,
                 "eta_min": 9.0,
                 "route_distance_km": 2.7,
                 "route_source": "osrm",
@@ -157,7 +157,7 @@ def test_driver_copilot_brief_prefers_best_offer_and_enriches_blocks(monkeypatch
         }
 
     async def fake_fuel(_request):  # noqa: ANN001
-        return {"fuel_price_eur_l": 1.81, "fuel_sync_status": "ok"}
+        return {"fuel_price_usd_gallon": 3.62, "fuel_sync_status": "ok"}
 
     async def fake_health(_request):  # noqa: ANN001
         return {
@@ -218,7 +218,7 @@ def test_driver_copilot_brief_falls_back_to_reposition(monkeypatch):
         return {
             "driver_id": driver_id,
             "target_eur_h": 18.0,
-            "consommation_l_100": 7.0,
+            "vehicle_mpg": 34.0,
             "aversion_risque": 0.5,
             "max_eta": 16.0,
             "source": "manual",
@@ -240,7 +240,7 @@ def test_driver_copilot_brief_falls_back_to_reposition(monkeypatch):
                 "dispatch_score": 0.74,
                 "risk_adjusted_potential_eur_h": 20.8,
                 "net_gain_vs_stay_eur_h": 2.6,
-                "travel_cost_eur": 1.0,
+                "travel_cost_usd": 1.0,
                 "eta_min": 8.0,
                 "route_distance_km": 2.3,
                 "route_source": "osrm",
@@ -257,7 +257,7 @@ def test_driver_copilot_brief_falls_back_to_reposition(monkeypatch):
         return {"count": 0, "items": []}
 
     async def fake_fuel(_request):  # noqa: ANN001
-        return {"fuel_price_eur_l": 1.81, "fuel_sync_status": "ok"}
+        return {"fuel_price_usd_gallon": 3.62, "fuel_sync_status": "ok"}
 
     async def fake_health(_request):  # noqa: ANN001
         return {
@@ -295,7 +295,7 @@ def test_driver_copilot_brief_falls_back_to_hold_and_stays_up(monkeypatch):
         return {
             "driver_id": driver_id,
             "target_eur_h": 18.0,
-            "consommation_l_100": 7.0,
+            "vehicle_mpg": 34.0,
             "aversion_risque": 0.5,
             "max_eta": 16.0,
             "source": "manual",
@@ -325,7 +325,7 @@ def test_driver_copilot_brief_falls_back_to_hold_and_stays_up(monkeypatch):
         raise HTTPException(status_code=504, detail="shift timeout")
 
     async def fake_fuel(_request):  # noqa: ANN001
-        return {"fuel_price_eur_l": 1.81, "fuel_sync_status": "cached"}
+        return {"fuel_price_usd_gallon": 3.62, "fuel_sync_status": "cached"}
 
     async def fake_health(_request):  # noqa: ANN001
         return {
@@ -364,7 +364,7 @@ def test_driver_copilot_brief_hot_and_calm_zones_are_sorted(monkeypatch):
         return {
             "driver_id": driver_id,
             "target_eur_h": 18.0,
-            "consommation_l_100": 7.0,
+            "vehicle_mpg": 34.0,
             "aversion_risque": 0.5,
             "max_eta": 16.0,
             "source": "manual",
@@ -384,7 +384,7 @@ def test_driver_copilot_brief_hot_and_calm_zones_are_sorted(monkeypatch):
         return {"count": 0, "items": []}
 
     async def fake_fuel(_request):  # noqa: ANN001
-        return {"fuel_price_eur_l": 1.81, "fuel_sync_status": "ok"}
+        return {"fuel_price_usd_gallon": 3.62, "fuel_sync_status": "ok"}
 
     async def fake_health(_request):  # noqa: ANN001
         return {
@@ -426,7 +426,7 @@ def test_driver_copilot_brief_aliases_demo_driver_to_live_driver_when_needed(mon
         return {
             "driver_id": driver_id,
             "target_eur_h": 18.0,
-            "consommation_l_100": 7.0,
+            "vehicle_mpg": 34.0,
             "aversion_risque": 0.5,
             "max_eta": 16.0,
             "source": "manual",
@@ -473,7 +473,7 @@ def test_driver_copilot_brief_aliases_demo_driver_to_live_driver_when_needed(mon
                     "route_distance_km": 5.1,
                     "route_source": "osrm",
                     "reason_codes": ["GAIN_STRONG", "TIME_EFFICIENT"],
-                    "costs": {"fuel_cost_eur": 1.12},
+                    "costs": {"fuel_cost_usd": 1.12},
                     "explanation_details": [{"label": "Net hourly yield", "impact": "positive"}],
                 }
             ]
@@ -492,7 +492,7 @@ def test_driver_copilot_brief_aliases_demo_driver_to_live_driver_when_needed(mon
         return {"driver_id": driver_id, "count": 0, "items": []}
 
     async def fake_fuel(_request):  # noqa: ANN001
-        return {"fuel_price_eur_l": 1.81, "fuel_sync_status": "ok"}
+        return {"fuel_price_usd_gallon": 3.62, "fuel_sync_status": "ok"}
 
     async def fake_health(_request):  # noqa: ANN001
         return {
@@ -557,7 +557,7 @@ def test_driver_copilot_brief_uses_gbfs_market_fallback_when_zone_contexts_are_m
         return {
             "driver_id": driver_id,
             "target_eur_h": 18.0,
-            "consommation_l_100": 7.0,
+            "vehicle_mpg": 34.0,
             "aversion_risque": 0.5,
             "max_eta": 16.0,
             "source": "manual",
@@ -577,7 +577,7 @@ def test_driver_copilot_brief_uses_gbfs_market_fallback_when_zone_contexts_are_m
         raise HTTPException(status_code=504, detail="shift timeout")
 
     async def fake_fuel(_request):  # noqa: ANN001
-        return {"fuel_price_eur_l": 1.81, "fuel_sync_status": "ok"}
+        return {"fuel_price_usd_gallon": 3.62, "fuel_sync_status": "ok"}
 
     async def fake_health(_request):  # noqa: ANN001
         return {

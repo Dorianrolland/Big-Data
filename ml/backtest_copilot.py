@@ -28,8 +28,9 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT / "api") not in sys.path:
     sys.path.insert(0, str(_ROOT / "api"))
 
-FUEL_PRICE_EUR_L = float(os.getenv("FUEL_PRICE_EUR_L", "1.85"))
-CONSUMPTION_L_100KM = float(os.getenv("CONSUMPTION_L_100KM", "7.5"))
+KM_TO_MILES = 0.621371
+FUEL_PRICE_USD_GALLON = float(os.getenv("COPILOT_FUEL_PRICE_USD_GALLON", "3.65"))
+VEHICLE_MPG = float(os.getenv("COPILOT_VEHICLE_MPG", "31.0"))
 PLATFORM_FEE_PCT = float(os.getenv("PLATFORM_FEE_PCT", "25.0"))
 COPILOT_SCORE_THRESHOLD = float(os.getenv("COPILOT_SCORE_THRESHOLD", "0.55"))
 GREEDY_NET_EUR_H_MIN = float(os.getenv("GREEDY_NET_EUR_H_MIN", "12.0"))
@@ -104,7 +105,7 @@ def _to_float_array(values: pd.Series | np.ndarray | float | int, default: float
 
 def _fuel_cost(distance_km: float | np.ndarray) -> float | np.ndarray:
     dist = np.asarray(distance_km, dtype=float)
-    return dist / 100.0 * CONSUMPTION_L_100KM * FUEL_PRICE_EUR_L
+    return (dist * KM_TO_MILES / max(VEHICLE_MPG, 1.0)) * max(FUEL_PRICE_USD_GALLON, 0.0)
 
 
 def _net_eur(fare: float | np.ndarray, distance_km: float | np.ndarray) -> float | np.ndarray:
@@ -281,7 +282,7 @@ def _compute_kpis(df: pd.DataFrame, accepted: np.ndarray, strategy: str) -> dict
             "net_eur_total": 0.0,
             "net_eur_h_mean": 0.0,
             "km_total": 0.0,
-            "fuel_cost_eur": 0.0,
+            "fuel_cost_usd": 0.0,
             "trips_per_driver": 0.0,
         }
 
@@ -313,7 +314,7 @@ def _compute_kpis(df: pd.DataFrame, accepted: np.ndarray, strategy: str) -> dict
         "net_eur_total": round(float(net_eur.sum()), 2),
         "net_eur_h_mean": round(float(net_eur_h.mean()), 2),
         "km_total": round(float(dist.sum()), 1),
-        "fuel_cost_eur": round(float(fuel.sum()), 2),
+        "fuel_cost_usd": round(float(fuel.sum()), 2),
         "trips_per_driver": round(n_accepted / max(n_drivers, 1), 1),
     }
 
@@ -398,14 +399,14 @@ def run_backtest(
 
     _safe_print("")
     _safe_print("-- Backtest Results ----------------------------------------------------")
-    _safe_print(f"{'Strategy':<18} {'Accept%':>8} {'Net EUR/h':>10} {'Net EUR':>10} {'Km':>8} {'Fuel EUR':>10}")
+    _safe_print(f"{'Strategy':<18} {'Accept%':>8} {'Net EUR/h':>10} {'Net EUR':>10} {'Km':>8} {'Fuel USD':>10}")
     _safe_print("-" * 72)
     for row in results:
         marker = " <-" if row["strategy"] == "copilot" else ""
         _safe_print(
             f"{row['strategy']:<18} {row['accept_rate']*100:>7.1f}%"
             f" {row['net_eur_h_mean']:>10.2f} {row['net_eur_total']:>10.2f}"
-            f" {row['km_total']:>8.1f} {row['fuel_cost_eur']:>10.2f}{marker}"
+            f" {row['km_total']:>8.1f} {row['fuel_cost_usd']:>10.2f}{marker}"
         )
     _safe_print("-" * 72)
 
