@@ -55,7 +55,7 @@ def test_driver_app_page_served():
         response = client.get("/copilot/driver-app")
 
     assert response.status_code == 200
-    assert "FleetStream Driver Copilot" in response.text
+    assert "FleetStream Courier Copilot" in response.text
     assert "Demo login" in response.text
     assert "Quick onboarding" in response.text
 
@@ -644,7 +644,7 @@ def test_driver_copilot_static_assets_exist():
     js = (root / "app.js").read_text(encoding="utf-8")
     manifest = (root / "manifest.webmanifest").read_text(encoding="utf-8")
 
-    assert "FleetStream Driver Copilot" in html
+    assert "FleetStream Courier Copilot" in html
     assert "Demo login" in html
     assert "Quick onboarding" in html
     assert 'data-tab="home"' in html

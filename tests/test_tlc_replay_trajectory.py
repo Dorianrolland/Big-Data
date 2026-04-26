@@ -77,7 +77,7 @@ def test_source_platform_for_route_replaces_existing_route_suffix():
     assert tagged_valhalla == "tlc_hvfhv|route=osrm"
 
 
-def test_prepare_trip_route_falls_back_to_linear_when_osrm_fails(monkeypatch):
+def test_prepare_trip_route_holds_when_osrm_fails_under_strict_road_geometry(monkeypatch):
     replay = replay_main.TLCReplay("2024-01")
     trip = _make_trip(trip_key="fallback_case")
 
@@ -89,11 +89,9 @@ def test_prepare_trip_route_falls_back_to_linear_when_osrm_fails(monkeypatch):
 
     asyncio.run(replay._prepare_trip_route(trip))
 
-    assert trip.route_source == "linear"
-    assert len(trip.route_geometry) >= 2
-    assert trip.route_geometry[0] == (trip.pickup_lat, trip.pickup_lon)
-    assert trip.route_geometry[-1] == (trip.dropoff_lat, trip.dropoff_lon)
-    assert replay.stats_route_linear_fallback == 1
+    assert trip.route_source == "hold"
+    assert trip.route_geometry == [(trip.pickup_lat, trip.pickup_lon)]
+    assert replay.stats_route_hold_fallback == 1
     assert replay.stats_route_osrm_errors == 1
 
 
@@ -114,6 +112,27 @@ def test_prepare_trip_route_holds_position_when_linear_fallback_disabled(monkeyp
     assert trip.route_geometry == [(trip.pickup_lat, trip.pickup_lon)]
     assert trip.route_cumulative_km == [0.0]
     assert replay.stats_route_hold_fallback == 1
+
+
+def test_prepare_trip_route_can_still_use_linear_when_strict_mode_disabled(monkeypatch):
+    replay = replay_main.TLCReplay("2024-01")
+    trip = _make_trip(trip_key="legacy_linear_case")
+
+    async def _raise_osrm(*_args, **_kwargs):
+        raise RuntimeError("osrm_down")
+
+    monkeypatch.setattr(replay_main, "TLC_ROUTE_MODE", "osrm")
+    monkeypatch.setattr(replay_main, "TLC_STRICT_ROAD_GEOMETRY", False)
+    monkeypatch.setattr(replay_main, "TLC_ROUTE_LINEAR_FALLBACK_ALLOWED", True)
+    monkeypatch.setattr(replay, "_fetch_osrm_geometry", _raise_osrm)
+
+    asyncio.run(replay._prepare_trip_route(trip))
+
+    assert trip.route_source == "linear"
+    assert len(trip.route_geometry) >= 2
+    assert trip.route_geometry[0] == (trip.pickup_lat, trip.pickup_lon)
+    assert trip.route_geometry[-1] == (trip.dropoff_lat, trip.dropoff_lon)
+    assert replay.stats_route_linear_fallback == 1
 
 
 def test_synthetic_grid_geometry_uses_turn_for_long_segments():
@@ -336,8 +355,8 @@ def test_prepare_trip_route_timeout_triggers_prefetch_schedule(monkeypatch):
 
     asyncio.run(replay._prepare_trip_route(trip))
 
-    assert trip.route_source == "linear"
-    assert replay.stats_route_linear_fallback == 1
+    assert trip.route_source == "hold"
+    assert replay.stats_route_hold_fallback == 1
     assert called["count"] == 1
 
 
@@ -868,6 +887,100 @@ def test_emit_trip_progress_emits_dense_samples_along_geometry(monkeypatch):
     assert any(abs(pos.lon - (-73.9820)) < 0.0008 for pos in decoded)
     assert any(abs(pos.lat - 40.7580) < 0.0008 for pos in decoded)
     assert decoded[-1].ts == replay_main.iso_from_dt(now)
+
+
+def test_emit_progress_phase_zeroes_speed_when_route_holds_position(monkeypatch):
+    replay = replay_main.TLCReplay("2024-01")
+    trip = _make_trip(trip_key="held_progress_case")
+    trip.route_geometry = [
+        (trip.pickup_lat, trip.pickup_lon),
+        (trip.pickup_lat, trip.pickup_lon),
+    ]
+    trip.route_cumulative_km = replay_main.cumulative_route_distances_km(trip.route_geometry)
+    trip.last_position_ts = trip.pickup_ts
+    trip.last_position_lat = trip.pickup_lat
+    trip.last_position_lon = trip.pickup_lon
+
+    sent: list[bytes] = []
+
+    async def _capture(_topic, _key, value):  # noqa: ANN001
+        sent.append(value)
+
+    monkeypatch.setattr(replay, "_send", _capture)
+
+    asyncio.run(
+        replay._emit_progress_phase(
+            trip,
+            phase_start_ts=trip.pickup_ts,
+            phase_end_ts=trip.dropoff_ts,
+            segment_start_ts=trip.pickup_ts,
+            segment_end_ts=trip.pickup_ts + timedelta(minutes=2),
+            geometry=trip.route_geometry,
+            cumulative_km=trip.route_cumulative_km,
+            status="delivering",
+        )
+    )
+
+    assert sent
+    pos = replay_main.CourierPositionV1()
+    pos.ParseFromString(sent[-1])
+    assert pos.status == "delivering"
+    assert pos.speed_kmh == 0.0
+
+
+def test_emit_progress_phase_inserts_stoplight_pause_without_large_jumps(monkeypatch):
+    replay = replay_main.TLCReplay("2024-01")
+    trip = _make_trip(trip_key="urban_pause_case")
+    trip.route_geometry = [
+        (40.7580, -73.9855),
+        (40.7580, -73.9810),
+        (40.7525, -73.9810),
+        (40.7525, -73.9765),
+    ]
+    trip.route_cumulative_km = replay_main.cumulative_route_distances_km(trip.route_geometry)
+    trip.last_position_ts = trip.pickup_ts
+    trip.last_position_lat = trip.pickup_lat
+    trip.last_position_lon = trip.pickup_lon
+
+    sent: list[bytes] = []
+
+    async def _capture(_topic, _key, value):  # noqa: ANN001
+        sent.append(value)
+
+    monkeypatch.setattr(replay_main, "TLC_COURIER_SIGNAL_BASE_STOP_SECONDS", 24.0)
+    monkeypatch.setattr(replay_main, "TLC_COURIER_SIGNAL_MIN_SPACING_KM", 0.05)
+    monkeypatch.setattr(replay_main, "TLC_COURIER_SIGNAL_MAX_PAUSE_RATIO", 0.4)
+    monkeypatch.setattr(replay_main, "TLC_LIVE_ROUTE_MAX_POINTS_PER_TICK", 24)
+    monkeypatch.setattr(replay, "_send", _capture)
+
+    asyncio.run(
+        replay._emit_progress_phase(
+            trip,
+            phase_start_ts=trip.pickup_ts,
+            phase_end_ts=trip.pickup_ts + timedelta(minutes=4),
+            segment_start_ts=trip.pickup_ts,
+            segment_end_ts=trip.pickup_ts + timedelta(minutes=4),
+            geometry=trip.route_geometry,
+            cumulative_km=trip.route_cumulative_km,
+            status="delivering",
+        )
+    )
+
+    decoded = []
+    for raw in sent:
+        pos = replay_main.CourierPositionV1()
+        pos.ParseFromString(raw)
+        decoded.append(pos)
+
+    assert decoded
+    assert any(pos.speed_kmh == 0.0 for pos in decoded)
+    max_step_km = 0.0
+    for previous, current in zip(decoded, decoded[1:]):
+        max_step_km = max(
+            max_step_km,
+            replay_main.haversine_km(previous.lat, previous.lon, current.lat, current.lon),
+        )
+    assert max_step_km < 0.12
 
 
 def test_prefer_working_route_provider_moves_public_first_when_local_down():

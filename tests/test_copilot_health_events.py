@@ -156,3 +156,143 @@ def test_health_exposes_routing_quality_metrics():
     assert rq["hold_rate"] == round(40 / 100, 4)
     assert rq["routing_success_rate"] < router.QUALITY_ALERT_THRESHOLDS["routing_success_rate_min"]
     assert rq["hold_rate"] > router.QUALITY_ALERT_THRESHOLDS["hold_rate_max"]
+
+
+def test_health_marks_single_driver_flat_supply_and_optional_dot_feed_as_demo_ready():
+    redis_payloads = {
+        router.WEATHER_KEY: {},
+        router.GBFS_KEY: {},
+        router.IRVE_KEY: {},
+        router.EVENTS_CONTEXT_KEY: {},
+        router.FUEL_CONTEXT_KEY: {},
+        router.CONTEXT_QUALITY_KEY: {
+            "supply_variance": "0.0001",
+            "supply_flat_alert": "1",
+            "context_fallback_applied": "1",
+            "stale_sources_count": "1",
+            "dot_speeds_status": "degraded",
+            "dot_speeds_rows": "0",
+            "stale_dot_speeds": "1",
+        },
+        router.TLC_REPLAY_KEY: {},
+        router.SINGLE_REPLAY_STATUS_KEY: {
+            "driver_id": "drv_demo_001",
+            "state": "repositioning",
+            "mode": "single_driver",
+            "route_requests": "12",
+            "route_successes": "12",
+            "positions": "12",
+        },
+    }
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                redis=_FakeRedis(redis_payloads),
+                copilot_model={"feature_columns": []},
+                copilot_model_quality_gate={"accepted": True, "reason": "ok"},
+            )
+        )
+    )
+
+    payload = asyncio.run(router.copilot_health(request))
+
+    dq = payload["data_quality"]
+    assert dq["supply_signal_mode"] == "single_driver_demo"
+    assert dq["supply_flat_alert"] is True
+    assert dq["supply_flat_effective"] is False
+    assert dq["effective_stale_sources_count"] == 0
+    assert dq["status"] == "ok"
+    assert "nyc_dot_speeds" in dq["optional_sources"]
+    assert payload["demo_readiness"]["ready"] is True
+    assert payload["demo_readiness"]["status"] == "ok"
+
+
+def test_health_marks_routing_warmup_as_non_blocking_monitoring():
+    redis_payloads = {
+        router.WEATHER_KEY: {},
+        router.GBFS_KEY: {},
+        router.IRVE_KEY: {},
+        router.EVENTS_CONTEXT_KEY: {},
+        router.FUEL_CONTEXT_KEY: {},
+        router.CONTEXT_QUALITY_KEY: {},
+        router.TLC_REPLAY_KEY: {},
+        router.SINGLE_REPLAY_STATUS_KEY: {
+            "driver_id": "drv_demo_001",
+            "state": "repositioning",
+            "positions": "4",
+        },
+    }
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                redis=_FakeRedis(redis_payloads),
+                copilot_model={"feature_columns": []},
+                copilot_model_quality_gate={"accepted": True, "reason": "ok"},
+            )
+        )
+    )
+
+    payload = asyncio.run(router.copilot_health(request))
+
+    rq = payload["routing_quality"]
+    assert rq["status"] == "warming_up"
+    assert rq["ready"] is True
+    assert "first route samples" in rq["note"].lower()
+    assert payload["demo_readiness"]["ready"] is True
+    assert payload["demo_readiness"]["status"] == "monitoring"
+    assert payload["demo_readiness"]["summary"].startswith("Demo ready")
+
+
+def test_normalize_nyc_ev_station_maps_open_data_row():
+    station = router._normalize_nyc_ev_station(
+        {
+            "station_name": "Broadway Hub",
+            "street": "350 Broadway",
+            "borough": "Manhattan",
+            "type_of_charger": "Level 2",
+            "latitude": "40.7163",
+            "longitude": "-74.0055",
+        },
+        fallback_index=7,
+    )
+
+    assert station is not None
+    assert station["source"] == "nyc_open_data_ev_stations"
+    assert station["station_id"].startswith("broadway_hub")
+    assert station["puissance_kw"] == 7.2
+    assert station["zone_id"]
+
+
+def test_health_falls_back_to_single_driver_replay_status():
+    redis_payloads = {
+        router.WEATHER_KEY: {},
+        router.GBFS_KEY: {},
+        router.IRVE_KEY: {},
+        router.EVENTS_CONTEXT_KEY: {},
+        router.FUEL_CONTEXT_KEY: {},
+        router.CONTEXT_QUALITY_KEY: {},
+        router.TLC_REPLAY_KEY: {},
+        router.SINGLE_REPLAY_STATUS_KEY: {
+            "driver_id": "drv_demo_001",
+            "state": "repositioning",
+            "positions": "23",
+            "trips": "1",
+            "updated_at": "2026-04-25T00:15:39.679856+00:00",
+        },
+    }
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                redis=_FakeRedis(redis_payloads),
+                copilot_model=None,
+                copilot_model_quality_gate={},
+            )
+        )
+    )
+
+    payload = asyncio.run(router.copilot_health(request))
+
+    assert payload["tlc_replay"]["status"] == "ok"
+    assert payload["tlc_replay"]["mode"] == "single_driver"
+    assert payload["tlc_replay"]["state"] == "repositioning"
+    assert payload["tlc_replay"]["events"] == "23"

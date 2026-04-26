@@ -154,6 +154,7 @@ const API_TIMEOUT_MS = 12000;
 const API_RETRY_DELAY_MS = 350;
 const API_RETRY_GET = 1;
 const UI_STATE_TYPES = ['loading', 'error', 'empty', 'success'];
+const DISPATCH_MAP_RENDERER = 'schematic';
 const DRIVER_PROFILE_DEFAULTS = Object.freeze({
   target_eur_h: 18,
   vehicle_mpg: 31,
@@ -253,6 +254,16 @@ function fmt(num, digits = 2) {
   return Number(num).toFixed(digits);
 }
 
+function fmtUsd(num, digits = 2) {
+  if (!Number.isFinite(Number(num))) return '-';
+  return `$${Number(num).toFixed(digits)}`;
+}
+
+function fmtUsdPerHour(num, digits = 1) {
+  if (!Number.isFinite(Number(num))) return '-';
+  return `$${Number(num).toFixed(digits)}/h`;
+}
+
 function renderListState(target, type, text) {
   if (!target) return;
   const kind = UI_STATE_TYPES.includes(type) ? type : 'empty';
@@ -340,15 +351,15 @@ function humanizeReason(reason) {
     fuel_cost_penalty: 'fuel cost penalty',
     long_offer_duration: 'long offer duration',
     short_offer_efficiency: 'short offer efficiency',
-    long_pickup_detour: 'long pickup detour',
+    long_pickup_detour: 'long restaurant detour',
     balanced_offer_profile: 'balanced profile',
     zone_high_demand_pressure: 'zone high demand',
     zone_low_demand_pressure: 'zone low demand',
-    pickup_far: 'pickup far',
-    pickup_near: 'pickup near',
+    pickup_far: 'restaurant far',
+    pickup_near: 'restaurant near',
     missing_route_coordinates: 'missing route coordinates',
-    osrm_pickup_leg_unavailable: 'pickup route unavailable',
-    osrm_dropoff_leg_unavailable: 'dropoff route unavailable',
+    osrm_pickup_leg_unavailable: 'restaurant route unavailable',
+    osrm_dropoff_leg_unavailable: 'customer route unavailable',
     osrm_client_unavailable: 'route service unavailable',
     insufficient_real_time_candidates: 'insufficient real-time candidates',
     no_profitable_local_offer: 'no profitable local offer',
@@ -390,7 +401,7 @@ function formatExplanationDetail(detail) {
 
   let unitLabel = '';
   if (unit === 'pct') unitLabel = '%';
-  else if (unit === 'eur_per_hour') unitLabel = 'EUR/h';
+  else if (unit === 'eur_per_hour') unitLabel = 'USD/h';
   else if (unit === 'probability' || unit === 'normalized') unitLabel = '';
   else if (unit) unitLabel = unit.replaceAll('_', ' ');
 
@@ -532,18 +543,18 @@ function offerMetricsHtml(offer) {
   const platform = Number(costs.platform_fee_eur);
   const targetGap = Number(offer?.target_gap_eur_h);
   const costTotal = Number.isFinite(fuel) || Number.isFinite(platform)
-    ? `$${fmt(fuel, 2)} / ${fmt(platform, 2)} EUR`
+    ? `${fmtUsd(fuel, 2)} / ${fmtUsd(platform, 2)}`
     : '-';
-  const gapText = Number.isFinite(targetGap) ? fmtSigned(targetGap, 1) : '-';
+  const gapText = Number.isFinite(targetGap) ? fmtUsdPerHour(targetGap, 1).replace('$-', '-$') : '-';
 
   return `
     <div class="offer-metrics">
-      <div class="offer-metric"><div class="k">Net EUR/h</div><div class="v">${fmt(netHourly, 1)}</div></div>
-      <div class="offer-metric"><div class="k">Net Trip</div><div class="v">${fmt(netTrip, 2)}</div></div>
+      <div class="offer-metric"><div class="k">Net USD/h</div><div class="v">${fmtUsdPerHour(netHourly, 1)}</div></div>
+      <div class="offer-metric"><div class="k">Delivery payout</div><div class="v">${fmtUsd(netTrip, 2)}</div></div>
       <div class="offer-metric"><div class="k">ETA min</div><div class="v">${fmt(eta, 1)}</div></div>
       <div class="offer-metric"><div class="k">Fuel/Fee</div><div class="v">${costTotal}</div></div>
     </div>
-    <div class="muted">target gap ${gapText} EUR/h</div>
+    <div class="muted">target gap ${gapText}</div>
   `;
 }
 
@@ -577,9 +588,9 @@ function renderDecisionFlow() {
 
   if (!selected) {
     decisionOfferCardEl.className = 'offer';
-    decisionOfferCardEl.innerHTML = '<div class="muted">No offer selected yet.</div>';
+    decisionOfferCardEl.innerHTML = '<div class="muted">No delivery selected yet.</div>';
     decisionStatusEl.className = 'state-message empty';
-    decisionStatusEl.textContent = 'Choose an offer to start the 3-step flow.';
+    decisionStatusEl.textContent = 'Choose a delivery to start the 3-step flow.';
     decisionScoreBtn.disabled = true;
     decisionActionBtn.disabled = true;
     setFlowStep('choose');
@@ -777,7 +788,7 @@ function ensureDispatchLeafletMap() {
     attributionControl: true,
     preferCanvas: true,
   });
-  window.L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  window.L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
     maxZoom: 19,
     attribution: '&copy; OpenStreetMap contributors',
   }).addTo(map);
@@ -851,7 +862,7 @@ function renderDispatchLegend(payload) {
             <strong>${label} - ${move.zone_id}</strong>
             <span class="badge ${idx === 0 ? 'consider' : 'accept'}">${score}</span>
           </div>
-          <div class="map-row-meta">ETA ${eta} min - ${dist} km - gross ${potential} EUR/h - net ${riskPotential} EUR/h - cost ${totalCost} EUR</div>
+          <div class="map-row-meta">ETA ${eta} min - ${dist} km - gross ${fmtUsdPerHour(potential, 1)} - net ${fmtUsdPerHour(riskPotential, 1)} - cost ${fmtUsd(totalCost, 2)}</div>
           <div class="offer-actions">
             <button
               class="ghost"
@@ -884,7 +895,7 @@ function renderDispatchMapSvg(payload) {
   dispatchMapEl.classList.remove('map-ready');
 
   if (!payload || payload.originLat == null || payload.originLon == null) {
-    dispatchMapEl.textContent = 'Driver location missing for map.';
+    dispatchMapEl.textContent = 'Courier location missing for map.';
     return;
   }
   if (!payload.moves.length) {
@@ -894,8 +905,8 @@ function renderDispatchMapSvg(payload) {
 
   const { originLat, originLon, moves } = payload;
   const width = 620;
-  const height = 260;
-  const pad = 26;
+  const height = 220;
+  const pad = 24;
   const lats = [originLat, ...moves.map((m) => m.lat)];
   const lons = [originLon, ...moves.map((m) => m.lon)];
   let minLat = Math.min(...lats);
@@ -918,19 +929,39 @@ function renderDispatchMapSvg(payload) {
   };
 
   const originPoint = project(originLat, originLon);
-  const grid = [0.2, 0.4, 0.6, 0.8]
+  const horizontalGrid = [0.18, 0.36, 0.54, 0.72, 0.9]
     .map(
       (p) =>
-        `<line x1="${pad}" y1="${(height * p).toFixed(1)}" x2="${width - pad}" y2="${(height * p).toFixed(1)}" stroke="rgba(15,23,42,0.12)" stroke-dasharray="3 5"/>`
+        `<line x1="${pad}" y1="${(height * p).toFixed(1)}" x2="${width - pad}" y2="${(height * p).toFixed(1)}" stroke="rgba(15,23,42,0.08)" stroke-dasharray="4 8"/>`
     )
     .join('');
+  const verticalGrid = [0.2, 0.4, 0.6, 0.8]
+    .map(
+      (p) =>
+        `<line x1="${(width * p).toFixed(1)}" y1="${pad}" x2="${(width * p).toFixed(1)}" y2="${height - pad}" stroke="rgba(15,23,42,0.05)" stroke-dasharray="4 10"/>`
+    )
+    .join('');
+  const labelPill = (x, y, text, fill, textFill = '#0f172a') => {
+    const safeText = escapeHtml(text);
+    const pillWidth = Math.max(44, 16 + safeText.length * 6.3);
+    const pillX = Math.min(width - pillWidth - 12, Math.max(12, x));
+    const pillY = Math.max(12, y);
+    return `
+      <g transform="translate(${pillX.toFixed(1)}, ${pillY.toFixed(1)})">
+        <rect width="${pillWidth.toFixed(1)}" height="22" rx="11" fill="${fill}" stroke="rgba(15,23,42,0.08)"></rect>
+        <text x="${(pillWidth / 2).toFixed(1)}" y="14" text-anchor="middle" font-size="10" font-weight="700" fill="${textFill}">${safeText}</text>
+      </g>
+    `;
+  };
 
   const lines = moves
     .map((move, idx) => {
       const p = project(move.lat, move.lon);
       const stroke = idx === 0 ? '#d97706' : '#0ea5a4';
       const opacity = idx === 0 ? '0.95' : '0.55';
-      return `<line x1="${originPoint.x.toFixed(1)}" y1="${originPoint.y.toFixed(1)}" x2="${p.x.toFixed(1)}" y2="${p.y.toFixed(1)}" stroke="${stroke}" stroke-width="${idx === 0 ? 2.6 : 1.4}" stroke-opacity="${opacity}"/>`;
+      return `
+        <line x1="${originPoint.x.toFixed(1)}" y1="${originPoint.y.toFixed(1)}" x2="${p.x.toFixed(1)}" y2="${p.y.toFixed(1)}" stroke="${stroke}" stroke-width="${idx === 0 ? 3 : 1.6}" stroke-opacity="${opacity}" stroke-linecap="round"/>
+      `;
     })
     .join('');
 
@@ -939,24 +970,30 @@ function renderDispatchMapSvg(payload) {
       const p = project(move.lat, move.lon);
       const fill = idx === 0 ? '#d97706' : '#0ea5a4';
       const label = idx === 0 ? 'BEST' : `#${idx + 1}`;
-      const lx = Math.min(width - 70, p.x + 7);
-      const ly = Math.max(16, p.y - 8);
       return `
         <circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="${idx === 0 ? 6.2 : 4.8}" fill="${fill}" stroke="#ffffff" stroke-width="2"/>
-        <text x="${lx.toFixed(1)}" y="${ly.toFixed(1)}" font-size="10" font-weight="700" fill="#0f172a">${label}</text>
+        ${labelPill(p.x + 10, p.y - 24, label, idx === 0 ? 'rgba(245, 158, 11, 0.16)' : 'rgba(14, 165, 164, 0.14)')}
       `;
     })
     .join('');
 
   const originMarker = `
     <circle cx="${originPoint.x.toFixed(1)}" cy="${originPoint.y.toFixed(1)}" r="6.8" fill="#2563eb" stroke="#ffffff" stroke-width="2.2"/>
-    <text x="${Math.min(width - 66, originPoint.x + 8).toFixed(1)}" y="${Math.max(16, originPoint.y - 10).toFixed(1)}" font-size="10" font-weight="700" fill="#0f172a">YOU</text>
+    ${labelPill(originPoint.x + 10, originPoint.y - 24, 'COURIER', 'rgba(37, 99, 235, 0.16)')}
   `;
 
   dispatchMapEl.innerHTML = `
     <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Dispatch map">
-      <rect x="0" y="0" width="${width}" height="${height}" fill="rgba(255,255,255,0.85)"></rect>
-      ${grid}
+      <defs>
+        <linearGradient id="dispatchBg" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="#f8fafc"></stop>
+          <stop offset="100%" stop-color="#edf3f7"></stop>
+        </linearGradient>
+      </defs>
+      <rect x="0" y="0" width="${width}" height="${height}" rx="18" fill="url(#dispatchBg)"></rect>
+      <rect x="${pad}" y="${pad}" width="${width - pad * 2}" height="${height - pad * 2}" rx="16" fill="rgba(255,255,255,0.68)" stroke="rgba(15,23,42,0.08)"></rect>
+      ${horizontalGrid}
+      ${verticalGrid}
       ${lines}
       ${originMarker}
       ${markers}
@@ -1042,11 +1079,11 @@ function renderDispatchMap(plan) {
 
   if (!payload || payload.originLat == null || payload.originLon == null) {
     dispatchMapEl.classList.remove('map-ready');
-    dispatchMapEl.textContent = 'Driver location missing for map.';
+    dispatchMapEl.textContent = 'Courier location missing for map.';
     return;
   }
 
-  if (canUseLeaflet() && renderDispatchMapLeaflet(payload)) {
+  if (DISPATCH_MAP_RENDERER !== 'schematic' && canUseLeaflet() && renderDispatchMapLeaflet(payload)) {
     return;
   }
 
@@ -1187,7 +1224,7 @@ async function startMission(target) {
   const driverId = currentDriverId();
   const origin = await resolveMissionOrigin(driverId);
   if (!origin) {
-    if (missionStatusEl) missionStatusEl.textContent = 'Cannot start mission: driver position unavailable.';
+    if (missionStatusEl) missionStatusEl.textContent = 'Cannot start mission: courier position unavailable.';
     return;
   }
 
@@ -1456,7 +1493,7 @@ function renderMissionJournal() {
   const missions = Array.isArray(state.missionJournal) ? state.missionJournal : [];
 
   if (!missions.length) {
-    missionJournalSummaryEl.textContent = 'No mission report yet for this driver.';
+    missionJournalSummaryEl.textContent = 'No mission report yet for this courier.';
     missionJournalListEl.innerHTML = '<div class="muted">Complete or stop a mission to populate this journal.</div>';
     if (journalSuccessRateEl) journalSuccessRateEl.textContent = '-';
     if (journalRealizedDeltaEl) journalRealizedDeltaEl.textContent = '-';
@@ -1477,12 +1514,12 @@ function renderMissionJournal() {
   }
   if (journalRealizedDeltaEl) {
     journalRealizedDeltaEl.textContent = Number.isFinite(Number(stats.avg_realized_delta_eur_h))
-      ? `${fmtSigned(stats.avg_realized_delta_eur_h, 2)} EUR/h`
+      ? fmtUsdPerHour(stats.avg_realized_delta_eur_h, 2).replace('$-', '-$')
       : '-';
   }
   if (journalPredictedDeltaEl) {
     journalPredictedDeltaEl.textContent = Number.isFinite(Number(stats.avg_predicted_delta_eur_h))
-      ? `${fmtSigned(stats.avg_predicted_delta_eur_h, 2)} EUR/h`
+      ? fmtUsdPerHour(stats.avg_predicted_delta_eur_h, 2).replace('$-', '-$')
       : '-';
   }
   if (journalAvgElapsedEl) {
@@ -1501,10 +1538,10 @@ function renderMissionJournal() {
       const safeCompleted = escapeHtml(completed);
       const safeStopReason = escapeHtml(mission.stop_reason || '-');
       const realizedDelta = Number.isFinite(Number(mission.realized_delta_eur_h))
-        ? `${fmtSigned(mission.realized_delta_eur_h, 2)} EUR/h`
+        ? fmtUsdPerHour(mission.realized_delta_eur_h, 2).replace('$-', '-$')
         : '-';
       const predictedDelta = Number.isFinite(Number(mission.predicted_delta_eur_h))
-        ? `${fmtSigned(mission.predicted_delta_eur_h, 2)} EUR/h`
+        ? fmtUsdPerHour(mission.predicted_delta_eur_h, 2).replace('$-', '-$')
         : '-';
       const elapsed = Number.isFinite(Number(mission.elapsed_min)) ? fmtDuration(mission.elapsed_min) : '-';
       return `
@@ -1576,9 +1613,14 @@ function renderHealth() {
   const fuel = health.fuel_context || {};
   const dq = health.data_quality || {};
   const rq = health.routing_quality || {};
+  const demo = health.demo_readiness || {};
   const thr = health.quality_alert_thresholds || {};
 
   const items = [];
+  if (demo.summary) {
+    const cls = demo.ready ? (demo.status === 'ok' ? 'chip good' : 'chip warn') : 'chip bad';
+    items.push({ txt: demo.status === 'ok' ? 'demo ready' : demo.summary.toLowerCase(), cls });
+  }
   if (Number.isFinite(Number(metrics.roc_auc))) items.push({ txt: `AUC ${fmt(metrics.roc_auc, 3)}`, cls: 'chip' });
   if (Number.isFinite(Number(metrics.average_precision))) items.push({ txt: `AP ${fmt(metrics.average_precision, 3)}`, cls: 'chip' });
   if (Number.isFinite(Number(metrics.brier_score))) items.push({ txt: `Brier ${fmt(metrics.brier_score, 3)}`, cls: 'chip' });
@@ -1588,8 +1630,10 @@ function renderHealth() {
   if (fuel.fuel_sync_status) items.push({ txt: `fuel sync ${fuel.fuel_sync_status}`, cls: 'chip' });
 
   // Data quality chips
-  if (dq.supply_flat_alert) {
-    items.push({ txt: 'supply FLAT', cls: 'chip bad' });
+  if (dq.supply_signal_mode === 'single_driver_demo') {
+    items.push({ txt: 'single-driver demo', cls: 'chip' });
+  } else if (dq.supply_flat_effective || dq.supply_flat_alert) {
+    items.push({ txt: 'supply flat', cls: 'chip warn' });
   } else if (Number.isFinite(Number(dq.supply_variance))) {
     const ok = dq.supply_variance >= (thr.supply_variance_min ?? 0.002);
     items.push({ txt: `supply var ${fmt(dq.supply_variance, 4)}`, cls: ok ? 'chip good' : 'chip warn' });
@@ -1598,16 +1642,31 @@ function renderHealth() {
     const ok = dq.traffic_nonzero_rate >= (thr.traffic_nonzero_rate_min ?? 0.30);
     items.push({ txt: `traffic nz ${fmt(dq.traffic_nonzero_rate, 2)}`, cls: ok ? 'chip good' : 'chip warn' });
   }
-  if (dq.context_fallback_applied) items.push({ txt: `fallback (${dq.stale_sources_count ?? 0} stale)`, cls: 'chip warn' });
+  if (Array.isArray(dq.optional_sources) && dq.optional_sources.includes('nyc_dot_speeds')) {
+    items.push({ txt: 'DOT speeds optional', cls: 'chip' });
+  }
+  if (dq.context_fallback_applied) {
+    const coreStale = Number.isFinite(Number(dq.effective_stale_sources_count))
+      ? Number(dq.effective_stale_sources_count)
+      : Number(dq.stale_sources_count ?? 0);
+    if ((dq.status || 'ok') === 'ok') {
+      items.push({ txt: 'fallback stable', cls: 'chip good' });
+    } else {
+      items.push({ txt: `context monitored (${coreStale} core stale)`, cls: 'chip warn' });
+    }
+  }
 
   // Routing quality chips
-  if (rq.routing_degraded) {
+  if (rq.status === 'warming_up') {
+    items.push({ txt: 'routing warm-up', cls: 'chip' });
+  } else if (rq.routing_degraded) {
     items.push({ txt: 'routing DEGRADED', cls: 'chip bad' });
   } else if (Number.isFinite(Number(rq.routing_success_rate))) {
     const ok = rq.routing_success_rate >= (thr.routing_success_rate_min ?? 0.80);
-    items.push({ txt: `routing ok ${fmt(rq.routing_success_rate * 100, 1)}%`, cls: ok ? 'chip good' : 'chip warn' });
+    const label = (rq.status === 'monitoring') ? 'routing watch' : 'routing ok';
+    items.push({ txt: `${label} ${fmt(rq.routing_success_rate * 100, 1)}%`, cls: ok && rq.status !== 'monitoring' ? 'chip good' : 'chip warn' });
   }
-  if (Number.isFinite(Number(rq.hold_rate))) {
+  if (rq.status !== 'warming_up' && Number.isFinite(Number(rq.hold_rate))) {
     const bad = rq.hold_rate > (thr.hold_rate_max ?? 0.30);
     items.push({ txt: `hold ${fmt(rq.hold_rate * 100, 1)}%`, cls: bad ? 'chip warn' : 'chip good' });
   }
@@ -1636,7 +1695,7 @@ function renderKpis() {
   const avgNet = source.reduce((acc, x) => acc + Number(x.eur_per_hour_net || 0), 0) / source.length;
 
   kpiAcceptRate.textContent = `${fmt(acceptRate, 1)}%`;
-  kpiAvgNet.textContent = `${fmt(avgNet, 1)}`;
+  kpiAvgNet.textContent = fmtUsdPerHour(avgNet, 1);
 }
 
 function renderOffers() {
@@ -1650,7 +1709,7 @@ function renderOffers() {
   offersEl.innerHTML = '';
 
   if (!rows.length) {
-    renderListState(offersEl, 'empty', 'No offer matches the current filter.');
+    renderListState(offersEl, 'empty', 'No delivery matches the current filter.');
     return;
   }
 
@@ -1700,12 +1759,12 @@ function renderBestOffers() {
   bestOffersEl.innerHTML = '';
 
   if (state.bestOffersError) {
-    renderListState(bestOffersEl, 'error', `Best offers unavailable: ${state.bestOffersError}`);
+    renderListState(bestOffersEl, 'error', `Best deliveries unavailable: ${state.bestOffersError}`);
     return;
   }
 
   if (!state.bestOffers.length) {
-    renderListState(bestOffersEl, 'empty', 'No profitable nearby offers for current filters.');
+    renderListState(bestOffersEl, 'empty', 'No profitable nearby deliveries for current filters.');
     return;
   }
 
@@ -1735,13 +1794,13 @@ function renderBestOffers() {
         <span class="badge ${asRecommendationClass(offer.recommendation_action)}">${escapeHtml(String(offer.recommendation_action || 'skip').toUpperCase())}</span>
       </div>
       <div class="offer-meta">
-        <span class="muted">pickup ${fmt(offer.distance_to_pickup_km, 2)} km</span>
+        <span class="muted">restaurant ${fmt(offer.distance_to_pickup_km, 2)} km</span>
         <span><strong>${fmt(offer.recommendation_score, 3)}</strong> rec - <strong>${fmt(offer.objective_score, 3)}</strong> objective - <strong>${fmt(offer.accept_score, 3)}</strong> ${escapeHtml(String(offer.model_used || 'heuristic'))}</span>
       </div>
       ${offerMetricsHtml(offer)}
       <div class="offer-meta">
         <span>${escapeHtml(routeSummary(offer))}</span>
-        <span><strong>${fmt(offer.target_gap_eur_h, 1)}</strong> gap EUR/h</span>
+        <span><strong>${fmtUsdPerHour(offer.target_gap_eur_h, 1).replace('$-', '-$')}</strong> gap</span>
       </div>
       ${breakdown}
       <div class="chips">${chips}</div>
@@ -1769,7 +1828,7 @@ function renderDispatch() {
   const plan = state.dispatch;
   if (!plan) {
     dispatchSummaryEl.textContent = 'No dispatch recommendation yet.';
-    renderListState(dispatchPlanEl, 'empty', 'Refresh driver data to compute dispatch recommendation.');
+    renderListState(dispatchPlanEl, 'empty', 'Refresh courier data to compute dispatch recommendation.');
     renderDispatchMap(null);
     return;
   }
@@ -1786,7 +1845,7 @@ function renderDispatch() {
   const strategyLabel = escapeHtml(strategy);
   top.innerHTML = `
     <div class="offer-top">
-      <strong>Target ${fmt(plan.target_hourly_net_eur, 1)} EUR/h</strong>
+      <strong>Target ${fmtUsdPerHour(plan.target_hourly_net_eur, 1)}</strong>
       <span class="badge ${asDispatchClass(decision)}">${decisionLabel}</span>
     </div>
     <div class="muted">Strategy ${strategyLabel} - Local candidates ${Number(plan.local_candidates_count || 0)} - Reposition candidates ${Number(plan.reposition_candidates_count || 0)} - max ETA ${fmt(plan.max_reposition_eta_min, 1)} min (effective ${fmt(plan.effective_max_reposition_eta_min, 1)} min) - forecast ${fmt(plan.forecast_horizon_min, 0)} min (effective ${fmt(plan.effective_forecast_horizon_min, 0)} min)</div>
@@ -1805,16 +1864,16 @@ function renderDispatch() {
 
     card.innerHTML = `
       <div class="offer-top">
-        <strong>Stay candidate - ${escapeHtml(stay.offer_id || 'offer')}</strong>
+        <strong>Stay nearby - ${escapeHtml(stay.offer_id || 'offer')}</strong>
         <span class="badge ${asRecommendationClass(stay.recommendation_action)}">${escapeHtml(String(stay.recommendation_action || 'consider').toUpperCase())}</span>
       </div>
       <div class="offer-meta">
         <span class="muted">zone ${escapeHtml(stay.zone_id || '-')}</span>
-        <span><strong>${fmt(stay.recommendation_score, 3)}</strong> rec - <strong>${fmt(stay.eur_per_hour_net, 1)}</strong> EUR/h</span>
+        <span><strong>${fmt(stay.recommendation_score, 3)}</strong> rec - <strong>${fmtUsdPerHour(stay.eur_per_hour_net, 1)}</strong></span>
       </div>
       ${offerMetricsHtml(stay)}
       <div class="offer-meta">
-        <span>pickup ${fmt(stay.distance_to_pickup_km, 2)} km</span>
+        <span>restaurant ${fmt(stay.distance_to_pickup_km, 2)} km</span>
         <span>route ${escapeHtml(stay.route_source || 'estimated')} - ${fmt(stay.route_duration_min, 1)} min</span>
       </div>
       ${breakdown}
@@ -1841,13 +1900,13 @@ function renderDispatch() {
       </div>
       <div class="muted">ETA ${fmt(move.eta_min, 1)} min - ${fmt(move.route_distance_km, 1)} km - route ${escapeHtml(move.route_source || 'estimated')}</div>
       <div class="offer-metrics">
-        <div class="offer-metric"><div class="k">Net EUR/h</div><div class="v">${fmt(move.risk_adjusted_potential_eur_h, 1)}</div></div>
-        <div class="offer-metric"><div class="k">Gross EUR/h</div><div class="v">${fmt(move.estimated_potential_eur_h, 1)}</div></div>
+        <div class="offer-metric"><div class="k">Net USD/h</div><div class="v">${fmtUsdPerHour(move.risk_adjusted_potential_eur_h, 1)}</div></div>
+        <div class="offer-metric"><div class="k">Gross USD/h</div><div class="v">${fmtUsdPerHour(move.estimated_potential_eur_h, 1)}</div></div>
         <div class="offer-metric"><div class="k">ETA min</div><div class="v">${fmt(move.eta_min, 1)}</div></div>
-        <div class="offer-metric"><div class="k">Reposition Cost</div><div class="v">${fmt(move.reposition_total_cost_eur, 2)}</div></div>
+        <div class="offer-metric"><div class="k">Reposition Cost</div><div class="v">${fmtUsd(move.reposition_total_cost_eur, 2)}</div></div>
       </div>
-      <div class="muted">Gross ${fmt(move.estimated_potential_eur_h, 1)} EUR/h - Risk-adjusted ${fmt(move.risk_adjusted_potential_eur_h, 1)} EUR/h - net gain vs stay ${fmt(move.net_gain_vs_stay_eur_h, 1)} EUR/h</div>
-      <div class="muted">fuel $${fmt(move.travel_cost_usd, 2)} - time ${fmt(move.time_cost_eur, 2)} EUR - risk ${fmt(move.risk_cost_eur, 2)} EUR - total ${fmt(move.reposition_total_cost_eur, 2)} EUR</div>
+      <div class="muted">Gross ${fmtUsdPerHour(move.estimated_potential_eur_h, 1)} - Risk-adjusted ${fmtUsdPerHour(move.risk_adjusted_potential_eur_h, 1)} - net gain vs stay ${fmtUsdPerHour(move.net_gain_vs_stay_eur_h, 1).replace('$-', '-$')}</div>
+      <div class="muted">fuel ${fmtUsd(move.travel_cost_usd, 2)} - time ${fmtUsd(move.time_cost_eur, 2)} - risk ${fmtUsd(move.risk_cost_eur, 2)} - total ${fmtUsd(move.reposition_total_cost_eur, 2)}</div>
       <div class="muted">demand ${fmt(move.demand_index, 2)} / supply ${fmt(move.supply_index, 2)} - forecast pressure ${fmt(move.forecast_pressure_ratio, 2)} - opportunity ${fmt(move.opportunity_score, 2)}</div>
       <div class="zone-meter"><div style="width:${Math.max(6, Math.min(100, Number(move.dispatch_score || 0) * 100))}%"></div></div>
       <div class="offer-actions">
@@ -1932,7 +1991,7 @@ function renderZones() {
       <div class="offer-metrics">
         <div class="offer-metric"><div class="k">Opportunity</div><div class="v">${fmt(adjustedScore, 2)}</div></div>
         <div class="offer-metric"><div class="k">ETA min</div><div class="v">${fmt(repoTime, 1)}</div></div>
-        <div class="offer-metric"><div class="k">Fuel EUR</div><div class="v">${fmt(fuelCost, 2)}</div></div>
+        <div class="offer-metric"><div class="k">Fuel USD</div><div class="v">${fmtUsd(fuelCost, 2)}</div></div>
         <div class="offer-metric"><div class="k">Distance km</div><div class="v">${fmt(distance, 2)}</div></div>
       </div>
       <div class="muted">demand ${fmt(zone.demand_index, 2)} / supply ${fmt(zone.supply_index, 2)} - weather ${fmt(zone.weather_factor, 2)} - traffic ${fmt(zone.traffic_factor, 2)}</div>
@@ -1966,7 +2025,7 @@ function renderShiftPlan() {
 
   const horizon = Number(plan?.horizon_min || shiftPlanHorizonInput?.value || 60);
   const target = Number(plan?.target_hourly_net_eur || 0);
-  shiftPlanSummaryEl.textContent = `Top ${items.length} zones for next ${horizon} min - target ${fmt(target, 1)} EUR/h`;
+  shiftPlanSummaryEl.textContent = `Top ${items.length} zones for next ${horizon} min - target ${fmtUsdPerHour(target, 1)}`;
 
   const maxScore = Math.max(...items.map((item) => Number(item.shift_score || 0)), 0.001);
   const originLat = asFloatOrNull(plan?.origin_lat ?? state.dispatch?.origin?.lat);
@@ -2027,10 +2086,10 @@ function renderShiftPlan() {
         <span>${fmt(item.distance_km, 2)} km - ${fmt(item.eta_min, 1)} min</span>
       </div>
       <div class="offer-metrics">
-        <div class="offer-metric"><div class="k">Net EUR/h</div><div class="v">${fmt(item.estimated_net_eur_h, 1)}</div></div>
-        <div class="offer-metric"><div class="k">Gross EUR/h</div><div class="v">${fmt(item.estimated_gross_eur_h, 1)}</div></div>
-        <div class="offer-metric"><div class="k">Gain vs Target</div><div class="v">${fmtSigned(item.net_gain_vs_target_eur_h, 1)}</div></div>
-        <div class="offer-metric"><div class="k">Reposition EUR</div><div class="v">${fmt(item.reposition_total_cost_eur, 2)}</div></div>
+        <div class="offer-metric"><div class="k">Net USD/h</div><div class="v">${fmtUsdPerHour(item.estimated_net_eur_h, 1)}</div></div>
+        <div class="offer-metric"><div class="k">Gross USD/h</div><div class="v">${fmtUsdPerHour(item.estimated_gross_eur_h, 1)}</div></div>
+        <div class="offer-metric"><div class="k">Gain vs Target</div><div class="v">${fmtUsdPerHour(item.net_gain_vs_target_eur_h, 1).replace('$-', '-$')}</div></div>
+        <div class="offer-metric"><div class="k">Reposition USD</div><div class="v">${fmtUsd(item.reposition_total_cost_eur, 2)}</div></div>
       </div>
       <div class="muted"><strong>Why now:</strong> ${whyNow}</div>
       <div class="muted">demand ${fmt(item.demand_index, 2)} / supply ${fmt(item.supply_index, 2)} - event ${fmt(item.event_pressure, 2)} - temporal ${fmt(item.temporal_pressure, 2)} - forecast pressure ${fmt(item.forecast_pressure_ratio, 2)}</div>
@@ -2175,7 +2234,7 @@ function ensureReplayLeafletMap() {
     zoomControl: true,
     attributionControl: true,
   });
-  window.L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  window.L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
     maxZoom: 19,
     attribution: '&copy; OpenStreetMap contributors',
   }).addTo(map);
@@ -2390,7 +2449,7 @@ function renderReplayTimeline(model) {
     const scrub = evt.positionIndex >= 0 ? `t+${evt.positionIndex + 1}` : 'n/a';
     row.innerHTML = `
       <strong>${eventType} - ${status}</strong>
-      <div>offer ${offerId} - order ${orderId} - zone ${zoneId}</div>
+      <div>offer ${offerId} - delivery ${orderId} - zone ${zoneId}</div>
       <div class="muted">${ts} - topic ${topic} - scrub ${scrub}</div>
     `;
     replayTimeline.appendChild(row);
@@ -2616,11 +2675,11 @@ function profileUpdatedLabel(updatedAt) {
 function renderDriverProfile() {
   const profile = state.driverProfile;
   if (state.driverProfileError) {
-    if (profileStatusEl) profileStatusEl.textContent = `Driver profile unavailable: ${state.driverProfileError}`;
+    if (profileStatusEl) profileStatusEl.textContent = `Courier profile unavailable: ${state.driverProfileError}`;
     return;
   }
   if (!profile) {
-    if (profileStatusEl) profileStatusEl.textContent = 'Driver profile not loaded yet.';
+    if (profileStatusEl) profileStatusEl.textContent = 'Courier profile not loaded yet.';
     return;
   }
   const payload = {
@@ -2650,8 +2709,8 @@ function renderDriverProfile() {
     const source = String(profile.source || 'default');
     const updatedAt = profileUpdatedLabel(profile.updated_at);
     profileStatusEl.textContent = updatedAt
-      ? `Driver profile ready (${source}, updated ${updatedAt})`
-      : `Driver profile ready (${source})`;
+      ? `Courier profile ready (${source}, updated ${updatedAt})`
+      : `Courier profile ready (${source})`;
   }
 }
 
@@ -2659,7 +2718,7 @@ async function saveDriverProfile() {
   const driver = currentDriverId();
   const payload = normalizedProfilePayloadFromInputs();
   syncProfileInputs(payload);
-  if (profileStatusEl) profileStatusEl.textContent = 'Saving driver profile...';
+  if (profileStatusEl) profileStatusEl.textContent = 'Saving courier profile...';
 
   try {
     const profile = await api(`/copilot/driver/${encodeURIComponent(driver)}/profile`, {
@@ -2669,7 +2728,7 @@ async function saveDriverProfile() {
     state.driverProfile = profile;
     state.driverProfileError = null;
     renderDriverProfile();
-    setUxStatus('success', 'Driver profile saved and applied.');
+    setUxStatus('success', 'Courier profile saved and applied.');
     await refreshDriverData();
   } catch (err) {
     const msg = errorMessage(err, 'profile update failed');
@@ -2840,8 +2899,8 @@ async function refreshDriverData() {
     refreshMissionJournal(true).catch(() => {});
   }
 
-  setUxStatus('loading', `Refreshing offers, score, and action plan for ${driver}...`);
-  if (profileStatusEl) profileStatusEl.textContent = 'Loading driver profile...';
+  setUxStatus('loading', `Refreshing deliveries, score, and action plan for ${driver}...`);
+  if (profileStatusEl) profileStatusEl.textContent = 'Loading courier profile...';
   renderListState(offersEl, 'loading', 'Loading offers...');
   renderListState(bestOffersEl, 'loading', 'Loading nearby recommendations...');
   dispatchSummaryEl.textContent = 'Loading instant dispatch recommendation...';
@@ -2862,7 +2921,7 @@ async function refreshDriverData() {
       api(`/copilot/driver/${encodeURIComponent(driver)}/profile`).catch((err) => ({ _error: errorMessage(err, 'profile unavailable') })),
       api(buildDriverOffersQuery(driver, limit)),
       api(buildZoneQuery(driver)),
-      api(buildAroundQuery(driver)).catch((err) => ({ offers: [], _error: errorMessage(err, 'best offers unavailable') })),
+      api(buildAroundQuery(driver)).catch((err) => ({ offers: [], _error: errorMessage(err, 'best deliveries unavailable') })),
       api(buildDispatchQuery(driver)).catch((err) => ({ _error: errorMessage(err, 'dispatch unavailable') })),
       api(buildShiftPlanQuery(driver)).catch((err) => ({ _error: errorMessage(err, 'shift plan unavailable') })),
     ]);
@@ -2896,9 +2955,9 @@ async function refreshDriverData() {
     renderShiftPlan();
     renderDriverProfile();
     renderDecisionFlow();
-    setUxStatus('success', 'Ready: choose an offer, score it, then trigger the action route.');
+    setUxStatus('success', 'Ready: choose a delivery, score it, then trigger the action route.');
   } catch (err) {
-    const msg = errorMessage(err, 'driver refresh failed');
+    const msg = errorMessage(err, 'courier refresh failed');
     renderListState(offersEl, 'error', `Unable to load offers: ${msg}`);
     renderListState(bestOffersEl, 'error', `Unable to load nearby recommendations: ${msg}`);
     dispatchSummaryEl.textContent = `Dispatch unavailable: ${msg}`;
@@ -3005,7 +3064,7 @@ async function scoreManualOffer(payloadOverride = null) {
 
     scoreProb.textContent = fmt(score.accept_score, 3);
     scoreDecision.textContent = (score.decision || '-').toUpperCase();
-    scoreEur.textContent = fmt(score.eur_per_hour_net, 1);
+    scoreEur.textContent = fmtUsdPerHour(score.eur_per_hour_net, 1);
 
     const expl = Array.isArray(score.explanation) ? score.explanation.map(humanizeReason).join(' - ') : '-';
     const detailSummary = Array.isArray(score.explanation_details)
@@ -3266,7 +3325,7 @@ async function refreshAll() {
   if (!mapEl || typeof L === 'undefined') return;
 
   const fleetMap = L.map(mapEl, { zoomControl: true }).setView([40.75, -73.99], 12);
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
     attribution: '© OpenStreetMap',
     maxZoom: 18,
   }).addTo(fleetMap);
@@ -3320,8 +3379,8 @@ async function refreshAll() {
       const drivers = Array.isArray(data.drivers) ? data.drivers : [];
 
       // Update chips
-      if (activeChip) activeChip.textContent = `${data.active_drivers} actifs`;
-      if (pressureChip) pressureChip.textContent = `pression ${(data.avg_pressure_ratio || 0).toFixed(2)}`;
+      if (activeChip) activeChip.textContent = `${data.active_drivers} active`;
+      if (pressureChip) pressureChip.textContent = `pressure ${(data.avg_pressure_ratio || 0).toFixed(2)}`;
 
       // Update map markers
       const seen = new Set();
@@ -3356,10 +3415,10 @@ async function refreshAll() {
           ? '<div style="color:#64748b;font-size:.8rem">Aucune opportunité forte détectée.</div>'
           : top.map(d => {
               const color = _scoreColor(d.opportunity_score);
-              return `<div style="display:flex;justify-content:space-between;align-items:center;background:rgba(0,0,0,.05);border-radius:.3rem;padding:.3rem .5rem;cursor:pointer"
+              return `<div class="fleet-opportunity"
                 data-cid="${escapeHtml(d.courier_id)}">
-                <span style="font-size:.8rem;color:var(--ink)">${escapeHtml(d.courier_id)} <span style="color:var(--ink-soft)">${escapeHtml(d.zone_id)}</span></span>
-                <span style="font-weight:700;color:${color}">${d.opportunity_score}</span>
+                <span class="fleet-opportunity-main">${escapeHtml(d.courier_id)}<span>${escapeHtml(d.zone_id)}</span></span>
+                <span class="fleet-score" style="color:${color}">${d.opportunity_score}</span>
               </div>`;
             }).join('');
         // Click on opportunity row
@@ -3482,10 +3541,10 @@ safeBind(missionStartBestBtn, 'click', () => {
   startBestMission().catch(() => {});
 });
 safeBind(missionStopBtn, 'click', () => {
-  stopMission('Mission stopped by driver.');
+  stopMission('Mission stopped by courier.');
 });
 safeBind(driverInput, 'change', () => {
-  stopMission('Driver changed, mission reset.');
+  stopMission('Courier changed, mission reset.');
   state.selectedOfferKey = null;
   state.selectedOfferSource = null;
   state.lastScoredOfferId = null;

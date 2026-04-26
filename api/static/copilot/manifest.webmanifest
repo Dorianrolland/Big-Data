@@ -1,7 +1,7 @@
 {
-  "name": "FleetStream Driver Copilot",
-  "short_name": "Copilot",
-  "description": "Copilote décisionnel temps réel pour chauffeurs VTC — FleetStream CY Tech",
+  "name": "FleetStream Courier Copilot",
+  "short_name": "Courier Copilot",
+  "description": "Copilote décisionnel temps réel pour livreurs de nourriture à New York — FleetStream CY Tech",
   "start_url": "/copilot",
   "scope": "/copilot",
   "display": "standalone",

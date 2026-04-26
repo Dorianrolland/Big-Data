@@ -581,9 +581,12 @@ def cached_fetch(
 
 def analytics_notice_html(payload: dict, *, default_detail: str = "") -> str:
     status = payload.get("analytics_status", {}) if isinstance(payload, dict) else {}
+    degraded = bool(status.get("degraded")) if isinstance(status, dict) else False
     detail = ""
     if isinstance(status, dict):
         detail = str(status.get("detail", "") or "")
+    if not degraded:
+        return ""
     if not detail and isinstance(payload, dict):
         detail = str(payload.get("detail", "") or "")
     if not detail:
@@ -979,11 +982,11 @@ ph_zones  = st.empty()
 # ════════════════════════════════════════════════════════════════════════════
 st.markdown("""
 <div class="fs-sh" style="margin-top:32px">
-    <div class="overline">Driver Revenue Copilot · ML + Open Data</div>
-    <div class="heading">Cockpit Chauffeur</div>
+    <div class="overline">Courier Revenue Copilot · ML + Open Data</div>
+    <div class="heading">Cockpit Livreur</div>
     <div class="sub">
         Score d'acceptation des offres, zones de repositionnement,
-        signaux Citi Bike (GBFS) et bornes de recharge (OpenChargeMap).
+        signaux Citi Bike (GBFS) et bornes EV NYC.
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -1066,9 +1069,11 @@ if analyse or livreur_id != st.session_state.last_lv_id:
 hist = st.session_state.last_hist
 
 with ph_hist.container():
-    if "resume" in hist:
-        r    = hist["resume"]
-        traj = hist.get("trajectory", [])
+    resume = hist.get("resume") if isinstance(hist, dict) else None
+    if isinstance(resume, dict):
+        r = resume
+        raw_traj = hist.get("trajectory", []) if isinstance(hist, dict) else []
+        traj = raw_traj if isinstance(raw_traj, list) else []
         notice_html = analytics_notice_html(hist)
 
         if notice_html:
@@ -1626,26 +1631,6 @@ while True:
             notice_html = analytics_notice_html(fraud_data)
 
             fraud_html = ""
-            if teleports:
-                for t in teleports[:4]:
-                    niv = t.get("niveau", "warning")
-                    cls = f"anomaly-{niv}"
-                    badge_cls = f"ab-{niv}"
-                    fraud_html += (
-                        f'<div class="anomaly-item {cls}">'
-                        f'<div class="anomaly-header">'
-                        f'<span class="anomaly-id">{t.get("livreur_id","?")}</span>'
-                        f'<span class="anomaly-badge {badge_cls}">TELEPORTATION</span>'
-                        f'<span style="margin-left:auto;font-size:11px;color:#94A3B8">'
-                        f'{t.get("saut_km",0):.1f} km · {t.get("vitesse_implicite_kmh",0):.0f} km/h implicite</span>'
-                        f'</div>'
-                        f'<div class="anomaly-detail">Saut de {t.get("saut_km",0):.2f} km '
-                        f'— vitesse implicite {t.get("vitesse_implicite_kmh",0):.0f} km/h '
-                        f'(seuil: {t.get("seuil_kmh",90)} km/h)</div>'
-                        f'<div class="anomaly-risque">{t.get("risque","")}</div>'
-                        f'</div>'
-                    )
-
             if frozen_list:
                 for f in frozen_list[:3]:
                     fraud_html += (
@@ -1658,14 +1643,15 @@ while True:
                         f'</div>'
                         f'<div class="anomaly-detail">Coordonnées identiques '
                         f'({f.get("lat","?")}, {f.get("lon","?")}) '
-                        f'sur {f.get("nb_repetitions",0)} mesures consécutives</div>'
+                        f'sur {f.get("nb_repetitions",0)} mesures consécutives'
+                        f' pendant {round(float(f.get("duration_s",0) or 0) / 60.0, 1)} min</div>'
                         f'<div class="anomaly-risque">{f.get("risque","")}</div>'
                         f'</div>'
                     )
 
             if not fraud_html:
                 fraud_html = (
-                    '<div class="reco-item ok">✅ Aucune fraude GPS détectée '
+                    '<div class="reco-item ok">✅ Aucun incident GPS crédible détecté '
                     f'— {f_resume.get("livreurs_scannes",0)} livreurs analysés.</div>'
                 )
 
@@ -1674,14 +1660,14 @@ while True:
                 f'<div class="bi-card">'
                 f'<div class="bi-card-header">'
                 f'<span style="font-size:18px">🛡️</span>'
-                f'<span class="bi-card-title">Détection Fraude GPS</span>'
+                f'<span class="bi-card-title">Qualité GPS live</span>'
                 f'<span style="margin-left:auto;font-size:10px;color:{fraud_color};font-weight:700">'
                 f'{total_frauds} alerte(s)</span>'
                 f'</div>'
                 f'{notice_html}'
                 f'<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px">'
-                f'<div class="bi-kpi"><div class="bi-kpi-lbl">🔴 Téléportations</div>'
-                f'<div class="bi-kpi-val" style="color:#EF4444">{f_resume.get("teleportations",0)}</div></div>'
+                f'<div class="bi-kpi"><div class="bi-kpi-lbl">🛡️ Sauts GPS bloqués</div>'
+                f'<div class="bi-kpi-val" style="color:#10B981">{f_resume.get("teleportations",0)}</div></div>'
                 f'<div class="bi-kpi"><div class="bi-kpi-lbl">⚠️ GPS figés</div>'
                 f'<div class="bi-kpi-val" style="color:#F59E0B">{f_resume.get("positions_figees",0)}</div></div>'
                 f'<div class="bi-kpi"><div class="bi-kpi-lbl">🔍 Livreurs scannés</div>'
@@ -1707,13 +1693,18 @@ while True:
             sous = alertes_z.get("zones_prioritaires", [])
             sur  = alertes_z.get("zones_saturees", [])
             analytics_status = zones_data.get("analytics_status", {})
+            coverage_metric_label = (
+                "signal demande"
+                if analytics_status.get("source") == "live_zone_context"
+                else "passages hist."
+            )
 
             def zone_item(z):
                 return (
                     f'<div class="zone-item">'
                     f'<div class="zi-coords">lat {z.get("lat","?")} · lon {z.get("lon","?")}</div>'
                     f'<div class="zi-stat">{z.get("livreurs_actifs",0)} livreur(s) · '
-                    f'{z.get("passages_historiques",0):,} passages hist.</div>'
+                    f'{z.get("passages_historiques",0):,} {coverage_metric_label}</div>'
                     f'<div class="zi-gap">Écart : {z.get("ecart_couverture","?")}</div>'
                     f'</div>'
                 )
@@ -1787,7 +1778,7 @@ while True:
                     f'<div style="min-width:50px;text-align:right;font-size:13px;font-weight:800">'
                     f'{score:.0%}</div>'
                     f'<div style="min-width:80px;text-align:right;font-size:12px;color:#64748B">'
-                    f'{eph:.1f} EUR/h</div>'
+                    f'${eph:.1f}/h</div>'
                     f'</div>'
                 )
             model_used = offers[0].get("model_used", "heuristic") if offers else "?"
@@ -1808,9 +1799,9 @@ while True:
             connectors_html = ""
             if cp_health:
                 for name, key in [("Weather", "weather_context"), ("Citi Bike", "gbfs_context"),
-                                  ("OCM EV", "irve_context"), ("TLC Replay", "tlc_replay")]:
+                                  ("NYC EV", "irve_context"), ("TLC Replay", "tlc_replay")]:
                     ctx = cp_health.get(key, {})
-                    status = ctx.get("status", "off")
+                    status = ctx.get("status") or ("ok" if ctx.get("state") == "running" else "off")
                     dot_color = "#10B981" if status == "ok" else "#F59E0B" if "degraded" in status else "#94A3B8"
                     connectors_html += (
                         f'<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 8px;'
@@ -1873,7 +1864,7 @@ while True:
                 f'</div>'
                 f'{rows_html}'
                 f'<div style="font-size:9px;color:#94A3B8;margin-top:8px">'
-                f'Stations vides = forte demande transport = boost taxi</div>'
+                f'Stations vides = demande de livraison plus forte</div>'
                 f'</div>',
                 unsafe_allow_html=True,
             )
@@ -1885,9 +1876,22 @@ while True:
         gbfs_ctx = (irve_health or {}).get("gbfs_context", {})
 
         def status_dot(ctx):
-            s = ctx.get("status", "off")
+            s = ctx.get("status") or ("ok" if ctx.get("state") == "running" else "off")
             c = "#10B981" if s == "ok" else "#F59E0B" if "degraded" in s else "#94A3B8"
             return f'<span style="width:8px;height:8px;border-radius:50%;background:{c};display:inline-block"></span>'
+
+        tlc_events = tlc_ctx.get("events", tlc_ctx.get("positions", tlc_ctx.get("emitted", "0")))
+        irve_source = irve_ctx.get("source", "nyc_ev")
+        tlc_scope = (
+            f'month {tlc_ctx.get("month","?")}'
+            if tlc_ctx.get("month")
+            else ("single-driver" if tlc_ctx.get("mode") == "single_driver" else "month ?")
+        )
+        tlc_tail = (
+            f'{tlc_ctx.get("progress_pct","0")}%'
+            if tlc_ctx.get("progress_pct") not in (None, "", "?")
+            else (tlc_ctx.get("state") or "off")
+        )
 
         st.markdown(
             f'<div class="bi-card">'
@@ -1897,15 +1901,15 @@ while True:
             f'</div>'
             f'<div style="display:flex;flex-direction:column;gap:10px">'
             f'<div style="display:flex;align-items:center;gap:8px;font-size:12px">'
-            f'{status_dot(irve_ctx)} <strong>IRVE</strong> — '
-            f'{irve_ctx.get("stations_loaded","0")} EV charging stations loaded</div>'
+            f'{status_dot(irve_ctx)} <strong>Stations EV NYC</strong> — '
+            f'{irve_ctx.get("stations_loaded","0")} stations · {irve_source}</div>'
             f'<div style="display:flex;align-items:center;gap:8px;font-size:12px">'
             f'{status_dot(gbfs_ctx)} <strong>Citi Bike GBFS</strong> — '
             f'{gbfs_ctx.get("stations_polled","0")} stations, '
             f'{gbfs_ctx.get("zones_updated","0")} zones</div>'
             f'<div style="display:flex;align-items:center;gap:8px;font-size:12px">'
             f'{status_dot(tlc_ctx)} <strong>NYC TLC Replay</strong> — '
-            f'month {tlc_ctx.get("month","?")} · {tlc_ctx.get("emitted","0")} events · {tlc_ctx.get("progress_pct","0")}%</div>'
+            f'{tlc_scope} · {tlc_events} events · {tlc_tail}</div>'
             f'</div></div>',
             unsafe_allow_html=True,
         )

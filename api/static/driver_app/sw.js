@@ -1,4 +1,4 @@
-const CACHE_NAME = 'fleetstream-driver-copilot-v2';
+const CACHE_NAME = 'fleetstream-driver-copilot-v3';
 const STATIC_ASSETS = [
   '/copilot/driver-app',
   '/static/driver_app/index.html',
@@ -50,7 +50,7 @@ self.addEventListener('fetch', (event) => {
           (cached) =>
             cached ||
             new Response(
-              '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Offline</title><style>body{margin:0;background:#111;color:#f4f1e8;font-family:Arial,sans-serif;display:grid;place-items:center;height:100vh}.box{padding:2rem;text-align:center}button{padding:.75rem 1.1rem;border-radius:999px;border:none;background:#ffb100;color:#111;font-weight:700;cursor:pointer}</style></head><body><div class="box"><h1>Driver Copilot is offline</h1><p>Reconnect to refresh the live driver briefing.</p><button onclick="location.reload()">Retry</button></div></body></html>',
+              '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Offline</title><style>body{margin:0;background:#111;color:#f4f1e8;font-family:Arial,sans-serif;display:grid;place-items:center;height:100vh}.box{padding:2rem;text-align:center}button{padding:.75rem 1.1rem;border-radius:999px;border:none;background:#ffb100;color:#111;font-weight:700;cursor:pointer}</style></head><body><div class="box"><h1>Courier Copilot is offline</h1><p>Reconnect to refresh the live courier briefing.</p><button onclick="location.reload()">Retry</button></div></body></html>',
               { headers: { 'Content-Type': 'text/html; charset=utf-8' } }
             )
         )

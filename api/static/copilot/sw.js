@@ -1,4 +1,4 @@
-const CACHE_NAME = 'fleetstream-copilot-v3';
+const CACHE_NAME = 'fleetstream-copilot-v6';
 const STATIC_ASSETS = [
   '/copilot',
   '/static/copilot/index.html',
@@ -62,9 +62,9 @@ self.addEventListener('fetch', (event) => {
               <meta name="viewport" content="width=device-width,initial-scale=1">
               <style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0f172a;color:#f8fafc}
               .box{text-align:center;padding:2rem}.icon{font-size:4rem}.h{font-size:1.4rem;margin:.5rem 0}.sub{color:#94a3b8;font-size:.9rem}</style>
-              </head><body><div class="box"><div class="icon">🚗</div>
+              </head><body><div class="box"><div class="icon">🛵</div>
               <div class="h">FleetStream hors ligne</div>
-              <div class="sub">Reconnectez-vous pour utiliser le Copilot en temps réel.</div>
+              <div class="sub">Reconnectez-vous pour utiliser le Copilot livreur en temps réel.</div>
               <br><button onclick="location.reload()" style="padding:.5rem 1.2rem;border-radius:.4rem;border:none;background:#22c55e;color:#fff;cursor:pointer;font-size:1rem">Réessayer</button>
               </div></body></html>`,
               { headers: { 'Content-Type': 'text/html; charset=utf-8' } }

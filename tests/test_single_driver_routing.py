@@ -36,6 +36,7 @@ from routing import (  # noqa: E402
     haversine_km,
     interpolate_on_route,
 )
+from motion import build_motion_schedule, progress_at_elapsed  # noqa: E402
 from single_driver import (  # noqa: E402
     _deterministic_offset_minutes,
     _in_time_window,
@@ -77,6 +78,62 @@ def test_interpolate_on_route_bounds_and_mid():
 
 
 # ── provider chain fallback ──────────────────────────────────────────────────
+def test_motion_schedule_inserts_pause_near_turns():
+    geom = [
+        (40.7580, -73.9855),
+        (40.7580, -73.9815),
+        (40.7530, -73.9815),
+        (40.7530, -73.9775),
+    ]
+    cum = cumulative_distances_km(geom)
+    schedule = build_motion_schedule(
+        geometry=geom,
+        cumulative_km=cum,
+        total_duration_s=240.0,
+        seed="drv_demo_001|delivering|turns",
+        reference_ts=datetime(2024, 1, 2, 17, 30, tzinfo=timezone.utc),
+        status="delivering",
+        min_spacing_km=0.05,
+        base_stop_seconds=18.0,
+        max_pause_ratio=0.35,
+    )
+
+    assert any(segment.paused for segment in schedule.segments)
+    assert schedule.segments[-1].progress_end == pytest.approx(1.0, abs=1e-6)
+
+
+def test_motion_schedule_progress_is_monotonic_and_can_hold_position():
+    geom = [
+        (40.7580, -73.9855),
+        (40.7580, -73.9815),
+        (40.7530, -73.9815),
+    ]
+    cum = cumulative_distances_km(geom)
+    schedule = build_motion_schedule(
+        geometry=geom,
+        cumulative_km=cum,
+        total_duration_s=180.0,
+        seed="drv_demo_001|delivering|pause",
+        reference_ts=datetime(2024, 1, 2, 8, 15, tzinfo=timezone.utc),
+        status="delivering",
+        min_spacing_km=0.05,
+        base_stop_seconds=20.0,
+        max_pause_ratio=0.35,
+    )
+
+    checkpoints = [0.0, 30.0, 60.0, 90.0, 120.0, 150.0, 180.0]
+    progresses = [progress_at_elapsed(schedule, elapsed)[0] for elapsed in checkpoints]
+    paused_segment = next(segment for segment in schedule.segments if segment.paused)
+    pause_midpoint = paused_segment.start_s + ((paused_segment.end_s - paused_segment.start_s) / 2.0)
+    pause_progress, is_paused = progress_at_elapsed(schedule, pause_midpoint)
+
+    assert progresses[0] == pytest.approx(0.0, abs=1e-6)
+    assert progresses[-1] == pytest.approx(1.0, abs=1e-6)
+    assert progresses == sorted(progresses)
+    assert is_paused is True
+    assert pause_progress == pytest.approx(paused_segment.progress_end, abs=1e-6)
+
+
 class _FakeProvider:
     def __init__(self, name, behaviour):
         self.name = name

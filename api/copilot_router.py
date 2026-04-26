@@ -183,6 +183,8 @@ GBFS_STATION_INFO_URL = "https://gbfs.citibikenyc.com/gbfs/en/station_informatio
 GBFS_STATION_STATUS_URL = "https://gbfs.citibikenyc.com/gbfs/en/station_status.json"
 OPENCHARGEMAP_URL = "https://api.openchargemap.io/v3/poi/"
 OPENCHARGEMAP_API_KEY = os.getenv("OPENCHARGEMAP_API_KEY", "").strip()
+NYC_EV_OPEN_DATA_URL = "https://data.cityofnewyork.us/resource/fc53-9hrv.json"
+NYC_OPEN_DATA_APP_TOKEN = os.getenv("NYC_OPEN_DATA_APP_TOKEN", "").strip()
 
 # NYC bounding box covers all 5 boroughs
 NYC_LAT_MIN, NYC_LAT_MAX = 40.49, 40.92
@@ -480,6 +482,18 @@ def _as_float(value: Any, default: float) -> float:
         return default
     if not math.isfinite(out):
         return default
+    return out
+
+
+def _as_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(out):
+        return None
     return out
 
 
@@ -1203,13 +1217,13 @@ def _coach_reasons_from_offer(offer: dict[str, Any]) -> list[str]:
     if accept_score >= 0.75:
         _append_unique_reason(reasons, f"High copilot confidence ({round(accept_score * 100)}%).")
     if target_gap >= 0.5:
-        _append_unique_reason(reasons, f"Above your target by {round(target_gap, 1)} EUR/h.")
+        _append_unique_reason(reasons, f"Above your target by ${round(target_gap, 1)}/h.")
     if fuel_cost >= 0.0 and fuel_cost <= 1.8:
         _append_unique_reason(reasons, f"Estimated fuel cost stays low at ${round(fuel_cost, 2)}.")
     if route_duration > 0.0 and route_duration <= 18.0:
         _append_unique_reason(reasons, f"Fast full route ({round(route_duration, 1)} min total).")
     if distance_to_pickup > 0.0 and distance_to_pickup <= 1.5:
-        _append_unique_reason(reasons, f"Pickup is close ({round(distance_to_pickup, 1)} km away).")
+        _append_unique_reason(reasons, f"Restaurant is close ({round(distance_to_pickup, 1)} km away).")
     if traffic_factor <= 1.08:
         _append_unique_reason(reasons, "Traffic is still manageable on this route.")
 
@@ -1246,7 +1260,7 @@ def _coach_warning_from_offer(offer: dict[str, Any]) -> str | None:
     if fuel_cost >= 2.8:
         return "Fuel burn is noticeable on this run."
     if target_gap < -1.0:
-        return "This order sits below your current hourly target."
+        return "This delivery sits below your current hourly target."
     if route_source not in {"osrm", "hold"}:
         return "Routing is estimated rather than OSRM-verified."
     return None
@@ -1360,9 +1374,9 @@ async def _build_offer_driver_brief(
         "dropoff": enriched.get("dropoff"),
         "zone": enriched.get("zone"),
         "coach_headline": (
-            f"Best order now: +{round(_as_float(offer.get('target_gap_eur_h'), 0.0), 1)} EUR/h above target"
+            f"Best delivery now: +${round(_as_float(offer.get('target_gap_eur_h'), 0.0), 1)}/h above target"
             if _as_float(offer.get("target_gap_eur_h"), 0.0) >= 0.5
-            else "Best order right now with balanced profit and ETA"
+            else "Best delivery right now with balanced profit and ETA"
         ),
         "coach_reasons": _coach_reasons_from_offer(offer),
         "coach_warning": _coach_warning_from_offer(offer),
@@ -1392,7 +1406,7 @@ def _build_reposition_driver_brief(reposition: dict[str, Any]) -> dict[str, Any]
     if _as_float(reposition.get("dispatch_score"), 0.0) >= 0.65:
         _append_unique_reason(reasons, "This is the strongest nearby market move.")
     if net_gain > 0.0:
-        _append_unique_reason(reasons, f"Projected upside beats staying put by {round(net_gain, 1)} EUR/h.")
+        _append_unique_reason(reasons, f"Projected upside beats staying put by ${round(net_gain, 1)}/h.")
     if eta_min > 0.0 and eta_min <= 12.0:
         _append_unique_reason(reasons, f"Reposition ETA stays short at {round(eta_min, 1)} min.")
     if forecast_pressure >= 1.1:
@@ -1484,9 +1498,9 @@ def _build_hold_driver_brief(next_zone: dict[str, Any] | None, *, warning: str |
             if next_zone
             else None
         ),
-        "coach_headline": "Hold position and wait for the next strong order",
+        "coach_headline": "Hold position and wait for the next strong delivery",
         "coach_reasons": reasons[:3],
-        "coach_warning": warning or "No order currently beats a smart wait-and-see move.",
+        "coach_warning": warning or "No delivery currently beats a smart wait-and-see move.",
         "reason_codes": ["HOLD"],
         "raw": {},
     }
@@ -1594,6 +1608,21 @@ async def _select_driver_brief_context(redis_client: aioredis.Redis, requested_d
         "source_summary": source,
         "note": note,
     }
+
+
+async def _resolve_live_driver_source_id(
+    redis_client: aioredis.Redis,
+    requested_driver_id: str,
+    *,
+    prefer_alias: bool,
+) -> tuple[str, bool]:
+    if not prefer_alias:
+        return requested_driver_id, False
+    context = await _select_driver_brief_context(redis_client, requested_driver_id)
+    return (
+        str(context.get("source_driver_id") or requested_driver_id),
+        bool(context.get("alias_active")),
+    )
 
 
 def _zone_candidate_market_score(zone: dict[str, Any]) -> float:
@@ -1706,7 +1735,7 @@ def _build_market_shift_items(
                 if eta_min > 0.0
                 else "The copilot can pivot here as soon as demand firms up."
             ),
-            f"This move protects a {round(target_hourly_eur, 1)} EUR/h target.",
+            f"This move protects a ${round(target_hourly_eur, 1)}/h target.",
         ]
         items.append(
             {
@@ -1758,6 +1787,170 @@ def _gbfs_zone_to_market_summary(zone: dict[str, Any], *, hot: bool) -> dict[str
     }
 
 
+def _dedupe_text_items(items: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        label = str(item or "").strip()
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        out.append(label)
+    return out
+
+
+def _derive_data_quality_health(
+    data_quality: dict[str, Any],
+    *,
+    tlc_replay_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    replay_mode = str((tlc_replay_context or {}).get("mode") or "")
+    single_driver_demo = replay_mode == "single_driver"
+    supply_flat_alert = bool(data_quality.get("supply_flat_alert"))
+    supply_flat_effective = supply_flat_alert and not single_driver_demo
+    stale_sources_count = int(_as_float(data_quality.get("stale_sources_count"), 0.0))
+    stale_dot_speeds = bool(data_quality.get("stale_dot_speeds"))
+    dot_speeds_status = str(data_quality.get("dot_speeds_status") or "")
+    dot_speeds_rows = int(_as_float(data_quality.get("dot_speeds_rows"), 0.0))
+    dot_speeds_optional = (
+        stale_dot_speeds
+        or (dot_speeds_status in {"", "degraded"} and dot_speeds_rows == 0)
+    )
+    effective_stale_sources_count = max(0, stale_sources_count - (1 if stale_dot_speeds else 0))
+
+    monitoring_flags: list[str] = []
+    notes: list[str] = []
+    optional_sources: list[str] = []
+    if single_driver_demo:
+        notes.append("Single-driver demo keeps supply variance nearly flat by design.")
+    if supply_flat_effective:
+        monitoring_flags.append("supply_flat")
+        notes.append("Supply signal appears flatter than expected for a multi-driver fleet.")
+    if dot_speeds_optional:
+        optional_sources.append("nyc_dot_speeds")
+        notes.append("NYC DOT live speed feed is optional; traffic falls back to advisory and event signals.")
+    elif dot_speeds_status and dot_speeds_status not in {"ok", "fresh"}:
+        monitoring_flags.append("dot_speeds")
+        notes.append("NYC DOT live speed feed is reporting a degraded state.")
+    if effective_stale_sources_count > 0:
+        monitoring_flags.append("core_context_fallback")
+        notes.append(f"{effective_stale_sources_count} core context source(s) are served from fallback snapshots.")
+
+    status = "monitoring" if monitoring_flags else "ok"
+    context_summary = (
+        "Context monitored"
+        if status == "monitoring"
+        else "Fallback stable"
+        if bool(data_quality.get("context_fallback_applied")) and optional_sources
+        else "Context fresh"
+    )
+    data_quality.update(
+        {
+            "status": status,
+            "context_summary": context_summary,
+            "supply_signal_mode": "single_driver_demo" if single_driver_demo else "fleet_live",
+            "supply_flat_effective": supply_flat_effective,
+            "effective_stale_sources_count": effective_stale_sources_count,
+            "optional_sources": optional_sources,
+            "notes": _dedupe_text_items(notes),
+            "monitoring_flags": monitoring_flags,
+        }
+    )
+    return data_quality
+
+
+def _derive_routing_health(routing_quality: dict[str, Any]) -> dict[str, Any]:
+    route_requests = int(_as_float(routing_quality.get("route_requests"), 0.0))
+    state = str(routing_quality.get("state") or "")
+    routing_degraded = bool(routing_quality.get("routing_degraded"))
+    routing_success_rate = routing_quality.get("routing_success_rate")
+    hold_rate = routing_quality.get("hold_rate")
+    note = ""
+    if routing_degraded:
+        status = "degraded"
+        note = str(routing_quality.get("routing_last_error") or "Routing fallback active.")
+    elif state and route_requests == 0:
+        status = "warming_up"
+        note = "Replay warming up; first route samples are still pending."
+    elif routing_success_rate is None:
+        status = "idle"
+    else:
+        routing_threshold = float(QUALITY_ALERT_THRESHOLDS["routing_success_rate_min"])
+        hold_threshold = float(QUALITY_ALERT_THRESHOLDS["hold_rate_max"])
+        if float(routing_success_rate) < routing_threshold or (
+            hold_rate is not None and float(hold_rate) > hold_threshold
+        ):
+            status = "monitoring"
+            note = "Routing quality is under watch."
+        else:
+            status = "ok"
+    routing_quality.update(
+        {
+            "status": status,
+            "ready": status in {"ok", "warming_up", "idle"},
+            "note": note,
+        }
+    )
+    return routing_quality
+
+
+def _derive_demo_readiness(
+    *,
+    model_loaded: bool,
+    model_gate: dict[str, Any],
+    tlc_replay_context: dict[str, Any],
+    data_quality: dict[str, Any],
+    routing_quality: dict[str, Any],
+) -> dict[str, Any]:
+    blocking_issues: list[str] = []
+    monitoring_notes: list[str] = []
+    notes: list[str] = list(data_quality.get("notes") or [])
+
+    if not model_loaded:
+        blocking_issues.append("model_unavailable")
+        notes.append("ML model is offline; heuristic fallback only.")
+    if not bool(model_gate.get("accepted", True)):
+        blocking_issues.append("model_quality_gate")
+        notes.append("Model quality gate is flagged.")
+    routing_status = str(routing_quality.get("status") or "")
+    if routing_status == "degraded":
+        blocking_issues.append("routing_degraded")
+        if routing_quality.get("note"):
+            notes.append(str(routing_quality.get("note")))
+    elif routing_status in {"warming_up", "monitoring"} and routing_quality.get("note"):
+        monitoring_notes.append(str(routing_quality.get("note")))
+
+    replay_status = str(tlc_replay_context.get("status") or "")
+    replay_state = str(tlc_replay_context.get("state") or "")
+    replay_mode = str(tlc_replay_context.get("mode") or "")
+    if replay_mode == "single_driver" and replay_state:
+        notes.append("Single-driver replay is active.")
+    elif replay_status and replay_status not in {"ok", "running"}:
+        monitoring_notes.append("Replay status is still catching up.")
+
+    if str(data_quality.get("status") or "") == "monitoring":
+        monitoring_notes.append(str(data_quality.get("context_summary") or "Context monitored."))
+
+    notes.extend(monitoring_notes)
+    notes = _dedupe_text_items(notes)
+    if blocking_issues:
+        status = "degraded"
+        summary = "Attention needed before demo"
+    elif monitoring_notes:
+        status = "monitoring"
+        summary = "Demo ready — monitoring non-blocking signals"
+    else:
+        status = "ok"
+        summary = "Demo ready"
+    return {
+        "ready": not blocking_issues,
+        "status": status,
+        "summary": summary,
+        "blocking_issues": blocking_issues,
+        "notes": notes,
+    }
+
+
 def _build_quality_badges(health: dict[str, Any] | None) -> list[dict[str, str]]:
     if not isinstance(health, dict):
         return [{"code": "health_partial", "label": "System snapshot partial", "tone": "warn"}]
@@ -1767,6 +1960,18 @@ def _build_quality_badges(health: dict[str, Any] | None) -> list[dict[str, str]]
     tlc_replay = health.get("tlc_replay") or {}
     fuel_ctx = health.get("fuel_context") or {}
     data_quality = health.get("data_quality") or {}
+    routing_quality = health.get("routing_quality") or {}
+    demo_readiness = health.get("demo_readiness") or {}
+
+    if demo_readiness.get("summary"):
+        demo_status = str(demo_readiness.get("status") or "")
+        badges.append(
+            {
+                "code": "demo_readiness",
+                "label": str(demo_readiness.get("summary")),
+                "tone": "good" if demo_status == "ok" else "warn" if demo_readiness.get("ready") else "bad",
+            }
+        )
 
     badges.append(
         {
@@ -1776,15 +1981,29 @@ def _build_quality_badges(health: dict[str, Any] | None) -> list[dict[str, str]]
         }
     )
 
+    routing_status = str(routing_quality.get("status") or "")
     linear_fallback = int(_as_float(tlc_replay.get("route_linear_fallback"), 0.0))
     hold_fallback = int(_as_float(tlc_replay.get("route_hold_fallback"), 0.0))
     route_errors = int(_as_float(tlc_replay.get("route_osrm_errors"), 0.0))
-    routing_green = linear_fallback == 0 and hold_fallback == 0 and route_errors == 0
+    routing_green = (
+        linear_fallback == 0
+        and hold_fallback == 0
+        and route_errors == 0
+        and routing_status not in {"degraded", "monitoring"}
+    )
     badges.append(
         {
             "code": "routing_quality",
-            "label": "Routing green" if routing_green else "Routing degraded",
-            "tone": "good" if routing_green else "warn",
+            "label": (
+                "Routing green"
+                if routing_green
+                else "Routing warm-up"
+                if routing_status == "warming_up"
+                else "Routing monitored"
+                if routing_status == "monitoring"
+                else "Routing degraded"
+            ),
+            "tone": "good" if routing_green else "warn" if routing_status in {"warming_up", "monitoring"} else "bad",
         }
     )
 
@@ -1797,12 +2016,21 @@ def _build_quality_badges(health: dict[str, Any] | None) -> list[dict[str, str]]
         }
     )
 
-    stale_count = int(_as_float(data_quality.get("stale_sources_count"), 0.0))
+    stale_count = int(
+        _as_float(
+            data_quality.get("effective_stale_sources_count"),
+            data_quality.get("stale_sources_count") or 0.0,
+        )
+    )
+    dq_status = str(data_quality.get("status") or "")
     badges.append(
         {
             "code": "context_freshness",
-            "label": "Context fresh" if stale_count <= 1 else f"{stale_count} stale sources",
-            "tone": "good" if stale_count <= 1 else "warn",
+            "label": str(
+                data_quality.get("context_summary")
+                or ("Context fresh" if stale_count <= 1 else f"{stale_count} stale sources")
+            ),
+            "tone": "good" if dq_status in {"", "ok"} and stale_count <= 1 else "warn",
         }
     )
     return badges
@@ -2172,6 +2400,83 @@ def _zone_id(lat: float, lon: float) -> str:
     return f"{lat_cell:.3f}_{lon_cell:.3f}"
 
 
+def _sanitize_station_id(value: str, *, fallback: str) -> str:
+    raw = (value or "").strip().lower()
+    cleaned = "".join(ch if ch.isalnum() else "_" for ch in raw)
+    compact = "_".join(token for token in cleaned.split("_") if token)
+    return compact[:96] or fallback
+
+
+def _charger_power_kw(charger_type: str) -> float:
+    label = (charger_type or "").strip().lower()
+    if "dc fast" in label or "fast charger" in label:
+        return 50.0
+    if "level 2" in label:
+        return 7.2
+    if "level 1" in label:
+        return 1.4
+    return 0.0
+
+
+def _normalize_openchargemap_station(poi: dict[str, Any], *, fallback_index: int) -> dict[str, Any] | None:
+    addr = (poi.get("AddressInfo") or {})
+    try:
+        lat = float(addr.get("Latitude") or 0.0)
+        lon = float(addr.get("Longitude") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if not (NYC_LAT_MIN <= lat <= NYC_LAT_MAX and NYC_LON_MIN <= lon <= NYC_LON_MAX):
+        return None
+
+    station_id = str(poi.get("ID") or f"ocm_{fallback_index}")
+    station_name = (addr.get("Title") or "").strip()
+    connections = poi.get("Connections") or []
+    max_kw = 0.0
+    for connection in connections:
+        try:
+            max_kw = max(max_kw, float(connection.get("PowerKW") or 0.0))
+        except (TypeError, ValueError):
+            continue
+    return {
+        "station_id": station_id,
+        "lat": lat,
+        "lon": lon,
+        "nom": station_name[:100],
+        "puissance_kw": max_kw,
+        "zone_id": _zone_id(lat, lon),
+        "source": "openchargemap_nyc",
+    }
+
+
+def _normalize_nyc_ev_station(row: dict[str, Any], *, fallback_index: int) -> dict[str, Any] | None:
+    try:
+        lat = float(row.get("latitude") or 0.0)
+        lon = float(row.get("longitude") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if not (NYC_LAT_MIN <= lat <= NYC_LAT_MAX and NYC_LON_MIN <= lon <= NYC_LON_MAX):
+        return None
+
+    station_name = (row.get("station_name") or "").strip()
+    street = (row.get("street") or "").strip()
+    borough = (row.get("borough") or "").strip()
+    charger_type = (row.get("type_of_charger") or "").strip()
+    label = " - ".join(part for part in (station_name, street or borough, charger_type) if part)
+    station_id = _sanitize_station_id(
+        f"{station_name}_{street}_{lat:.5f}_{lon:.5f}_{charger_type}",
+        fallback=f"nyc_ev_{fallback_index}",
+    )
+    return {
+        "station_id": station_id,
+        "lat": lat,
+        "lon": lon,
+        "nom": (label or station_name or f"NYC EV Station {fallback_index}")[:100],
+        "puissance_kw": _charger_power_kw(charger_type),
+        "zone_id": _zone_id(lat, lon),
+        "source": "nyc_open_data_ev_stations",
+    }
+
+
 async def _gbfs_loop(app) -> None:
     """Poll Citi Bike GBFS station_status every 60s and materialize zone-level demand signals."""
     await asyncio.sleep(5)
@@ -2223,8 +2528,8 @@ async def _gbfs_loop(app) -> None:
                     docks = zone_docks.get(zid, [0])
                     total_capacity = sum(bikes) + sum(docks)
                     occupancy = sum(bikes) / max(total_capacity, 1)
-                    # High occupancy = lots of bikes = low taxi demand (people have bikes)
-                    # Low occupancy = no bikes = people need transport = higher taxi demand
+                    # High occupancy = lots of bikes = lower delivery demand boost
+                    # Low occupancy = no bikes = people need alternatives = higher delivery demand boost
                     demand_boost = max(0.0, 1.0 - occupancy) * 0.5
                     key = f"copilot:context:gbfs:zone:{zid}"
                     pipe.hset(key, mapping={
@@ -2271,10 +2576,11 @@ async def _gbfs_loop(app) -> None:
 
 
 async def _irve_loop(app) -> None:
-    """Load NYC EV charging stations from OpenChargeMap and store in Redis.
+    """Load NYC EV charging stations and store them in Redis.
 
-    Refreshes every 6h. Field name "irve" is kept for Redis key compatibility;
-    the source is OpenChargeMap (NYC).
+    Field name "irve" is kept for Redis key compatibility even though the
+    dataset is now sourced from NYC EV station feeds first when OCM is missing
+    or degraded.
     """
     await asyncio.sleep(10)
 
@@ -2292,53 +2598,63 @@ async def _irve_loop(app) -> None:
     headers = {"User-Agent": "FleetStream/1.0 (driver-revenue-copilot)"}
     if OPENCHARGEMAP_API_KEY:
         headers["X-API-Key"] = OPENCHARGEMAP_API_KEY
+    nyc_headers = {"User-Agent": "FleetStream/1.0 (driver-revenue-copilot)"}
+    if NYC_OPEN_DATA_APP_TOKEN:
+        nyc_headers["X-App-Token"] = NYC_OPEN_DATA_APP_TOKEN
 
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         while True:
             try:
-                resp = await client.get(OPENCHARGEMAP_URL, params=params, headers=headers)
-                resp.raise_for_status()
-                stations = resp.json()
-                if not isinstance(stations, list):
-                    stations = []
+                normalized_stations: list[dict[str, Any]] = []
+                source_name = "openchargemap_nyc"
+
+                if OPENCHARGEMAP_API_KEY:
+                    try:
+                        resp = await client.get(OPENCHARGEMAP_URL, params=params, headers=headers)
+                        resp.raise_for_status()
+                        stations = resp.json()
+                        if not isinstance(stations, list):
+                            stations = []
+                        for idx, poi in enumerate(stations):
+                            normalized = _normalize_openchargemap_station(poi, fallback_index=idx)
+                            if normalized is not None:
+                                normalized_stations.append(normalized)
+                    except Exception as exc:
+                        logger.warning("openchargemap load failed, fallback NYC Open Data: %s", exc)
+
+                if not normalized_stations:
+                    source_name = "nyc_open_data_ev_stations"
+                    resp = await client.get(
+                        NYC_EV_OPEN_DATA_URL,
+                        params={"$limit": 5000},
+                        headers=nyc_headers,
+                    )
+                    resp.raise_for_status()
+                    stations = resp.json()
+                    if not isinstance(stations, list):
+                        stations = []
+                    for idx, row in enumerate(stations):
+                        normalized = _normalize_nyc_ev_station(row, fallback_index=idx)
+                        if normalized is not None:
+                            normalized_stations.append(normalized)
 
                 r = app.state.redis
                 pipe = r.pipeline(transaction=False)
                 count = 0
 
-                for poi in stations:
-                    addr = (poi.get("AddressInfo") or {})
-                    try:
-                        lat = float(addr.get("Latitude") or 0)
-                        lon = float(addr.get("Longitude") or 0)
-                    except (ValueError, TypeError):
-                        continue
-
-                    if not (NYC_LAT_MIN <= lat <= NYC_LAT_MAX and NYC_LON_MIN <= lon <= NYC_LON_MAX):
-                        continue
-
-                    station_id = str(poi.get("ID") or f"ocm_{count}")
-                    nom = (addr.get("Title") or "")[:100]
-                    connections = poi.get("Connections") or []
-                    max_kw = 0.0
-                    for c in connections:
-                        try:
-                            pw = float(c.get("PowerKW") or 0)
-                            if pw > max_kw:
-                                max_kw = pw
-                        except (ValueError, TypeError):
-                            continue
-                    zid = _zone_id(lat, lon)
-
+                for station in normalized_stations:
+                    station_id = station["station_id"]
+                    lat = float(station["lat"])
+                    lon = float(station["lon"])
                     key = f"copilot:context:irve:station:{station_id}"
                     pipe.hset(key, mapping={
                         "station_id": station_id,
                         "lat": lat,
                         "lon": lon,
-                        "nom": nom,
-                        "puissance_kw": str(max_kw),
-                        "zone_id": zid,
-                        "source": "openchargemap",
+                        "nom": station["nom"],
+                        "puissance_kw": str(station["puissance_kw"]),
+                        "zone_id": station["zone_id"],
+                        "source": station["source"],
                         "updated_at": str(asyncio.get_event_loop().time()),
                     })
                     pipe.expire(key, 86400)
@@ -2352,14 +2668,14 @@ async def _irve_loop(app) -> None:
                 await r.hset(IRVE_KEY, mapping={
                     "status": "ok",
                     "stations_loaded": str(count),
-                    "source": "openchargemap_nyc",
+                    "source": source_name,
                     "updated_at": str(asyncio.get_event_loop().time()),
                 })
                 await r.expire(IRVE_KEY, 86400)
-                logger.info("openchargemap loaded %d EV charging stations in NYC area", count)
+                logger.info("%s loaded %d EV charging stations in NYC area", source_name, count)
 
             except Exception as exc:
-                logger.warning("openchargemap load failed: %s", exc)
+                logger.warning("ev station load failed: %s", exc)
                 try:
                     await app.state.redis.hset(IRVE_KEY, mapping={
                         "status": f"degraded:{type(exc).__name__}",
@@ -3080,16 +3396,23 @@ async def best_offers_around(
     ),
 ):
     redis_client: aioredis.Redis = request.app.state.redis
+    source_driver_id, alias_active = await _resolve_live_driver_source_id(
+        redis_client,
+        driver_id,
+        prefer_alias=lat is None or lon is None,
+    )
     driver_profile = await _resolve_driver_profile(redis_client, driver_id)
     objective_override = _has_objective_weight_override(w_gain=w_gain, w_time=w_time, w_fuel=w_fuel)
     objective_weights = _resolve_objective_weights(w_gain=w_gain, w_time=w_time, w_fuel=w_fuel)
 
-    lat, lon = await _resolve_driver_origin(redis_client, driver_id, lat, lon)
+    lat, lon = await _resolve_driver_origin(redis_client, source_driver_id, lat, lon)
 
-    offer_ids = await redis_client.lrange(f"{DRIVER_OFFERS_PREFIX}{driver_id}:offers", 0, scan_limit - 1)
+    offer_ids = await redis_client.lrange(f"{DRIVER_OFFERS_PREFIX}{source_driver_id}:offers", 0, scan_limit - 1)
     if not offer_ids:
         return {
             "driver_id": driver_id,
+            "source_driver_id": source_driver_id,
+            "alias_active": alias_active,
             "origin": {"lat": lat, "lon": lon},
             "radius_km": radius_km,
             "count": 0,
@@ -3113,7 +3436,7 @@ async def best_offers_around(
                 continue
 
             payload = dict(off)
-            payload["courier_id"] = payload.get("courier_id") or driver_id
+            payload["courier_id"] = payload.get("courier_id") or source_driver_id
             payload["courier_lat"] = lat
             payload["courier_lon"] = lon
             payload["use_osrm"] = use_osrm
@@ -3230,6 +3553,8 @@ async def best_offers_around(
 
     return {
         "driver_id": driver_id,
+        "source_driver_id": source_driver_id,
+        "alias_active": alias_active,
         "origin": {"lat": round(float(lat), 6), "lon": round(float(lon), 6)},
         "radius_km": radius_km,
         "ranked_by": rank_by,
@@ -3261,6 +3586,11 @@ async def instant_dispatch(
     ),
 ):
     redis_client: aioredis.Redis = request.app.state.redis
+    source_driver_id, alias_active = await _resolve_live_driver_source_id(
+        redis_client,
+        driver_id,
+        prefer_alias=lat is None or lon is None,
+    )
     driver_profile = await _resolve_driver_profile(redis_client, driver_id)
     query_keys = set(request.query_params.keys())
     if "target_hourly_net_eur" not in query_keys and target_hourly_net_eur is None:
@@ -3272,7 +3602,7 @@ async def instant_dispatch(
             _as_float(driver_profile.get("aversion_risque"), DRIVER_PROFILE_DEFAULT_RISK_AVERSION)
         )
 
-    lat, lon = await _resolve_driver_origin(redis_client, driver_id, lat, lon)
+    lat, lon = await _resolve_driver_origin(redis_client, source_driver_id, lat, lon)
 
     around_payload = await best_offers_around(
         request,
@@ -3291,7 +3621,17 @@ async def instant_dispatch(
     local_best = local_offers[0] if local_offers else None
 
     zone_scan_size = min(50, max(zone_top_k * 3, zone_top_k + 4))
-    zone_payload = await next_best_zone(request, driver_id, top_k=zone_scan_size, lat=lat, lon=lon)
+    zone_payload = await next_best_zone(
+        request,
+        driver_id,
+        top_k=zone_scan_size,
+        lat=lat,
+        lon=lon,
+        home_lat=None,
+        home_lon=None,
+        max_distance_km=None,
+        distance_weight=0.0,
+    )
     zones_raw = zone_payload.get("recommendations", [])
     zones = [zone for zone in zones_raw if isinstance(zone, dict)]
 
@@ -3496,6 +3836,8 @@ async def instant_dispatch(
 
     return {
         "driver_id": driver_id,
+        "source_driver_id": source_driver_id,
+        "alias_active": alias_active,
         "origin": {"lat": round(float(lat), 6), "lon": round(float(lon), 6)},
         "decision": decision,
         "confidence": round(float(confidence), 4),
@@ -3804,8 +4146,13 @@ async def shift_plan(
         raise HTTPException(status_code=422, detail="horizon_min must be 60 or 90")
 
     redis_client: aioredis.Redis = request.app.state.redis
+    source_driver_id, _alias_active = await _resolve_live_driver_source_id(
+        redis_client,
+        driver_id,
+        prefer_alias=lat is None or lon is None,
+    )
     driver_profile = await _resolve_driver_profile(redis_client, driver_id)
-    driver_lat, driver_lon = await _resolve_driver_origin(redis_client, driver_id, lat, lon)
+    driver_lat, driver_lon = await _resolve_driver_origin(redis_client, source_driver_id, lat, lon)
 
     zones = await _load_zone_context_payloads(redis_client)
     if not zones:
@@ -3955,13 +4302,29 @@ async def next_best_zone(
     distance_weight: float = Query(0.0, ge=0.0, le=1.0, description="Pénalité distance (0=off, 0.3=modéré, 0.6=agressif)."),
 ):
     redis_client: aioredis.Redis = request.app.state.redis
+    try:
+        top_k = int(top_k)
+    except (TypeError, ValueError):
+        top_k = 5
+    top_k = max(1, min(20, top_k))
+    lat = _as_optional_float(lat)
+    lon = _as_optional_float(lon)
+    home_lat = _as_optional_float(home_lat)
+    home_lon = _as_optional_float(home_lon)
+    max_distance_km = _as_optional_float(max_distance_km)
+    distance_weight = _clamp(_as_float(distance_weight, 0.0), 0.0, 1.0)
+    source_driver_id, alias_active = await _resolve_live_driver_source_id(
+        redis_client,
+        driver_id,
+        prefer_alias=lat is None or lon is None,
+    )
 
     zones = await _load_zone_context_payloads(redis_client)
 
     driver_lat: float | None = lat
     driver_lon: float | None = lon
     if driver_lat is None or driver_lon is None:
-        state = await redis_client.hgetall(f"{COURIER_HASH_PREFIX}{driver_id}")
+        state = await redis_client.hgetall(f"{COURIER_HASH_PREFIX}{source_driver_id}")
         if state:
             lat_val = _as_float(state.get("lat"), 0.0)
             lon_val = _as_float(state.get("lon"), 0.0)
@@ -3987,6 +4350,8 @@ async def next_best_zone(
 
     return {
         "driver_id": driver_id,
+        "source_driver_id": source_driver_id,
+        "alias_active": alias_active,
         "driver_lat": driver_lat,
         "driver_lon": driver_lon,
         "home_lat": home_lat,
@@ -4744,7 +5109,7 @@ async def irve_nearby(
 
 @copilot_router.get("/gbfs/zones")
 async def gbfs_zones(request: Request, top_k: int = Query(20, ge=1, le=100)):
-    """Return Citi Bike zone signals sorted by demand boost (proxy for taxi demand)."""
+    """Return Citi Bike zone signals sorted by demand boost (proxy for delivery demand)."""
     redis_client: aioredis.Redis = request.app.state.redis
     zones = []
     async for key in redis_client.scan_iter(match="copilot:context:gbfs:zone:*"):
@@ -4840,6 +5205,85 @@ async def copilot_health(request: Request):
         round(route_successes / route_requests, 4) if route_requests > 0 else None
     )
     hold_rate = round(hold_ticks / positions, 4) if positions > 0 else None
+    tlc_replay_context = dict(tlc_replay)
+    if not tlc_replay_context and single_replay:
+        tlc_replay_context = {
+            "status": "ok" if single_replay.get("state") else "off",
+            "mode": "single_driver",
+            "state": single_replay.get("state"),
+            "events": single_replay.get("positions"),
+            "positions": single_replay.get("positions"),
+            "trips": single_replay.get("trips"),
+            "updated_at": single_replay.get("updated_at"),
+        }
+
+    data_quality = {
+        "supply_key": context_quality.get("supply_key"),
+        "supply_variance": round(_as_float(context_quality.get("supply_variance"), 0.0), 6),
+        "supply_window_span": round(_as_float(context_quality.get("supply_window_span"), 0.0), 6),
+        "supply_window_cycles": int(_as_float(context_quality.get("supply_window_cycles"), 0.0)),
+        "supply_flat_alert": _as_bool(context_quality.get("supply_flat_alert"), False),
+        "traffic_nonzero_rate": round(_as_float(context_quality.get("traffic_nonzero_rate"), 0.0), 4),
+        "traffic_mean": round(_as_float(context_quality.get("traffic_mean"), 1.0), 4),
+        "sources": context_quality.get("sources"),
+        "events_source_active": _as_bool(context_quality.get("events_source_active"), False),
+        "events_rows": int(_as_float(context_quality.get("events_rows"), 0.0)),
+        "events_status": context_quality.get("events_status"),
+        "event_pressure_mean": round(_as_float(context_quality.get("event_pressure_mean"), 0.0), 4),
+        "event_pressure_max": round(_as_float(context_quality.get("event_pressure_max"), 0.0), 4),
+        "event_pressure_nonzero_rate": round(
+            _as_float(context_quality.get("event_pressure_nonzero_rate"), 0.0), 4
+        ),
+        "dot_advisory_status": context_quality.get("dot_advisory_status"),
+        "dot_advisory_rows": int(_as_float(context_quality.get("dot_advisory_rows"), 0.0)),
+        "dot_speeds_status": context_quality.get("dot_speeds_status"),
+        "dot_speeds_rows": int(_as_float(context_quality.get("dot_speeds_rows"), 0.0)),
+        "closure_pressure_mean": round(_as_float(context_quality.get("closure_pressure_mean"), 0.0), 4),
+        "closure_pressure_max": round(_as_float(context_quality.get("closure_pressure_max"), 0.0), 4),
+        "speed_pressure_mean": round(_as_float(context_quality.get("speed_pressure_mean"), 0.0), 4),
+        "speed_pressure_max": round(_as_float(context_quality.get("speed_pressure_max"), 0.0), 4),
+        "freshness_policy": context_quality.get("freshness_policy"),
+        "context_fallback_applied": _as_bool(context_quality.get("context_fallback_applied"), False),
+        "stale_sources_count": int(_as_float(context_quality.get("stale_sources_count"), 0.0)),
+        "age_gbfs_s": round(_as_float(context_quality.get("age_gbfs_s"), -1.0), 3),
+        "age_weather_s": round(_as_float(context_quality.get("age_weather_s"), -1.0), 3),
+        "age_nyc311_s": round(_as_float(context_quality.get("age_nyc311_s"), -1.0), 3),
+        "age_events_s": round(_as_float(context_quality.get("age_events_s"), -1.0), 3),
+        "age_dot_closure_s": round(_as_float(context_quality.get("age_dot_closure_s"), -1.0), 3),
+        "age_dot_speeds_s": round(_as_float(context_quality.get("age_dot_speeds_s"), -1.0), 3),
+        "stale_gbfs": _as_bool(context_quality.get("stale_gbfs"), False),
+        "stale_weather": _as_bool(context_quality.get("stale_weather"), False),
+        "stale_nyc311": _as_bool(context_quality.get("stale_nyc311"), False),
+        "stale_events": _as_bool(context_quality.get("stale_events"), False),
+        "stale_dot_closure": _as_bool(context_quality.get("stale_dot_closure"), False),
+        "stale_dot_speeds": _as_bool(context_quality.get("stale_dot_speeds"), False),
+        "updated_at": context_quality.get("updated_at"),
+    }
+    data_quality = _derive_data_quality_health(data_quality, tlc_replay_context=tlc_replay_context)
+
+    routing_quality = {
+        "driver_id": single_replay.get("driver_id"),
+        "state": single_replay.get("state"),
+        "routing_degraded": _as_bool(single_replay.get("routing_degraded"), False),
+        "routing_last_error": single_replay.get("routing_last_error"),
+        "route_requests": route_requests,
+        "route_successes": route_successes,
+        "routing_success_rate": routing_success_rate,
+        "hold_ticks": hold_ticks,
+        "hold_rate": hold_rate,
+        "routing_errors": int(_as_float(single_replay.get("routing_errors"), 0.0)),
+        "providers": [p for p in (single_replay.get("routing_providers") or "").split(",") if p],
+        "updated_at": single_replay.get("updated_at"),
+    }
+    routing_quality = _derive_routing_health(routing_quality)
+
+    demo_readiness = _derive_demo_readiness(
+        model_loaded=bool(model_payload),
+        model_gate=quality_gate,
+        tlc_replay_context=tlc_replay_context,
+        data_quality=data_quality,
+        routing_quality=routing_quality,
+    )
 
     return {
         "model_loaded": bool(model_payload),
@@ -4872,63 +5316,10 @@ async def copilot_health(request: Request):
             "fuel_sync_checked_at": fuel.get("fuel_sync_checked_at"),
             "updated_at": fuel.get("updated_at"),
         },
-        "data_quality": {
-            "supply_key": context_quality.get("supply_key"),
-            "supply_variance": round(_as_float(context_quality.get("supply_variance"), 0.0), 6),
-            "supply_window_span": round(_as_float(context_quality.get("supply_window_span"), 0.0), 6),
-            "supply_window_cycles": int(_as_float(context_quality.get("supply_window_cycles"), 0.0)),
-            "supply_flat_alert": _as_bool(context_quality.get("supply_flat_alert"), False),
-            "traffic_nonzero_rate": round(_as_float(context_quality.get("traffic_nonzero_rate"), 0.0), 4),
-            "traffic_mean": round(_as_float(context_quality.get("traffic_mean"), 1.0), 4),
-            "sources": context_quality.get("sources"),
-            "events_source_active": _as_bool(context_quality.get("events_source_active"), False),
-            "events_rows": int(_as_float(context_quality.get("events_rows"), 0.0)),
-            "events_status": context_quality.get("events_status"),
-            "event_pressure_mean": round(_as_float(context_quality.get("event_pressure_mean"), 0.0), 4),
-            "event_pressure_max": round(_as_float(context_quality.get("event_pressure_max"), 0.0), 4),
-            "event_pressure_nonzero_rate": round(
-                _as_float(context_quality.get("event_pressure_nonzero_rate"), 0.0), 4
-            ),
-            "dot_advisory_status": context_quality.get("dot_advisory_status"),
-            "dot_advisory_rows": int(_as_float(context_quality.get("dot_advisory_rows"), 0.0)),
-            "dot_speeds_status": context_quality.get("dot_speeds_status"),
-            "dot_speeds_rows": int(_as_float(context_quality.get("dot_speeds_rows"), 0.0)),
-            "closure_pressure_mean": round(_as_float(context_quality.get("closure_pressure_mean"), 0.0), 4),
-            "closure_pressure_max": round(_as_float(context_quality.get("closure_pressure_max"), 0.0), 4),
-            "speed_pressure_mean": round(_as_float(context_quality.get("speed_pressure_mean"), 0.0), 4),
-            "speed_pressure_max": round(_as_float(context_quality.get("speed_pressure_max"), 0.0), 4),
-            "freshness_policy": context_quality.get("freshness_policy"),
-            "context_fallback_applied": _as_bool(context_quality.get("context_fallback_applied"), False),
-            "stale_sources_count": int(_as_float(context_quality.get("stale_sources_count"), 0.0)),
-            "age_gbfs_s": round(_as_float(context_quality.get("age_gbfs_s"), -1.0), 3),
-            "age_weather_s": round(_as_float(context_quality.get("age_weather_s"), -1.0), 3),
-            "age_nyc311_s": round(_as_float(context_quality.get("age_nyc311_s"), -1.0), 3),
-            "age_events_s": round(_as_float(context_quality.get("age_events_s"), -1.0), 3),
-            "age_dot_closure_s": round(_as_float(context_quality.get("age_dot_closure_s"), -1.0), 3),
-            "age_dot_speeds_s": round(_as_float(context_quality.get("age_dot_speeds_s"), -1.0), 3),
-            "stale_gbfs": _as_bool(context_quality.get("stale_gbfs"), False),
-            "stale_weather": _as_bool(context_quality.get("stale_weather"), False),
-            "stale_nyc311": _as_bool(context_quality.get("stale_nyc311"), False),
-            "stale_events": _as_bool(context_quality.get("stale_events"), False),
-            "stale_dot_closure": _as_bool(context_quality.get("stale_dot_closure"), False),
-            "stale_dot_speeds": _as_bool(context_quality.get("stale_dot_speeds"), False),
-            "updated_at": context_quality.get("updated_at"),
-        },
-        "routing_quality": {
-            "driver_id": single_replay.get("driver_id"),
-            "state": single_replay.get("state"),
-            "routing_degraded": _as_bool(single_replay.get("routing_degraded"), False),
-            "routing_last_error": single_replay.get("routing_last_error"),
-            "route_requests": route_requests,
-            "route_successes": route_successes,
-            "routing_success_rate": routing_success_rate,
-            "hold_ticks": hold_ticks,
-            "hold_rate": hold_rate,
-            "routing_errors": int(_as_float(single_replay.get("routing_errors"), 0.0)),
-            "providers": [p for p in (single_replay.get("routing_providers") or "").split(",") if p],
-            "updated_at": single_replay.get("updated_at"),
-        },
-        "tlc_replay": tlc_replay,
+        "data_quality": data_quality,
+        "routing_quality": routing_quality,
+        "demo_readiness": demo_readiness,
+        "tlc_replay": tlc_replay_context,
         "events_path": str(EVENTS_PATH),
         "model_path": str(MODEL_PATH),
         "quality_alert_thresholds": QUALITY_ALERT_THRESHOLDS,
@@ -5030,7 +5421,7 @@ def _report_to_pdf(report: dict) -> bytes:
 
     pdf.set_font("Helvetica", "B", 14)
     pdf.set_text_color(20, 20, 20)
-    _cell_line(pdf, 0, 10, f"Rapport de session - Chauffeur {report['driver_id']}", align="C")
+    _cell_line(pdf, 0, 10, f"Rapport de session - Livreur {report['driver_id']}", align="C")
     pdf.set_font("Helvetica", "I", 9)
     pdf.set_text_color(100, 100, 100)
     _cell_line(pdf, 0, 6, f"Genere le {report['generated_at'][:10]}", align="C")
@@ -5047,8 +5438,8 @@ def _report_to_pdf(report: dict) -> bytes:
         "missions_count": "Missions",
         "success_rate_pct": "Taux de succes (%)",
         "avg_elapsed_min": "Duree moyenne (min)",
-        "avg_realized_delta_eur_h": "Gain moyen realise (EUR/h)",
-        "avg_predicted_delta_eur_h": "Gain moyen predit (EUR/h)",
+        "avg_realized_delta_eur_h": "Gain moyen realise (USD/h)",
+        "avg_predicted_delta_eur_h": "Gain moyen predit (USD/h)",
         "realized_win_rate_pct": "Taux missions gagnantes (%)",
         "avg_alignment_score": "Score alignement pred/realise",
     }
@@ -5267,7 +5658,7 @@ async def fleet_overview(
     min_score: float = Query(0.0, ge=0.0, le=1.0, description="Score opportunité minimum"),
     limit: int = Query(100, ge=1, le=500),
 ):
-    """Vue agrégée flotte : top chauffeurs, scores opportunité, alertes."""
+    """Vue agrégée flotte : top livreurs, scores opportunité, alertes."""
     redis_client: aioredis.Redis = request.app.state.redis
 
     zone_contexts = await _load_zone_context_payloads(redis_client)
@@ -5308,7 +5699,7 @@ async def fleet_overview(
     top_opportunities = [d for d in drivers[:10] if d["opportunity_score"] >= 0.6]
     alerts: list[dict] = []
     if n == 0:
-        alerts.append({"type": "no_active_drivers", "message": "Aucun chauffeur actif en Redis."})
+        alerts.append({"type": "no_active_drivers", "message": "Aucun livreur actif en Redis."})
 
     avg_demand = round(sum(d["demand_index"] for d in drivers) / max(n, 1), 4)
     avg_pressure = round(sum(d["pressure_ratio"] for d in drivers) / max(n, 1), 4)

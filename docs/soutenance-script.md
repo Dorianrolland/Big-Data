@@ -10,7 +10,7 @@ make up
 
 - API docs: `http://localhost:8001/docs`
 - Live map: `http://localhost:8001/map`
-- Driver Copilot app: `http://localhost:8001/copilot/driver-app`
+- Courier Copilot app: `http://localhost:8001/copilot/driver-app`
 - Copilot operator fallback: `http://localhost:8001/copilot`
 - Grafana: `http://localhost:3000`
 
@@ -35,7 +35,7 @@ pwsh ./scripts/duckdb-local.ps1 -Action events-count
 ## 4) Demonstrate copilot decisioning
 
 1. In PWA, score manual offer.
-2. Show driver offers and zone recommendations.
+2. Show courier offers and zone recommendations.
 3. Call API directly:
 
 ```bash

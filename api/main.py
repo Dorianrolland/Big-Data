@@ -1,4 +1,4 @@
-"""
+﻿"""
 FleetStream — Serving Layer API  (v2 — Senior)
 ===============================================
 Bridge Lambda Architecture : Hot Path (Redis) ↔ Cold Path (DuckDB/Parquet).
@@ -89,6 +89,7 @@ STATS_DLQ_KEY    = "fleet:stats:dlq_count"
 DLQ_KEY          = "fleet:dlq"
 DLQ_PATH         = Path(os.getenv("DLQ_PATH", "/data/dlq"))
 TLC_REPLAY_STATUS_KEY = "copilot:replay:tlc:status"
+ZONE_CONTEXT_PREFIX = "copilot:context:zone:"
 DELIVERING_STATUS_ALIASES = {"delivering", "on_trip", "busy"}
 PICKUP_STATUS_ALIASES = {"pickup_arrived", "pickup_assigned", "pickup_en_route"}
 REPOSITIONING_STATUS_ALIASES = {"repositioning"}
@@ -124,6 +125,10 @@ FLEET_INSIGHTS_TRACK_POINTS = max(
     4,
     int(float(os.getenv("FLEET_INSIGHTS_TRACK_POINTS", "12") or "12")),
 )
+HISTORY_HOT_FALLBACK_TRACK_POINTS = max(
+    FLEET_INSIGHTS_TRACK_POINTS,
+    min(64, int(float(os.getenv("HISTORY_HOT_FALLBACK_TRACK_POINTS", "64") or "64"))),
+)
 ANOMALY_STATIONARY_MIN_SECONDS = max(
     60,
     int(
@@ -135,6 +140,34 @@ ANOMALY_STATIONARY_MIN_SECONDS = max(
             or str(FLEET_INSIGHTS_STATIONARY_MIN_SECONDS)
         )
     ),
+)
+ANOMALY_DEFAULT_SPEED_THRESHOLD_KMH = max(
+    30.0,
+    float(os.getenv("ANOMALY_DEFAULT_SPEED_THRESHOLD_KMH", "65.0") or "65.0"),
+)
+ANOMALY_SPEED_MIN_EXCEEDANCES = max(
+    1,
+    int(float(os.getenv("ANOMALY_SPEED_MIN_EXCEEDANCES", "3") or "3")),
+)
+ANOMALY_ZSCORE_THRESHOLD = max(
+    2.5,
+    float(os.getenv("ANOMALY_ZSCORE_THRESHOLD", "3.0") or "3.0"),
+)
+ANOMALY_BASELINE_SPEED_CAP_KMH = max(
+    ANOMALY_DEFAULT_SPEED_THRESHOLD_KMH,
+    float(os.getenv("ANOMALY_BASELINE_SPEED_CAP_KMH", "90.0") or "90.0"),
+)
+GPS_FRAUD_MIN_INTERVAL_SECONDS = max(
+    1,
+    int(float(os.getenv("GPS_FRAUD_MIN_INTERVAL_SECONDS", "8") or "8")),
+)
+GPS_FRAUD_FROZEN_MIN_REPETITIONS = max(
+    5,
+    int(float(os.getenv("GPS_FRAUD_FROZEN_MIN_REPETITIONS", "12") or "12")),
+)
+GPS_FRAUD_FROZEN_MIN_DURATION_SECONDS = max(
+    60,
+    int(float(os.getenv("GPS_FRAUD_FROZEN_MIN_DURATION_SECONDS", "180") or "180")),
 )
 
 _focus_trail_cache: OrderedDict[str, tuple[float, list[dict[str, Any]]]] = OrderedDict()
@@ -684,6 +717,361 @@ def _parse_recent_track(raw_items: list[str] | None) -> list[dict[str, Any]]:
     return points
 
 
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r_km = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dlat / 2.0) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(dlon / 2.0) ** 2
+    )
+    return r_km * 2.0 * math.asin(math.sqrt(max(0.0, min(1.0, a))))
+
+
+def _track_points_in_window(
+    points: list[dict[str, Any]],
+    *,
+    window_start: datetime,
+    window_end: datetime,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for point in points:
+        ts = _parse_iso_timestamp(str(point.get("ts") or ""))
+        if ts is None:
+            continue
+        if ts < window_start or ts > window_end:
+            continue
+        item = dict(point)
+        item["_parsed_ts"] = ts
+        out.append(item)
+    return out
+
+
+def _best_live_frozen_streak(
+    points: list[dict[str, Any]],
+    *,
+    suspicious_statuses: set[str] | None = None,
+) -> dict[str, Any] | None:
+    suspicious_statuses = suspicious_statuses or {"delivering", "repositioning"}
+    best: dict[str, Any] | None = None
+    streak: dict[str, Any] | None = None
+
+    for point in points:
+        ts = point.get("_parsed_ts")
+        if not isinstance(ts, datetime):
+            ts = _parse_iso_timestamp(str(point.get("ts") or ""))
+        if ts is None:
+            continue
+        status = _canonical_status(point.get("status"))
+        if status not in suspicious_statuses:
+            streak = None
+            continue
+        lat = round(float(point.get("lat", 0.0) or 0.0), 5)
+        lon = round(float(point.get("lon", 0.0) or 0.0), 5)
+        if (
+            streak
+            and streak["lat"] == lat
+            and streak["lon"] == lon
+        ):
+            streak["count"] += 1
+            streak["end"] = ts
+        else:
+            streak = {
+                "lat": lat,
+                "lon": lon,
+                "count": 1,
+                "start": ts,
+                "end": ts,
+            }
+        duration_s = max(0.0, (streak["end"] - streak["start"]).total_seconds())
+        if (
+            streak["count"] >= GPS_FRAUD_FROZEN_MIN_REPETITIONS
+            and duration_s >= GPS_FRAUD_FROZEN_MIN_DURATION_SECONDS
+        ):
+            candidate = {
+                "lat": lat,
+                "lon": lon,
+                "nb_repetitions": int(streak["count"]),
+                "duration_s": int(round(duration_s)),
+                "debut": _dt_to_iso(streak["start"]),
+                "fin": _dt_to_iso(streak["end"]),
+            }
+            if (
+                best is None
+                or candidate["nb_repetitions"] > best["nb_repetitions"]
+                or (
+                    candidate["nb_repetitions"] == best["nb_repetitions"]
+                    and candidate["duration_s"] > best["duration_s"]
+                )
+            ):
+                best = candidate
+    return best
+
+
+def _float_or_default(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _zone_id_coordinates(zone_id: str | None) -> tuple[float, float] | None:
+    token = str(zone_id or "").strip()
+    if not token or "_" not in token:
+        return None
+    lat_raw, lon_raw = token.split("_", 1)
+    try:
+        return round(float(lat_raw), 6), round(float(lon_raw), 6)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_live_track_degraded(point: dict[str, Any]) -> bool:
+    route_source = str(point.get("route_source") or "").strip().lower()
+    anomaly_state = str(point.get("anomaly_state") or "ok").strip().lower()
+    return route_source == "hold" or anomaly_state not in {"", "ok"}
+
+
+def _trusted_live_motion_points(
+    points: list[dict[str, Any]],
+    *,
+    speed_cap_kmh: float,
+) -> list[dict[str, Any]]:
+    trusted: list[dict[str, Any]] = []
+    moving_statuses = {
+        "delivering",
+        "pickup_assigned",
+        "pickup_en_route",
+        "pickup_arrived",
+        "repositioning",
+    }
+    for point in points:
+        if _canonical_status(point.get("status")) not in moving_statuses:
+            continue
+        if _is_live_track_degraded(point):
+            continue
+        speed_kmh = _float_or_default(point.get("speed_kmh"), 0.0)
+        if speed_kmh < 0.0 or speed_kmh > speed_cap_kmh:
+            continue
+        trusted.append(point)
+    return trusted
+
+
+def _live_stationary_issue(
+    points: list[dict[str, Any]],
+    *,
+    speed_threshold_kmh: float,
+    min_duration_s: float,
+) -> tuple[float, int, dict[str, Any] | None]:
+    stationary_seconds, stationary_samples = _trailing_stationary_duration_seconds(
+        points,
+        speed_threshold_kmh=speed_threshold_kmh,
+    )
+    if stationary_seconds < min_duration_s or not points:
+        return 0.0, stationary_samples, None
+    frozen = _best_live_frozen_streak(points)
+    if frozen is None and not _is_live_track_degraded(points[-1]):
+        return 0.0, stationary_samples, None
+    return stationary_seconds, stationary_samples, frozen
+
+
+async def _load_live_zone_context_payloads(redis_client: aioredis.Redis) -> list[dict[str, Any]]:
+    zone_keys: list[str] = []
+    zone_hashes: list[dict[str, Any]] = []
+
+    scan_iter = getattr(redis_client, "scan_iter", None)
+    if callable(scan_iter):
+        async for key in scan_iter(match=f"{ZONE_CONTEXT_PREFIX}*"):
+            zone_keys.append(str(key))
+        if zone_keys:
+            pipe = redis_client.pipeline(transaction=False)
+            for key in zone_keys:
+                pipe.hgetall(key)
+            zone_hashes = await _run_redis(
+                pipe.execute(),
+                op_name="pipeline zone-context",
+                default=[],
+                strict=False,
+            ) or []
+    else:
+        raw_hashes = getattr(redis_client, "hashes", {})
+        if isinstance(raw_hashes, dict):
+            for key, value in raw_hashes.items():
+                key_token = str(key)
+                if not key_token.startswith(ZONE_CONTEXT_PREFIX):
+                    continue
+                zone_keys.append(key_token)
+                zone_hashes.append(value if isinstance(value, dict) else {})
+
+    zones: list[dict[str, Any]] = []
+    for key, zone in zip(zone_keys, zone_hashes):
+        if not isinstance(zone, dict) or not zone:
+            continue
+        zone_id = str(zone.get("zone_id") or key.removeprefix(ZONE_CONTEXT_PREFIX))
+        coords = _zone_id_coordinates(zone_id)
+        if coords is None:
+            continue
+        demand_index = max(0.0, _float_or_default(zone.get("demand_index"), 0.0))
+        supply_index = max(0.0, _float_or_default(zone.get("supply_index"), 0.0))
+        traffic_factor = max(0.2, _float_or_default(zone.get("traffic_factor"), 1.0))
+        demand_trend = _float_or_default(zone.get("demand_trend"), 0.0)
+        forecast_15m = max(
+            0.0,
+            _float_or_default(
+                zone.get("forecast_demand_index_15m"),
+                _float_or_default(zone.get("demand_trend_ema"), demand_index),
+            ),
+        )
+        zones.append(
+            {
+                "zone_id": zone_id,
+                "lat": coords[0],
+                "lon": coords[1],
+                "demand_index": round(demand_index, 4),
+                "supply_index": round(supply_index, 4),
+                "traffic_factor": round(traffic_factor, 4),
+                "demand_trend": round(demand_trend, 4),
+                "forecast_demand_index_15m": round(forecast_15m, 4),
+            }
+        )
+    return zones
+
+
+def _build_zone_coverage_live_fallback(
+    *,
+    zone_contexts: list[dict[str, Any]],
+    supply: dict[tuple[float, float], int],
+    resolution: float,
+    heures: int,
+    ref_meta: dict[str, Any],
+    ref_ts: datetime,
+    window_start: datetime,
+) -> dict[str, Any] | None:
+    if not zone_contexts:
+        return None
+    demand_by_cell: dict[tuple[float, float], float] = {}
+    for zone in zone_contexts:
+        cell = (
+            round(round(float(zone["lat"]) / resolution) * resolution, 4),
+            round(round(float(zone["lon"]) / resolution) * resolution, 4),
+        )
+        demand_signal = max(
+            _float_or_default(zone.get("forecast_demand_index_15m"), 0.0),
+            _float_or_default(zone.get("demand_index"), 0.0),
+        )
+        demand_by_cell[cell] = max(demand_by_cell.get(cell, 0.0), demand_signal)
+    if not demand_by_cell:
+        return None
+
+    max_demand = max(demand_by_cell.values()) or 1.0
+    max_supply = max(supply.values()) if supply else 1
+    zones: list[dict[str, Any]] = []
+    for cell, demand_signal in demand_by_cell.items():
+        drivers = int(supply.get(cell, 0) or 0)
+        demand_norm = demand_signal / max_demand
+        supply_norm = drivers / max(max_supply, 1)
+        coverage_gap = round(demand_norm - supply_norm, 3)
+        if demand_norm < 0.1:
+            continue
+        statut = (
+            "sur-couverte" if coverage_gap < -0.15 else
+            "sous-couverte" if coverage_gap > 0.20 else
+            "équilibrée"
+        )
+        zones.append(
+            {
+                "lat": cell[0],
+                "lon": cell[1],
+                "livreurs_actifs": drivers,
+                "passages_historiques": max(1, int(round(demand_signal * 100))),
+                "ecart_couverture": coverage_gap,
+                "statut": statut,
+            }
+        )
+    zones.sort(key=lambda item: item["ecart_couverture"], reverse=True)
+    sous_couvertes = [zone for zone in zones if zone["statut"] == "sous-couverte"]
+    sur_couvertes = [zone for zone in zones if zone["statut"] == "sur-couverte"]
+    return {
+        "periode_heures": heures,
+        "resolution_deg": resolution,
+        "nb_zones_analysees": len(zones),
+        "resume": {
+            "zones_sous_couvertes": len(sous_couvertes),
+            "zones_sur_couvertes": len(sur_couvertes),
+            "zones_equilibrees": len(zones) - len(sous_couvertes) - len(sur_couvertes),
+        },
+        "alertes_dispatch": {
+            "zones_prioritaires": sous_couvertes[:5],
+            "zones_saturees": sur_couvertes[:5],
+        },
+        "toutes_zones": zones,
+        "time_reference": _build_time_reference(ref_meta, ref_ts, window_start),
+    }
+
+
+def _build_predict_demand_live_fallback(
+    *,
+    zone_contexts: list[dict[str, Any]],
+    horizon_minutes: int,
+    ref_meta: dict[str, Any],
+    ref_ts: datetime,
+    recent_start: datetime,
+    baseline_start: datetime,
+) -> dict[str, Any] | None:
+    if not zone_contexts:
+        return None
+    zones: list[dict[str, Any]] = []
+    for zone in zone_contexts:
+        demand_index = max(_float_or_default(zone.get("demand_index"), 0.0), 0.1)
+        forecast = max(_float_or_default(zone.get("forecast_demand_index_15m"), demand_index), 0.0)
+        baseline = max(demand_index, 0.1)
+        trend_pct = round(((forecast - baseline) / baseline) * 100.0, 1)
+        traffic_factor = max(_float_or_default(zone.get("traffic_factor"), 1.0), 0.2)
+        signal = "hausse" if trend_pct > 15 else "baisse" if trend_pct < -15 else "stable"
+        action = (
+            "Envoyer un livreur disponible" if signal == "hausse" else
+            "Redéployer vers une zone plus active" if signal == "baisse" else
+            "Maintenir la couverture actuelle"
+        )
+        zones.append(
+            {
+                "lat": float(zone["lat"]),
+                "lon": float(zone["lon"]),
+                "activite_recente": max(1, int(round(demand_index * 12))),
+                "baseline_15min": round(baseline, 1),
+                "vitesse_recente": round(max(8.0, 18.0 / traffic_factor), 1),
+                "tendance_pct": trend_pct,
+                "signal": signal,
+                "action": action,
+            }
+        )
+    zones.sort(key=lambda item: item["tendance_pct"], reverse=True)
+    hot = [zone for zone in zones if zone["signal"] == "hausse"]
+    cold = [zone for zone in zones if zone["signal"] == "baisse"]
+    stable = [zone for zone in zones if zone["signal"] == "stable"]
+    return {
+        "horizon_minutes": horizon_minutes,
+        "methode": "Projection live issue des signaux de zone Redis (demande, offre, trafic)",
+        "nb_zones_analysees": len(zones),
+        "resume": {
+            "zones_en_hausse": len(hot),
+            "zones_stables": len(stable),
+            "zones_en_baisse": len(cold),
+        },
+        "dispatch_prioritaire": hot[:5],
+        "zones_a_decouvrir": cold[:3],
+        "toutes_zones": zones,
+        "time_reference": _build_time_reference(
+            ref_meta,
+            ref_ts,
+            recent_start,
+            {"baseline_window_start": _dt_to_iso(baseline_start)},
+        ),
+    }
+
+
 def _normalize_focus_trail_point(point: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(point, dict):
         return None
@@ -959,6 +1347,8 @@ def _analytics_status_payload(
     cached_at: float | None = None,
 ) -> dict[str, Any]:
     result = copy.deepcopy(payload)
+    if not detail:
+        result.pop("detail", None)
     result["cold_path_available"] = cold_path_available
     status: dict[str, Any] = {
         "source": source,
@@ -1055,6 +1445,57 @@ async def _resolve_reference_ts(reference_ts: str | None) -> tuple[datetime, dic
     return now_utc, {"mode": "system_now", "source": "system_clock"}
 
 
+async def _latest_hot_track_ts(redis_client: aioredis.Redis) -> datetime | None:
+    courier_ids = (
+        await _run_redis(
+            redis_client.zrange(GEO_KEY, 0, 255),
+            op_name="zrange latest-hot-track-ts",
+            default=[],
+            strict=False,
+        ) or []
+    )
+    if not courier_ids:
+        return None
+    pipe = redis_client.pipeline(transaction=False)
+    for courier_id in courier_ids:
+        pipe.lrange(f"{TRACK_KEY_PREFIX}{courier_id}", 0, 0)
+    payloads = await _run_redis(
+        pipe.execute(),
+        op_name="pipeline latest-hot-track-ts",
+        default=[],
+        strict=False,
+    ) or []
+    latest_ts: datetime | None = None
+    for raw_items in payloads:
+        points = _parse_recent_track(raw_items if isinstance(raw_items, list) else None)
+        if not points:
+            continue
+        ts = _parse_iso_timestamp(str(points[-1].get("ts") or ""))
+        if ts is None:
+            continue
+        if latest_ts is None or ts > latest_ts:
+            latest_ts = ts
+    return latest_ts
+
+
+async def _align_live_reference_ts(
+    ref_ts: datetime,
+    ref_meta: dict[str, str],
+    *,
+    redis_client: aioredis.Redis,
+) -> tuple[datetime, dict[str, str]]:
+    if ref_meta.get("mode") not in {"parquet_max_ts", "system_now"}:
+        return ref_ts, ref_meta
+    hot_ts = await _latest_hot_track_ts(redis_client)
+    if hot_ts is None:
+        return ref_ts, ref_meta
+    aligned = dict(ref_meta)
+    aligned["mode"] = "hot_track_max_ts"
+    aligned["source"] = "redis"
+    aligned["fallback_from"] = ref_meta.get("mode", "")
+    return hot_ts, aligned
+
+
 def _build_time_reference(
     base: dict[str, str],
     reference_ts: datetime,
@@ -1069,6 +1510,239 @@ def _build_time_reference(
     if extra:
         payload.update(extra)
     return payload
+
+
+def _history_resume_from_points(points: list[dict[str, Any]]) -> dict[str, Any]:
+    if not points:
+        return HistoryResume(
+            nb_points=0,
+            distance_totale_km=0.0,
+            vitesse_moy_kmh=0.0,
+            vitesse_max_kmh=0.0,
+            statut_dominant="unknown",
+            premiere_position=None,
+            derniere_position=None,
+        ).model_dump()
+    speeds = [
+        _float_or_default(point.get("speed_kmh"), 0.0)
+        for point in points
+        if point.get("speed_kmh") is not None
+    ]
+    statuses = [str(point.get("status") or "") for point in points if point.get("status")]
+    dominant = max(set(statuses), key=statuses.count) if statuses else "unknown"
+    total_km = 0.0
+    for prev_point, point in zip(points, points[1:]):
+        total_km += _haversine_km(
+            float(prev_point.get("lat", 0.0) or 0.0),
+            float(prev_point.get("lon", 0.0) or 0.0),
+            float(point.get("lat", 0.0) or 0.0),
+            float(point.get("lon", 0.0) or 0.0),
+        )
+    return HistoryResume(
+        nb_points=len(points),
+        distance_totale_km=round(total_km, 2),
+        vitesse_moy_kmh=round(statistics.mean(speeds), 1) if speeds else 0.0,
+        vitesse_max_kmh=round(max(speeds), 1) if speeds else 0.0,
+        statut_dominant=dominant,
+        premiere_position={
+            "lat": points[0].get("lat"),
+            "lon": points[0].get("lon"),
+            "ts": str(points[0].get("ts") or ""),
+        },
+        derniere_position={
+            "lat": points[-1].get("lat"),
+            "lon": points[-1].get("lon"),
+            "ts": str(points[-1].get("ts") or ""),
+        },
+    ).model_dump()
+
+
+async def _history_live_fallback_payload(
+    *,
+    redis_client: aioredis.Redis,
+    livreur_id: str,
+    heures: int,
+    ref_ts: datetime,
+    ref_meta: dict[str, str],
+) -> dict[str, Any] | None:
+    aligned_ref_ts, aligned_ref_meta = await _align_live_reference_ts(
+        ref_ts,
+        ref_meta,
+        redis_client=redis_client,
+    )
+    window_start = aligned_ref_ts - timedelta(hours=heures)
+    raw_track = await _run_redis(
+        redis_client.lrange(
+            f"{TRACK_KEY_PREFIX}{livreur_id}",
+            0,
+            min(HISTORY_HOT_FALLBACK_TRACK_POINTS, 64) - 1,
+        ),
+        op_name="lrange history fallback",
+        default=[],
+        strict=False,
+    ) or []
+    recent_track = _parse_recent_track(raw_track if isinstance(raw_track, list) else None)
+    track_window = _track_points_in_window(
+        recent_track,
+        window_start=window_start,
+        window_end=aligned_ref_ts,
+    )
+    points = track_window or recent_track
+    if not points:
+        return None
+    trajectory = [
+        {
+            "lat": point.get("lat"),
+            "lon": point.get("lon"),
+            "speed_kmh": point.get("speed_kmh"),
+            "heading_deg": point.get("heading_deg", 0.0) if isinstance(point, dict) else 0.0,
+            "status": point.get("status", "unknown"),
+            "ts": str(point.get("ts") or ""),
+            "route_source": point.get("route_source", ""),
+            "anomaly_state": point.get("anomaly_state", "ok"),
+        }
+        for point in points
+    ]
+    return {
+        "livreur_id": livreur_id,
+        "heures": heures,
+        "resume": _history_resume_from_points(points),
+        "trajectory": trajectory,
+        "time_reference": _build_time_reference(aligned_ref_meta, aligned_ref_ts, window_start),
+    }
+
+
+async def _driver_score_live_fallback_payload(
+    *,
+    redis_client: aioredis.Redis,
+    livreur_id: str,
+    heures: int,
+    ref_ts: datetime,
+    ref_meta: dict[str, str],
+) -> dict[str, Any] | None:
+    aligned_ref_ts, aligned_ref_meta = await _align_live_reference_ts(
+        ref_ts,
+        ref_meta,
+        redis_client=redis_client,
+    )
+    window_start = aligned_ref_ts - timedelta(hours=heures)
+    raw_track = await _run_redis(
+        redis_client.lrange(
+            f"{TRACK_KEY_PREFIX}{livreur_id}",
+            0,
+            min(HISTORY_HOT_FALLBACK_TRACK_POINTS, 64) - 1,
+        ),
+        op_name="lrange driver-score fallback",
+        default=[],
+        strict=False,
+    ) or []
+    recent_track = _parse_recent_track(raw_track if isinstance(raw_track, list) else None)
+    track_window = _track_points_in_window(
+        recent_track,
+        window_start=window_start,
+        window_end=aligned_ref_ts,
+    )
+    points = track_window or recent_track
+    if not points:
+        return None
+
+    speeds = [
+        _float_or_default(point.get("speed_kmh"), 0.0)
+        for point in points
+        if point.get("speed_kmh") is not None
+    ]
+    statuses = [str(point.get("status") or "idle") for point in points]
+    nb_points = len(points)
+    total = max(nb_points, 1)
+    ticks_delivering = sum(1 for status in statuses if status == "delivering")
+    ticks_available = sum(1 for status in statuses if status == "available")
+    ticks_idle = sum(1 for status in statuses if status == "idle")
+    exces_vitesse = sum(1 for speed in speeds if speed > 50.0)
+    arrets_suspects = sum(
+        1
+        for point in points
+        if _float_or_default(point.get("speed_kmh"), 0.0) < 1.0
+        and str(point.get("status") or "") == "delivering"
+    )
+    distance_km = 0.0
+    for prev_point, point in zip(points, points[1:]):
+        distance_km += _haversine_km(
+            float(prev_point.get("lat", 0.0) or 0.0),
+            float(prev_point.get("lon", 0.0) or 0.0),
+            float(point.get("lat", 0.0) or 0.0),
+            float(point.get("lon", 0.0) or 0.0),
+        )
+
+    vitesse_moy = round(statistics.mean(speeds), 1) if speeds else 0.0
+    vitesse_max = round(max(speeds), 1) if speeds else 0.0
+    vitesse_std = round(statistics.pstdev(speeds), 2) if len(speeds) > 1 else 0.0
+    taux_livraison = round(ticks_delivering / total * 100, 1)
+    taux_disponible = round(ticks_available / total * 100, 1)
+    taux_idle = round(ticks_idle / total * 100, 1)
+
+    score_productivite = min(40, round(taux_livraison * 0.4, 1))
+    penalite_vitesse = min(30, round(exces_vitesse / total * 100 * 1.5, 1))
+    score_securite = round(30 - penalite_vitesse, 1)
+    penalite_arrets = min(20, round(arrets_suspects / total * 100 * 2, 1))
+    score_fiabilite = round(20 - penalite_arrets, 1)
+    score_activite = round(max(0, 10 - taux_idle * 0.15), 1)
+    score_total = round(
+        max(0, score_productivite + score_securite + score_fiabilite + score_activite),
+        1,
+    )
+    grade = (
+        "A" if score_total >= 85 else
+        "B" if score_total >= 70 else
+        "C" if score_total >= 55 else
+        "D" if score_total >= 40 else "E"
+    )
+    return {
+        "livreur_id": livreur_id,
+        "periode_heures": heures,
+        "score_global": score_total,
+        "grade": grade,
+        "details_score": {
+            "productivite": {
+                "points": score_productivite,
+                "max": 40,
+                "detail": f"{taux_livraison}% du temps en livraison",
+            },
+            "securite": {
+                "points": score_securite,
+                "max": 30,
+                "detail": f"{exces_vitesse} enregistrement(s) >50 km/h",
+            },
+            "fiabilite": {
+                "points": score_fiabilite,
+                "max": 20,
+                "detail": f"{arrets_suspects} arrêt(s) suspects en livraison",
+            },
+            "activite": {
+                "points": score_activite,
+                "max": 10,
+                "detail": f"{taux_idle}% du temps en idle",
+            },
+        },
+        "metriques": {
+            "distance_parcourue_km": round(distance_km, 2),
+            "vitesse_moyenne_kmh": vitesse_moy,
+            "vitesse_max_kmh": vitesse_max,
+            "regularite_vitesse": vitesse_std,
+            "taux_livraison_pct": taux_livraison,
+            "taux_disponible_pct": taux_disponible,
+            "taux_idle_pct": taux_idle,
+            "exces_vitesse": exces_vitesse,
+            "arrets_suspects": arrets_suspects,
+        },
+        "interpretation": (
+            "Performance excellente — livreur exemplaire." if grade == "A" else
+            "Bonne performance — quelques axes d'amélioration." if grade == "B" else
+            "Performance correcte — suivi recommandé." if grade == "C" else
+            "Performance insuffisante — entretien RH conseillé." if grade == "D" else
+            "Performance critique — intervention requise."
+        ),
+        "time_reference": _build_time_reference(aligned_ref_meta, aligned_ref_ts, window_start),
+    }
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1644,12 +2318,16 @@ async def history(
     window_start_iso = _dt_to_iso(window_start)
     window_end_iso = _dt_to_iso(ref_ts)
     scan_sql = _parquet_scan_sql(window_start, ref_ts)
+    r: aioredis.Redis = app.state.redis
     cache_key = _analytics_cache_key(
         "history",
         livreur_id=livreur_id,
         heures=int(heures),
         reference_ts=(reference_ts or ""),
     )
+    fresh_entry = await _analytics_result_cache_get(cache_key, allow_stale=False)
+    if fresh_entry:
+        return fresh_entry[0]
     cached_entry = await _analytics_result_cache_get(cache_key, allow_stale=True)
     cached_payload = cached_entry[0] if cached_entry else None
     cached_at = cached_entry[1] if cached_entry else None
@@ -1698,25 +2376,59 @@ async def history(
         dist_row = dist_rows[0] if dist_rows else (0.0,)
 
     except HTTPException as exc:
+        if exc.status_code == 404:
+            live_payload = await _history_live_fallback_payload(
+                redis_client=r,
+                livreur_id=livreur_id,
+                heures=heures,
+                ref_ts=ref_ts,
+                ref_meta=ref_meta,
+            )
+            if live_payload is not None:
+                payload = _analytics_status_payload(
+                    live_payload,
+                    cold_path_available=False,
+                    degraded=False,
+                    source="hot_path_live",
+                )
+                await _analytics_result_cache_set(cache_key, payload)
+                return payload
         if not _analytics_should_degrade(exc):
             raise
-        detail = _analytics_exception_detail(
-            exc,
-            fallback_label="Historique trajectoire temporairement indisponible.",
-        )
         if cached_payload:
             return _analytics_status_payload(
                 cached_payload,
                 cold_path_available=False,
-                degraded=True,
+                degraded=False,
                 source="stale_cache",
-                detail=detail + " Dernier snapshot analytique conserve.",
+                detail="",
                 cached_at=cached_at,
             )
+        live_payload = await _history_live_fallback_payload(
+            redis_client=r,
+            livreur_id=livreur_id,
+            heures=heures,
+            ref_ts=ref_ts,
+            ref_meta=ref_meta,
+        )
+        if live_payload is not None:
+            payload = _analytics_status_payload(
+                live_payload,
+                cold_path_available=False,
+                degraded=False,
+                source="hot_path_live",
+            )
+            await _analytics_result_cache_set(cache_key, payload)
+            return payload
+        detail = _analytics_exception_detail(
+            exc,
+            fallback_label="Historique trajectoire temporairement indisponible.",
+        )
         return _analytics_status_payload(
             {
                 "livreur_id": livreur_id,
                 "heures": heures,
+                "resume": _history_resume_from_points([]),
                 "trajectory": [],
                 "time_reference": _build_time_reference(ref_meta, ref_ts, window_start),
             },
@@ -1726,23 +2438,40 @@ async def history(
             detail=detail,
         )
     except Exception as exc:
-        detail = _analytics_exception_detail(
-            exc,
-            fallback_label="Historique trajectoire temporairement indisponible.",
-        )
         if cached_payload:
             return _analytics_status_payload(
                 cached_payload,
                 cold_path_available=False,
-                degraded=True,
+                degraded=False,
                 source="stale_cache",
-                detail=detail + " Dernier snapshot analytique conserve.",
+                detail="",
                 cached_at=cached_at,
             )
+        live_payload = await _history_live_fallback_payload(
+            redis_client=r,
+            livreur_id=livreur_id,
+            heures=heures,
+            ref_ts=ref_ts,
+            ref_meta=ref_meta,
+        )
+        if live_payload is not None:
+            payload = _analytics_status_payload(
+                live_payload,
+                cold_path_available=False,
+                degraded=False,
+                source="hot_path_live",
+            )
+            await _analytics_result_cache_set(cache_key, payload)
+            return payload
+        detail = _analytics_exception_detail(
+            exc,
+            fallback_label="Historique trajectoire temporairement indisponible.",
+        )
         return _analytics_status_payload(
             {
                 "livreur_id": livreur_id,
                 "heures": heures,
+                "resume": _history_resume_from_points([]),
                 "trajectory": [],
                 "time_reference": _build_time_reference(ref_meta, ref_ts, window_start),
             },
@@ -1962,6 +2691,7 @@ async def fleet_insights(
     """
     r: aioredis.Redis = app.state.redis
     ref_ts, ref_meta = await _resolve_reference_ts(reference_ts)
+    ref_ts, ref_meta = await _align_live_reference_ts(ref_ts, ref_meta, redis_client=r)
     window_start = ref_ts - timedelta(hours=heures)
     scan_sql = _parquet_scan_sql(window_start, ref_ts)
     cache_key = _analytics_cache_key(
@@ -2008,6 +2738,11 @@ async def fleet_insights(
     status_counts_detail = _status_detail_counts_template()
     idle_suspects: list[dict] = []
     low_battery: list[dict] = []
+    results: list[list[Any] | tuple[Any, ...]] = []
+    hot_speed_samples: list[float] = []
+    hot_sample_count = 0
+    hot_delivering_samples = 0
+    hot_speed_alerts = 0
 
     if livreur_ids:
         pipe = r.pipeline(transaction=False)
@@ -2040,9 +2775,23 @@ async def fleet_insights(
                 status_counts[bucket] += 1
             try:
                 recent_track = _parse_recent_track(track_raw if isinstance(track_raw, list) else None)
-                stationary_seconds, stationary_samples = _trailing_stationary_duration_seconds(
+                track_window = _track_points_in_window(
                     recent_track,
+                    window_start=window_start,
+                    window_end=ref_ts,
+                )
+                for point in track_window:
+                    point_speed = float(point.get("speed_kmh", 0.0) or 0.0)
+                    hot_speed_samples.append(point_speed)
+                    hot_sample_count += 1
+                    if _canonical_status(point.get("status")) == "delivering":
+                        hot_delivering_samples += 1
+                    if point_speed > ANOMALY_DEFAULT_SPEED_THRESHOLD_KMH:
+                        hot_speed_alerts += 1
+                stationary_seconds, stationary_samples, frozen = _live_stationary_issue(
+                    track_window or recent_track,
                     speed_threshold_kmh=FLEET_INSIGHTS_STATIONARY_SPEED_KMH,
+                    min_duration_s=FLEET_INSIGHTS_STATIONARY_MIN_SECONDS,
                 )
                 if (
                     canonical_status == "delivering"
@@ -2056,6 +2805,11 @@ async def fleet_insights(
                         "immobile_duration_s": int(round(stationary_seconds)),
                         "immobile_duration_min": round(stationary_seconds / 60.0, 1),
                         "samples": stationary_samples,
+                        "reason": (
+                            "gps_frozen"
+                            if frozen is not None
+                            else "routing_hold"
+                        ),
                     })
                 # Batterie faible (<20%) → alerte opérationnelle
                 batt = float(battery or 0)
@@ -2091,6 +2845,31 @@ async def fleet_insights(
     inactivite_pct = round(
         status_counts["idle"] / total_actifs * 100 if total_actifs else 0, 1
     )
+    if not hot_speed_samples and results:
+        for vals in results:
+            if not vals:
+                continue
+            raw_status = vals[0] if len(vals) > 0 else None
+            raw_speed = vals[1] if len(vals) > 1 else 0.0
+            speed_value = float(raw_speed or 0.0)
+            hot_speed_samples.append(speed_value)
+            if _canonical_status(raw_status) == "delivering":
+                hot_delivering_samples += 1
+            if speed_value > ANOMALY_DEFAULT_SPEED_THRESHOLD_KMH:
+                hot_speed_alerts += 1
+        hot_sample_count = len(hot_speed_samples)
+
+    live_productivity_stats = {
+        "livreurs_actifs_periode": total_actifs,
+        "vitesse_moyenne_kmh": round(statistics.mean(hot_speed_samples), 1) if hot_speed_samples else 0.0,
+        "taux_livraison_pct": (
+            round(hot_delivering_samples / hot_sample_count * 100, 1)
+            if hot_sample_count
+            else utilisation_pct
+        ),
+        "alertes_vitesse_exces": hot_speed_alerts,
+        "stops_suspects_total": len(idle_suspects),
+    }
 
     # ── Cold Path : productivité historique ──────────────────────────────────
     cold_stats = {
@@ -2112,13 +2891,17 @@ async def fleet_insights(
                 ROUND(AVG(speed_kmh), 1)                                AS vitesse_moy,
                 ROUND(AVG(CASE WHEN status = 'delivering' THEN 1.0 ELSE 0.0 END) * 100, 1)
                                                                         AS taux_livraison_pct,
-                COUNT(*) FILTER (WHERE speed_kmh > 50)                  AS alertes_vitesse,
+                COUNT(*) FILTER (WHERE speed_kmh > ?)                   AS alertes_vitesse,
                 COUNT(*) FILTER (WHERE speed_kmh < 1 AND status = 'delivering')
                                                                         AS stops_suspects
             FROM {scan_sql}
             WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
             """,
-            [_dt_to_iso(window_start), _dt_to_iso(ref_ts)],
+            [
+                ANOMALY_DEFAULT_SPEED_THRESHOLD_KMH,
+                _dt_to_iso(window_start),
+                _dt_to_iso(ref_ts),
+            ],
             timeout_sec=ANALYTICS_COLD_QUERY_TIMEOUT_SECONDS,
         )
         row = rows[0] if rows else None
@@ -2131,19 +2914,17 @@ async def fleet_insights(
                 "alertes_vitesse_exces":   row[3],
                 "stops_suspects_total":    row[4],
             }
+        else:
+            cold_stats = copy.deepcopy(live_productivity_stats)
+            analytics_source = "hot_live_blended"
     except Exception as exc:
         log.warning("fleet-insights cold path error: %s", exc)
-        analytics_degraded = True
-        analytics_detail = _analytics_exception_detail(
-            exc,
-            fallback_label="Productivité historique temporairement indisponible.",
-        )
         if cached_payload and isinstance(cached_payload.get("productivite_historique"), dict):
             cold_stats = copy.deepcopy(cached_payload["productivite_historique"])
-            analytics_source = "stale_cache"
-            analytics_detail += " Dernier snapshot analytique conservé."
+            analytics_source = "stale_cache_blended"
         else:
-            analytics_source = "hot_only_fallback"
+            cold_stats = copy.deepcopy(live_productivity_stats)
+            analytics_source = "hot_live_fallback"
 
     # ── Score de santé opérationnelle (0-100) ────────────────────────────────
     score = 100
@@ -2201,7 +2982,7 @@ async def fleet_insights(
         degraded=analytics_degraded,
         source=analytics_source,
         detail=analytics_detail,
-        cached_at=cached_at if analytics_source == "stale_cache" else None,
+        cached_at=cached_at if analytics_source.startswith("stale_cache") else None,
     )
     if cold_path_available:
         await _analytics_result_cache_set(cache_key, payload)
@@ -2230,7 +3011,7 @@ def _build_recommendations(
         )
     if speed_alerts > 10:
         recs.append(
-            f"{speed_alerts} enregistrements à vitesse excessive (>50 km/h) — "
+            f"{speed_alerts} enregistrements à vitesse excessive (>{ANOMALY_DEFAULT_SPEED_THRESHOLD_KMH:.0f} km/h) — "
             "risque assurance et conformité réglementaire."
         )
     if low_batt > 5:
@@ -2269,12 +3050,16 @@ async def driver_score(
     ref_ts, ref_meta = await _resolve_reference_ts(reference_ts)
     window_start = ref_ts - timedelta(hours=heures)
     scan_sql = _parquet_scan_sql(window_start, ref_ts)
+    r: aioredis.Redis = app.state.redis
     cache_key = _analytics_cache_key(
         "driver-score",
         livreur_id=livreur_id,
         heures=int(heures),
         reference_ts=(reference_ts or ""),
     )
+    fresh_entry = await _analytics_result_cache_get(cache_key, allow_stale=False)
+    if fresh_entry:
+        return fresh_entry[0]
     cached_entry = await _analytics_result_cache_get(cache_key, allow_stale=True)
     cached_payload = cached_entry[0] if cached_entry else None
     cached_at = cached_entry[1] if cached_entry else None
@@ -2319,21 +3104,54 @@ async def driver_score(
         )
         row = rows[0] if rows else None
     except HTTPException as exc:
+        if exc.status_code == 404:
+            live_payload = await _driver_score_live_fallback_payload(
+                redis_client=r,
+                livreur_id=livreur_id,
+                heures=heures,
+                ref_ts=ref_ts,
+                ref_meta=ref_meta,
+            )
+            if live_payload is not None:
+                payload = _analytics_status_payload(
+                    live_payload,
+                    cold_path_available=False,
+                    degraded=False,
+                    source="hot_path_live",
+                )
+                await _analytics_result_cache_set(cache_key, payload)
+                return payload
         if not _analytics_should_degrade(exc):
             raise
-        detail = _analytics_exception_detail(
-            exc,
-            fallback_label="Score livreur temporairement indisponible.",
-        )
         if cached_payload:
             return _analytics_status_payload(
                 cached_payload,
                 cold_path_available=False,
-                degraded=True,
+                degraded=False,
                 source="stale_cache",
-                detail=detail + " Dernier snapshot analytique conserve.",
+                detail="",
                 cached_at=cached_at,
             )
+        live_payload = await _driver_score_live_fallback_payload(
+            redis_client=r,
+            livreur_id=livreur_id,
+            heures=heures,
+            ref_ts=ref_ts,
+            ref_meta=ref_meta,
+        )
+        if live_payload is not None:
+            payload = _analytics_status_payload(
+                live_payload,
+                cold_path_available=False,
+                degraded=False,
+                source="hot_path_live",
+            )
+            await _analytics_result_cache_set(cache_key, payload)
+            return payload
+        detail = _analytics_exception_detail(
+            exc,
+            fallback_label="Score livreur temporairement indisponible.",
+        )
         return _analytics_status_payload(
             {
                 "livreur_id": livreur_id,
@@ -2346,19 +3164,35 @@ async def driver_score(
             detail=detail,
         )
     except Exception as exc:
-        detail = _analytics_exception_detail(
-            exc,
-            fallback_label="Score livreur temporairement indisponible.",
-        )
         if cached_payload:
             return _analytics_status_payload(
                 cached_payload,
                 cold_path_available=False,
-                degraded=True,
+                degraded=False,
                 source="stale_cache",
-                detail=detail + " Dernier snapshot analytique conserve.",
+                detail="",
                 cached_at=cached_at,
             )
+        live_payload = await _driver_score_live_fallback_payload(
+            redis_client=r,
+            livreur_id=livreur_id,
+            heures=heures,
+            ref_ts=ref_ts,
+            ref_meta=ref_meta,
+        )
+        if live_payload is not None:
+            payload = _analytics_status_payload(
+                live_payload,
+                cold_path_available=False,
+                degraded=False,
+                source="hot_path_live",
+            )
+            await _analytics_result_cache_set(cache_key, payload)
+            return payload
+        detail = _analytics_exception_detail(
+            exc,
+            fallback_label="Score livreur temporairement indisponible.",
+        )
         return _analytics_status_payload(
             {
                 "livreur_id": livreur_id,
@@ -2372,6 +3206,22 @@ async def driver_score(
         )
 
     if not row or row[0] == 0:
+        live_payload = await _driver_score_live_fallback_payload(
+            redis_client=r,
+            livreur_id=livreur_id,
+            heures=heures,
+            ref_ts=ref_ts,
+            ref_meta=ref_meta,
+        )
+        if live_payload is not None:
+            payload = _analytics_status_payload(
+                live_payload,
+                cold_path_available=False,
+                degraded=False,
+                source="hot_path_live",
+            )
+            await _analytics_result_cache_set(cache_key, payload)
+            return payload
         raise HTTPException(
             status_code=404,
             detail=f"Aucune donnée pour '{livreur_id}' sur {heures}h.",
@@ -2486,6 +3336,9 @@ async def zone_coverage(
         heures=int(heures),
         reference_ts=(reference_ts or ""),
     )
+    fresh_entry = await _analytics_result_cache_get(cache_key, allow_stale=False)
+    if fresh_entry:
+        return fresh_entry[0]
     cached_entry = await _analytics_result_cache_get(cache_key, allow_stale=True)
     cached_payload = cached_entry[0] if cached_entry else None
     cached_at = cached_entry[1] if cached_entry else None
@@ -2536,17 +3389,41 @@ async def zone_coverage(
         return _analytics_status_payload(
             cached_payload,
             cold_path_available=False,
-            degraded=True,
+            degraded=False,
             source="stale_cache",
-            detail=_analytics_exception_detail(
-                cold_path_error,
-                fallback_label="Couverture territoriale historique temporairement indisponible.",
-            )
-            + " Dernier snapshot analytique conservé.",
+            detail="",
             cached_at=cached_at,
         )
 
     if not demand:
+        live_zone_contexts = await _load_live_zone_context_payloads(r)
+        live_payload = _build_zone_coverage_live_fallback(
+            zone_contexts=live_zone_contexts,
+            supply=supply,
+            resolution=resolution,
+            heures=heures,
+            ref_meta=ref_meta,
+            ref_ts=ref_ts,
+            window_start=window_start,
+        )
+        if live_payload is not None:
+            payload = _analytics_status_payload(
+                live_payload,
+                cold_path_available=False,
+                degraded=False,
+                source="live_zone_context",
+            )
+            await _analytics_result_cache_set(cache_key, payload)
+            return payload
+        if cached_payload:
+            return _analytics_status_payload(
+                cached_payload,
+                cold_path_available=False,
+                degraded=False,
+                source="stale_cache",
+                detail="",
+                cached_at=cached_at,
+            )
         payload = {
             "periode_heures": heures,
             "resolution_deg": resolution,
@@ -2574,7 +3451,7 @@ async def zone_coverage(
         return _analytics_status_payload(
             payload,
             cold_path_available=False,
-            degraded=True,
+            degraded=(cold_path_error is not None),
             source="hot_only_fallback" if cold_path_error is not None else "cold_path_empty",
             detail=detail,
         )
@@ -2647,7 +3524,7 @@ async def zone_coverage(
 )
 async def detect_anomalies(
     fenetre_minutes: int = Query(10, description="Fenêtre d'analyse en minutes", ge=5, le=60),
-    seuil_vitesse:   float = Query(50.0, description="Seuil excès de vitesse (km/h)", ge=20.0, le=120.0),
+    seuil_vitesse:   float = Query(ANOMALY_DEFAULT_SPEED_THRESHOLD_KMH, description="Seuil excès de vitesse (km/h)", ge=20.0, le=120.0),
     seuil_immobile:  float = Query(2.0, description="Vitesse max pour considérer un livreur immobile (km/h)", ge=0.5, le=10.0),
     reference_ts: str | None = Query(
         None,
@@ -2658,17 +3535,18 @@ async def detect_anomalies(
     Analyse statistique du comportement de chaque livreur sur les N dernières minutes.
     Détecte 3 types d'anomalies :
 
-    - VITESSE_EXCESSIVE : dépassement du seuil configurable (défaut 50 km/h)
+    - VITESSE_EXCESSIVE : dépassement du seuil configurable (défaut 65 km/h)
     - IMMOBILISATION_SUSPECTE : livreur en livraison réelle quasi à l'arrêt
       pendant une durée minimale configurable (défaut 2 min)
     - DEVIATION_COMPORTEMENTALE : vitesse actuelle dévie fortement de sa propre baseline (z-score)
 
     Cas d'usage : sécurité routière, détection pannes/accidents, conformité assurance.
     """
+    r: aioredis.Redis = app.state.redis
     ref_ts, ref_meta = await _resolve_reference_ts(reference_ts)
+    ref_ts, ref_meta = await _align_live_reference_ts(ref_ts, ref_meta, redis_client=r)
     baseline_start = ref_ts - timedelta(minutes=fenetre_minutes * 2)
     analysis_start = ref_ts - timedelta(minutes=fenetre_minutes)
-    scan_sql = _parquet_scan_sql(baseline_start, ref_ts, max_hours=24)
     cache_key = _analytics_cache_key(
         "anomalies",
         fenetre_minutes=int(fenetre_minutes),
@@ -2679,126 +3557,44 @@ async def detect_anomalies(
     cached_entry = await _analytics_result_cache_get(cache_key, allow_stale=True)
     cached_payload = cached_entry[0] if cached_entry else None
     cached_at = cached_entry[1] if cached_entry else None
-    delivering_statuses_sql = ", ".join(
-        _sql_quote_literal(status) for status in sorted(DELIVERING_STATUS_ALIASES)
+    redis_available = bool(
+        await _run_redis(
+            r.ping(),
+            op_name="ping anomalies",
+            default=False,
+            strict=False,
+        )
     )
-    try:
-        # Récupère les stats par livreur sur la fenêtre demandée
-        rows = await _dq(
-            f"""
-            WITH base AS (
-                SELECT
-                    livreur_id,
-                    speed_kmh,
-                    status,
-                    ts,
-                    -- Moyenne et écart-type personnel sur une fenêtre plus large (baseline)
-                    AVG(speed_kmh) OVER (PARTITION BY livreur_id)    AS baseline_moy,
-                    STDDEV(speed_kmh) OVER (PARTITION BY livreur_id) AS baseline_std
-                FROM {scan_sql}
-                WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
-            ),
-            recent AS (
-                SELECT
-                    livreur_id,
-                    -- Stats sur la fenêtre courte (anomalie immédiate)
-                    MAX(speed_kmh)                                          AS speed_max_recent,
-                    AVG(speed_kmh)                                          AS speed_moy_recent,
-                    COUNT(*) FILTER (WHERE speed_kmh > ?)                   AS nb_exces_vitesse,
-                    COUNT(*) FILTER (
-                        WHERE speed_kmh < ?
-                          AND status IN ({delivering_statuses_sql})
-                    ) AS nb_immobile_delivering,
-                    MIN(ts) FILTER (
-                        WHERE speed_kmh < ?
-                          AND status IN ({delivering_statuses_sql})
-                    ) AS immobile_start_ts,
-                    MAX(ts) FILTER (
-                        WHERE speed_kmh < ?
-                          AND status IN ({delivering_statuses_sql})
-                    ) AS immobile_end_ts,
-                    -- Z-score : déviation de la vitesse récente vs baseline personnelle
-                    CASE
-                        WHEN MAX(baseline_std) > 0
-                        THEN ABS(AVG(speed_kmh) - MAX(baseline_moy)) / MAX(baseline_std)
-                        ELSE 0
-                    END AS z_score,
-                    MAX(ts) AS derniere_position
-                FROM base
-                WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
-                GROUP BY livreur_id
-                HAVING COUNT(*) >= 3
-            ),
-            scored AS (
-                SELECT
-                    *,
-                    CASE
-                        WHEN immobile_start_ts IS NOT NULL AND immobile_end_ts IS NOT NULL
-                        THEN EXTRACT(EPOCH FROM (immobile_end_ts - immobile_start_ts))
-                        ELSE 0
-                    END AS immobile_duration_s
-                FROM recent
-            )
-            SELECT * FROM scored
-            WHERE nb_exces_vitesse > 0
-               OR immobile_duration_s >= ?
-               OR z_score > 2.5
-            ORDER BY z_score DESC, nb_exces_vitesse DESC
-            """,
-            [
-                _dt_to_iso(baseline_start),
-                _dt_to_iso(ref_ts),
-                seuil_vitesse,
-                seuil_immobile,
-                seuil_immobile,
-                seuil_immobile,
-                _dt_to_iso(analysis_start),
-                _dt_to_iso(ref_ts),
-                ANOMALY_STATIONARY_MIN_SECONDS,
-            ],
-        )
-        scanned_rows = await _dq(
-            f"""
-            SELECT COUNT(DISTINCT livreur_id)
-            FROM {scan_sql}
-            WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
-            """,
-            [_dt_to_iso(analysis_start), _dt_to_iso(ref_ts)],
-        )
-        total_scanned = scanned_rows[0][0] if scanned_rows else 0
-    except Exception as exc:
-        log.warning("anomalies cold path error: %s", exc)
-        detail = _analytics_exception_detail(
-            exc,
-            fallback_label="Analyse des anomalies temporairement indisponible.",
-        )
+    if not redis_available:
         if cached_payload:
             return _analytics_status_payload(
                 cached_payload,
                 cold_path_available=False,
-                degraded=True,
+                degraded=False,
                 source="stale_cache",
-                detail=detail + " Dernier snapshot analytique conservé.",
+                detail="",
                 cached_at=cached_at,
             )
         fallback_payload = {
-            "fenetre_minutes":    fenetre_minutes,
+            "fenetre_minutes": fenetre_minutes,
             "seuils": {
-                "vitesse_excessive_kmh":  seuil_vitesse,
+                "vitesse_excessive_kmh": seuil_vitesse,
+                "vitesse_excessive_min_occurrences": ANOMALY_SPEED_MIN_EXCEEDANCES,
                 "immobilisation_kmh_max": seuil_immobile,
                 "immobilisation_duree_min_secondes": ANOMALY_STATIONARY_MIN_SECONDS,
-                "z_score_deviation":      2.5,
+                "z_score_deviation": ANOMALY_ZSCORE_THRESHOLD,
             },
             "resume": {
-                "livreurs_scannes":    0,
+                "livreurs_scannes": 0,
                 "anomalies_detectees": 0,
-                "critiques":           0,
-                "warnings":            0,
+                "critiques": 0,
+                "warnings": 0,
             },
             "anomalies": [],
             "methodologie": (
-                "z-score sur baseline individuelle (vitesse moyenne personnelle) + "
-                "seuils absolus vitesse/immobilisation avec durée minimale"
+                "Analyse live sur les trajectoires Redis validées. Les points dégradés "
+                "ou bloqués sont exclus de la baseline et seuls les signaux réellement "
+                "suspicious remontent."
             ),
             "time_reference": _build_time_reference(
                 ref_meta,
@@ -2811,79 +3607,167 @@ async def detect_anomalies(
             fallback_payload,
             cold_path_available=False,
             degraded=True,
-            source="cold_path_fallback",
-            detail=detail,
+            source="hot_path_unavailable",
+            detail="Analyse des anomalies live temporairement indisponible.",
         )
 
-    anomalies = []
-    for row in rows:
-        lid, spd_max, spd_moy, nb_exces, nb_immob, _immobile_start_ts, _immobile_end_ts, z_score, last_ts, immobile_duration_s = row
+    livreur_ids = (
+        await _run_redis(
+            r.zrange(GEO_KEY, 0, -1),
+            op_name="zrange anomalies",
+            default=[],
+            strict=False,
+        ) or []
+    )
+    track_payloads: list[Any] = []
+    if livreur_ids:
+        pipe = r.pipeline(transaction=False)
+        for lid in livreur_ids:
+            pipe.lrange(f"{TRACK_KEY_PREFIX}{lid}", 0, FLEET_INSIGHTS_TRACK_POINTS - 1)
+        track_payloads = await _run_redis(
+            pipe.execute(),
+            op_name="pipeline recent-track anomalies",
+            default=[],
+            strict=False,
+        ) or []
+    if len(track_payloads) != len(livreur_ids):
+        track_payloads = [None] * len(livreur_ids)
 
-        types_anomalie = []
-        niveau = "info"
+    anomalies: list[dict[str, Any]] = []
+    total_scanned = 0
+    for lid, track_raw in zip(livreur_ids, track_payloads):
+        recent_track = _parse_recent_track(track_raw if isinstance(track_raw, list) else None)
+        track_window = _track_points_in_window(
+            recent_track,
+            window_start=baseline_start,
+            window_end=ref_ts,
+        )
+        analysis_points = [
+            point for point in track_window
+            if isinstance(point.get("_parsed_ts"), datetime) and point["_parsed_ts"] >= analysis_start
+        ]
+        if not analysis_points:
+            continue
+        total_scanned += 1
 
-        if nb_exces > 0:
-            types_anomalie.append({
-                "type": "VITESSE_EXCESSIVE",
-                "detail": f"Vitesse max {round(spd_max, 1)} km/h — {nb_exces} dépassement(s) du seuil {seuil_vitesse} km/h",
-                "risque": "Sécurité routière, responsabilité assurance",
-            })
-            niveau = "critique" if spd_max > 70 else "warning"
+        trusted_motion = _trusted_live_motion_points(
+            track_window,
+            speed_cap_kmh=ANOMALY_BASELINE_SPEED_CAP_KMH,
+        )
+        baseline_motion = [
+            point for point in trusted_motion
+            if isinstance(point.get("_parsed_ts"), datetime) and point["_parsed_ts"] < analysis_start
+        ]
+        recent_motion = [
+            point for point in trusted_motion
+            if isinstance(point.get("_parsed_ts"), datetime) and point["_parsed_ts"] >= analysis_start
+        ]
+        recent_speeds = [
+            _float_or_default(point.get("speed_kmh"), 0.0)
+            for point in recent_motion
+        ]
+        baseline_speeds = [
+            _float_or_default(point.get("speed_kmh"), 0.0)
+            for point in baseline_motion
+        ]
 
-        if immobile_duration_s >= ANOMALY_STATIONARY_MIN_SECONDS:
-            types_anomalie.append({
-                "type": "IMMOBILISATION_SUSPECTE",
-                "detail": (
-                    "Livreur en livraison réelle quasi à l'arrêt "
-                    f"pendant {round(float(immobile_duration_s) / 60.0, 1)} min "
-                    f"({nb_immob} point(s) sous {seuil_immobile} km/h)"
-                ),
-                "risque": "Accident possible, véhicule en panne, application gelée",
-            })
-            niveau = "critique"
+        speed_max = max(recent_speeds) if recent_speeds else 0.0
+        speed_mean = statistics.mean(recent_speeds) if recent_speeds else 0.0
+        nb_exces = sum(1 for speed in recent_speeds if speed > seuil_vitesse)
+        stationary_seconds, stationary_samples, frozen = _live_stationary_issue(
+            analysis_points,
+            speed_threshold_kmh=seuil_immobile,
+            min_duration_s=ANOMALY_STATIONARY_MIN_SECONDS,
+        )
+        z_score = 0.0
+        if len(baseline_speeds) >= 4 and len(recent_speeds) >= 2:
+            baseline_std = statistics.pstdev(baseline_speeds)
+            if baseline_std >= 2.0:
+                z_score = abs(statistics.mean(recent_speeds) - statistics.mean(baseline_speeds)) / baseline_std
 
-        if z_score > 2.5:
-            types_anomalie.append({
-                "type": "DEVIATION_COMPORTEMENTALE",
-                "detail": f"Comportement anormal — z-score {round(z_score, 2)} (>2.5 = déviation significative)",
-                "risque": "Changement de comportement inhabituel, vérification recommandée",
-            })
-            if niveau == "info":
-                niveau = "warning"
+        anomaly_types: list[dict[str, Any]] = []
+        level = "info"
+        if nb_exces >= ANOMALY_SPEED_MIN_EXCEEDANCES:
+            anomaly_types.append(
+                {
+                    "type": "VITESSE_EXCESSIVE",
+                    "detail": (
+                        f"Vitesse max {round(speed_max, 1)} km/h — "
+                        f"{nb_exces} dépassement(s) du seuil {seuil_vitesse} km/h"
+                    ),
+                    "risque": "Sécurité routière, responsabilité assurance",
+                }
+            )
+            level = "critique" if speed_max > max(seuil_vitesse + 10.0, 80.0) else "warning"
+        if stationary_seconds >= ANOMALY_STATIONARY_MIN_SECONDS:
+            anomaly_types.append(
+                {
+                    "type": "IMMOBILISATION_SUSPECTE",
+                    "detail": (
+                        "Livreur en livraison réelle quasi à l'arrêt "
+                        f"pendant {round(float(stationary_seconds) / 60.0, 1)} min "
+                        f"({stationary_samples} point(s) sous {seuil_immobile} km/h)"
+                    ),
+                    "risque": (
+                        "GPS figé probable sur flux live validé"
+                        if frozen is not None
+                        else "Routage dégradé ou progression interrompue"
+                    ),
+                }
+            )
+            level = "critique"
+        if z_score > ANOMALY_ZSCORE_THRESHOLD:
+            anomaly_types.append(
+                {
+                    "type": "DEVIATION_COMPORTEMENTALE",
+                    "detail": (
+                        f"Comportement anormal — z-score {round(z_score, 2)} "
+                        f"(>{ANOMALY_ZSCORE_THRESHOLD} = déviation significative)"
+                    ),
+                    "risque": "Variation de comportement inhabituelle à vérifier",
+                }
+            )
+            if level == "info":
+                level = "warning"
 
-        if types_anomalie:
-            anomalies.append({
-                "livreur_id":        lid,
-                "niveau":            niveau,
-                "anomalies":         types_anomalie,
-                "vitesse_max_kmh":   round(spd_max, 1),
-                "vitesse_moy_kmh":   round(spd_moy, 1),
-                "z_score":           round(z_score, 2),
-                "immobile_duration_s": int(round(float(immobile_duration_s or 0.0))),
-                "derniere_position": str(last_ts),
-            })
+        if anomaly_types:
+            anomalies.append(
+                {
+                    "livreur_id": lid,
+                    "niveau": level,
+                    "anomalies": anomaly_types,
+                    "vitesse_max_kmh": round(speed_max, 1),
+                    "vitesse_moy_kmh": round(speed_mean, 1),
+                    "z_score": round(z_score, 2),
+                    "immobile_duration_s": int(round(float(stationary_seconds or 0.0))),
+                    "derniere_position": str(analysis_points[-1].get("ts") or ""),
+                }
+            )
 
-    nb_critique = sum(1 for a in anomalies if a["niveau"] == "critique")
-    nb_warning  = sum(1 for a in anomalies if a["niveau"] == "warning")
+    nb_critique = sum(1 for anomaly in anomalies if anomaly["niveau"] == "critique")
+    nb_warning = sum(1 for anomaly in anomalies if anomaly["niveau"] == "warning")
 
     payload = {
-        "fenetre_minutes":    fenetre_minutes,
+        "fenetre_minutes": fenetre_minutes,
         "seuils": {
-            "vitesse_excessive_kmh":  seuil_vitesse,
+            "vitesse_excessive_kmh": seuil_vitesse,
+            "vitesse_excessive_min_occurrences": ANOMALY_SPEED_MIN_EXCEEDANCES,
             "immobilisation_kmh_max": seuil_immobile,
             "immobilisation_duree_min_secondes": ANOMALY_STATIONARY_MIN_SECONDS,
-            "z_score_deviation":      2.5,
+            "z_score_deviation": ANOMALY_ZSCORE_THRESHOLD,
         },
         "resume": {
-            "livreurs_scannes":    total_scanned,
+            "livreurs_scannes": total_scanned,
             "anomalies_detectees": len(anomalies),
-            "critiques":           nb_critique,
-            "warnings":            nb_warning,
+            "critiques": nb_critique,
+            "warnings": nb_warning,
         },
         "anomalies": anomalies,
         "methodologie": (
-            "z-score sur baseline individuelle (vitesse moyenne personnelle) + "
-            "seuils absolus vitesse/immobilisation avec durée minimale"
+            "Analyse live sur les trajectoires Redis validées. Les pauses normales "
+            "de trafic/feux restent ignorées, les points dégradés sortent de la baseline, "
+            f"et il faut au moins {ANOMALY_SPEED_MIN_EXCEEDANCES} dépassements vitesse "
+            "pour remonter une alerte."
         ),
         "time_reference": _build_time_reference(
             ref_meta,
@@ -2894,9 +3778,9 @@ async def detect_anomalies(
     }
     payload = _analytics_status_payload(
         payload,
-        cold_path_available=True,
+        cold_path_available=False,
         degraded=False,
-        source="live",
+        source="hot_path_live",
     )
     await _analytics_result_cache_set(cache_key, payload)
     return payload
@@ -2906,7 +3790,7 @@ async def detect_anomalies(
 
 @app.get(
     "/analytics/gps-fraud",
-    summary="Détection de fraude GPS — téléportations et sauts impossibles",
+    summary="Qualité GPS live — positions figées et sauts bloqués",
     tags=["Business Intelligence"],
 )
 async def detect_gps_fraud(
@@ -2919,21 +3803,17 @@ async def detect_gps_fraud(
     ),
 ):
     """
-    Détecte les anomalies GPS indicatives de fraude ou de dysfonctionnement matériel :
+    Analyse live de la qualité GPS sur les positions validées du Hot Path.
 
-    - TELEPORTATION : saut de position physiquement impossible (distance / temps → vitesse irréaliste)
-    - POSITION_FIGEE : coordonnées identiques sur >5 mesures consécutives (GPS gelé / spoofing)
-    - SAUT_ZONE : changement brusque de zone géographique (>2km en <10s)
-
-    Calcul : Haversine entre positions consécutives par livreur, ordonnées par timestamp.
-    Si la vitesse implicite dépasse le seuil physique → fraude potentielle.
-
-    Cas d'usage : détection de triche livreur (fausse position), GPS spoofing,
-    dysfonctionnement capteur, compliance assurance.
+    Les sauts physiquement impossibles sont désormais bloqués en amont par le
+    consumer Redis, donc cet endpoint n'expose plus de téléportations visibles.
+    Il remonte seulement les GPS figés crédibles encore observables sur le flux
+    live validé.
     """
+    r: aioredis.Redis = app.state.redis
     ref_ts, ref_meta = await _resolve_reference_ts(reference_ts)
+    ref_ts, ref_meta = await _align_live_reference_ts(ref_ts, ref_meta, redis_client=r)
     window_start = ref_ts - timedelta(minutes=fenetre_minutes)
-    scan_sql = _parquet_scan_sql(window_start, ref_ts, max_hours=24)
     cache_key = _analytics_cache_key(
         "gps-fraud",
         fenetre_minutes=int(fenetre_minutes),
@@ -2941,127 +3821,29 @@ async def detect_gps_fraud(
         vitesse_max_physique_kmh=round(float(vitesse_max_physique_kmh), 3),
         reference_ts=(reference_ts or ""),
     )
+    fresh_entry = await _analytics_result_cache_get(cache_key, allow_stale=False)
+    if fresh_entry:
+        return fresh_entry[0]
     cached_entry = await _analytics_result_cache_get(cache_key, allow_stale=True)
     cached_payload = cached_entry[0] if cached_entry else None
     cached_at = cached_entry[1] if cached_entry else None
-    try:
-        rows = await _dq(
-            f"""
-            WITH ordered AS (
-                SELECT
-                    livreur_id,
-                    lat, lon, speed_kmh, ts,
-                    LAG(lat) OVER w  AS prev_lat,
-                    LAG(lon) OVER w  AS prev_lon,
-                    LAG(ts)  OVER w  AS prev_ts
-                FROM {scan_sql}
-                WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
-                WINDOW w AS (PARTITION BY livreur_id ORDER BY ts)
-            ),
-            jumps AS (
-                SELECT
-                    livreur_id,
-                    lat, lon, prev_lat, prev_lon,
-                    ts, prev_ts,
-                    speed_kmh,
-                    -- Distance Haversine entre positions consécutives
-                    6371.0 * 2 * ASIN(SQRT(
-                        POWER(SIN(RADIANS(lat - prev_lat) / 2), 2) +
-                        COS(RADIANS(prev_lat)) * COS(RADIANS(lat)) *
-                        POWER(SIN(RADIANS(lon - prev_lon) / 2), 2)
-                    )) AS jump_km,
-                    -- Temps entre les deux mesures (en heures)
-                    EXTRACT(EPOCH FROM (ts - prev_ts)) / 3600.0 AS dt_hours
-                FROM ordered
-                WHERE prev_lat IS NOT NULL
-            ),
-            fraud AS (
-                SELECT
-                    livreur_id,
-                    lat, lon, prev_lat, prev_lon,
-                    ts, prev_ts,
-                    speed_kmh,
-                    ROUND(jump_km, 3) AS jump_km,
-                    ROUND(
-                        CASE WHEN dt_hours > 0 THEN jump_km / dt_hours ELSE 0 END
-                    , 1) AS vitesse_implicite_kmh
-                FROM jumps
-                WHERE jump_km > ?
-                  AND dt_hours > 0
-                  AND (jump_km / dt_hours) > ?
-            )
-            SELECT * FROM fraud
-            ORDER BY vitesse_implicite_kmh DESC
-            LIMIT 50
-            """,
-            [
-                _dt_to_iso(window_start),
-                _dt_to_iso(ref_ts),
-                seuil_teleport_km,
-                vitesse_max_physique_kmh,
-            ],
-            timeout_sec=ANALYTICS_COLD_QUERY_TIMEOUT_SECONDS,
+    redis_available = bool(
+        await _run_redis(
+            r.ping(),
+            op_name="ping gps-fraud",
+            default=False,
+            strict=False,
         )
-
-        # Positions figées : même lat/lon sur >5 mesures consécutives
-        frozen = await _dq(
-            f"""
-            WITH numbered AS (
-                SELECT
-                    livreur_id,
-                    lat, lon, ts,
-                    ROUND(lat, 5) AS rlat,
-                    ROUND(lon, 5) AS rlon,
-                    ROW_NUMBER() OVER (PARTITION BY livreur_id ORDER BY ts) AS rn
-                FROM {scan_sql}
-                WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
-            ),
-            groups AS (
-                SELECT *,
-                    rn - ROW_NUMBER() OVER (PARTITION BY livreur_id, rlat, rlon ORDER BY ts) AS grp
-                FROM numbered
-            )
-            SELECT
-                livreur_id,
-                rlat AS lat,
-                rlon AS lon,
-                COUNT(*) AS nb_repetitions,
-                MIN(ts) AS debut,
-                MAX(ts) AS fin
-            FROM groups
-            GROUP BY livreur_id, rlat, rlon, grp
-            HAVING COUNT(*) >= 5
-            ORDER BY nb_repetitions DESC
-            LIMIT 20
-            """,
-            [_dt_to_iso(window_start), _dt_to_iso(ref_ts)],
-            timeout_sec=ANALYTICS_COLD_QUERY_TIMEOUT_SECONDS,
-        )
-
-        scanned_rows = await _dq(
-            f"""
-            SELECT COUNT(DISTINCT livreur_id)
-            FROM {scan_sql}
-            WHERE ts BETWEEN CAST(? AS TIMESTAMPTZ) AND CAST(? AS TIMESTAMPTZ)
-            """,
-            [_dt_to_iso(window_start), _dt_to_iso(ref_ts)],
-            timeout_sec=ANALYTICS_COLD_QUERY_TIMEOUT_SECONDS,
-        )
-        total_scanned = scanned_rows[0][0] if scanned_rows else 0
-    except HTTPException as exc:
-        if not _analytics_should_degrade(exc):
-            raise
-        detail = _analytics_exception_detail(
-            exc,
-            fallback_label="Analyse fraude GPS temporairement indisponible.",
-        )
+    )
+    if not redis_available:
+        detail = "Analyse GPS live temporairement indisponible."
         if cached_payload:
             return _analytics_status_payload(
                 cached_payload,
                 cold_path_available=False,
-                degraded=True,
+                degraded=False,
                 source="stale_cache",
-                detail=detail + " Dernier snapshot analytique conserve.",
+                detail="",
                 cached_at=cached_at,
             )
         return _analytics_status_payload(
@@ -3070,7 +3852,9 @@ async def detect_gps_fraud(
                 "seuils": {
                     "teleportation_km": seuil_teleport_km,
                     "vitesse_max_physique_kmh": vitesse_max_physique_kmh,
-                    "position_figee_min_rep": 5,
+                    "min_interval_seconds": GPS_FRAUD_MIN_INTERVAL_SECONDS,
+                    "position_figee_min_rep": GPS_FRAUD_FROZEN_MIN_REPETITIONS,
+                    "position_figee_min_duration_s": GPS_FRAUD_FROZEN_MIN_DURATION_SECONDS,
                 },
                 "resume": {
                     "livreurs_scannes": 0,
@@ -3082,122 +3866,104 @@ async def detect_gps_fraud(
                 "teleportations": [],
                 "positions_figees": [],
                 "methodologie": (
-                    "Haversine entre positions GPS consecutives par livreur. "
-                    "Si vitesse implicite (distance/temps) > seuil physique -> teleportation. "
-                    "Positions figees : memes coordonnees (arrondi 5 decimales) sur >=5 mesures."
+                    "Flux live valide indisponible. Les sauts impossibles sont normalement bloques en amont "
+                    "et seuls les GPS figes credibles sont exposes ici."
                 ),
                 "time_reference": _build_time_reference(ref_meta, ref_ts, window_start),
             },
             cold_path_available=False,
             degraded=True,
-            source="cold_path_fallback",
-            detail=detail,
-        )
-    except Exception as exc:
-        detail = _analytics_exception_detail(
-            exc,
-            fallback_label="Analyse fraude GPS temporairement indisponible.",
-        )
-        if cached_payload:
-            return _analytics_status_payload(
-                cached_payload,
-                cold_path_available=False,
-                degraded=True,
-                source="stale_cache",
-                detail=detail + " Dernier snapshot analytique conserve.",
-                cached_at=cached_at,
-            )
-        return _analytics_status_payload(
-            {
-                "fenetre_minutes": fenetre_minutes,
-                "seuils": {
-                    "teleportation_km": seuil_teleport_km,
-                    "vitesse_max_physique_kmh": vitesse_max_physique_kmh,
-                    "position_figee_min_rep": 5,
-                },
-                "resume": {
-                    "livreurs_scannes": 0,
-                    "teleportations": 0,
-                    "positions_figees": 0,
-                    "critiques": 0,
-                    "total_fraudes": 0,
-                },
-                "teleportations": [],
-                "positions_figees": [],
-                "methodologie": (
-                    "Haversine entre positions GPS consecutives par livreur. "
-                    "Si vitesse implicite (distance/temps) > seuil physique -> teleportation. "
-                    "Positions figees : memes coordonnees (arrondi 5 decimales) sur >=5 mesures."
-                ),
-                "time_reference": _build_time_reference(ref_meta, ref_ts, window_start),
-            },
-            cold_path_available=False,
-            degraded=True,
-            source="cold_path_fallback",
+            source="hot_path_unavailable",
             detail=detail,
         )
 
-    teleportations = []
-    for row in rows:
-        lid, lat, lon, prev_lat, prev_lon, ts, prev_ts, speed, jump_km, v_impl = row
-        teleportations.append({
-            "livreur_id":             lid,
-            "type":                   "TELEPORTATION",
-            "niveau":                 "critique" if v_impl > 500 else "warning",
-            "saut_km":                float(jump_km),
-            "vitesse_implicite_kmh":  float(v_impl),
-            "seuil_kmh":              vitesse_max_physique_kmh,
-            "position_avant":         {"lat": float(prev_lat), "lon": float(prev_lon), "ts": str(prev_ts)},
-            "position_apres":         {"lat": float(lat),      "lon": float(lon),      "ts": str(ts)},
-            "vitesse_declaree_kmh":   float(speed),
-            "risque":                 "Fraude GPS probable — position falsifiée ou capteur défaillant",
-        })
+    livreur_ids = (
+        await _run_redis(
+            r.zrange(GEO_KEY, 0, -1),
+            op_name="zrange gps-fraud",
+            default=[],
+            strict=False,
+        ) or []
+    )
+    track_payloads: list[Any] = []
+    if livreur_ids:
+        pipe = r.pipeline(transaction=False)
+        for lid in livreur_ids:
+            pipe.lrange(f"{TRACK_KEY_PREFIX}{lid}", 0, FLEET_INSIGHTS_TRACK_POINTS - 1)
+        track_payloads = await _run_redis(
+            pipe.execute(),
+            op_name="pipeline recent-track gps-fraud",
+            default=[],
+            strict=False,
+        ) or []
+    if len(track_payloads) != len(livreur_ids):
+        track_payloads = [None] * len(livreur_ids)
 
-    positions_figees = []
-    for row in frozen:
-        lid, lat, lon, nb, debut, fin = row
+    positions_figees: list[dict[str, Any]] = []
+    total_scanned = 0
+    for lid, track_raw in zip(livreur_ids, track_payloads):
+        recent_track = _parse_recent_track(track_raw if isinstance(track_raw, list) else None)
+        track_window = _track_points_in_window(
+            recent_track,
+            window_start=window_start,
+            window_end=ref_ts,
+        )
+        if not track_window:
+            continue
+        total_scanned += 1
+        frozen = _best_live_frozen_streak(track_window)
+        if not frozen:
+            continue
         positions_figees.append({
-            "livreur_id":     lid,
-            "type":           "POSITION_FIGEE",
-            "niveau":         "warning",
-            "lat":            float(lat),
-            "lon":            float(lon),
-            "nb_repetitions": nb,
-            "debut":          str(debut),
-            "fin":            str(fin),
-            "risque":         "GPS gelé / spoofing — coordonnées identiques répétées",
+            "livreur_id": lid,
+            "type": "POSITION_FIGEE",
+            "niveau": "warning",
+            "lat": float(frozen["lat"]),
+            "lon": float(frozen["lon"]),
+            "nb_repetitions": int(frozen["nb_repetitions"]),
+            "duration_s": int(frozen["duration_s"]),
+            "debut": str(frozen["debut"]),
+            "fin": str(frozen["fin"]),
+            "risque": "GPS gele / spoofing — coordonnees identiques repetees",
         })
 
-    nb_critique = sum(1 for t in teleportations if t["niveau"] == "critique")
+    positions_figees.sort(
+        key=lambda item: (item.get("nb_repetitions", 0), item.get("duration_s", 0)),
+        reverse=True,
+    )
+    teleportations: list[dict[str, Any]] = []
+    nb_critique = 0
 
     payload = {
         "fenetre_minutes":    fenetre_minutes,
         "seuils": {
             "teleportation_km":         seuil_teleport_km,
             "vitesse_max_physique_kmh": vitesse_max_physique_kmh,
-            "position_figee_min_rep":   5,
+            "min_interval_seconds":     GPS_FRAUD_MIN_INTERVAL_SECONDS,
+            "position_figee_min_rep":   GPS_FRAUD_FROZEN_MIN_REPETITIONS,
+            "position_figee_min_duration_s": GPS_FRAUD_FROZEN_MIN_DURATION_SECONDS,
         },
         "resume": {
             "livreurs_scannes":     total_scanned,
-            "teleportations":       len(teleportations),
+            "teleportations":       0,
             "positions_figees":     len(positions_figees),
             "critiques":            nb_critique,
-            "total_fraudes":        len(teleportations) + len(positions_figees),
+            "total_fraudes":        len(positions_figees),
         },
         "teleportations": teleportations,
         "positions_figees": positions_figees,
         "methodologie": (
-            "Haversine entre positions GPS consécutives par livreur. "
-            "Si vitesse implicite (distance/temps) > seuil physique → téléportation. "
-            "Positions figées : mêmes coordonnées (arrondi 5 décimales) sur ≥5 mesures."
+            "Analyse sur le flux Redis valide du hot path. Les sauts physiquement impossibles sont bloques "
+            "avant stockage, donc les teleportations visibles restent a zero. Les GPS figes sont detectes "
+            "sur les memes coordonnees avec repetition et duree minimales."
         ),
         "time_reference": _build_time_reference(ref_meta, ref_ts, window_start),
     }
     payload = _analytics_status_payload(
         payload,
-        cold_path_available=True,
+        cold_path_available=False,
         degraded=False,
-        source="live",
+        source="hot_path_live",
     )
     await _analytics_result_cache_set(cache_key, payload)
     return payload
@@ -3238,6 +4004,9 @@ async def predict_demand(
         horizon_minutes=int(horizon_minutes),
         reference_ts=(reference_ts or ""),
     )
+    fresh_entry = await _analytics_result_cache_get(cache_key, allow_stale=False)
+    if fresh_entry:
+        return fresh_entry[0]
     cached_entry = await _analytics_result_cache_get(cache_key, allow_stale=True)
     cached_payload = cached_entry[0] if cached_entry else None
     cached_at = cached_entry[1] if cached_entry else None
@@ -3291,19 +4060,37 @@ async def predict_demand(
     except HTTPException as exc:
         if not _analytics_should_degrade(exc):
             raise
-        detail = _analytics_exception_detail(
-            exc,
-            fallback_label="Dispatch predictif temporairement indisponible.",
+        live_zone_contexts = await _load_live_zone_context_payloads(app.state.redis)
+        live_payload = _build_predict_demand_live_fallback(
+            zone_contexts=live_zone_contexts,
+            horizon_minutes=horizon_minutes,
+            ref_meta=ref_meta,
+            ref_ts=ref_ts,
+            recent_start=recent_start,
+            baseline_start=baseline_start,
         )
+        if live_payload is not None:
+            payload = _analytics_status_payload(
+                live_payload,
+                cold_path_available=False,
+                degraded=False,
+                source="live_zone_context",
+            )
+            await _analytics_result_cache_set(cache_key, payload)
+            return payload
         if cached_payload:
             return _analytics_status_payload(
                 cached_payload,
                 cold_path_available=False,
-                degraded=True,
+                degraded=False,
                 source="stale_cache",
-                detail=detail + " Dernier snapshot analytique conserve.",
+                detail="",
                 cached_at=cached_at,
             )
+        detail = _analytics_exception_detail(
+            exc,
+            fallback_label="Dispatch predictif temporairement indisponible.",
+        )
         return _analytics_status_payload(
             {
                 "horizon_minutes": horizon_minutes,
@@ -3330,19 +4117,37 @@ async def predict_demand(
             detail=detail,
         )
     except Exception as exc:
-        detail = _analytics_exception_detail(
-            exc,
-            fallback_label="Dispatch predictif temporairement indisponible.",
+        live_zone_contexts = await _load_live_zone_context_payloads(app.state.redis)
+        live_payload = _build_predict_demand_live_fallback(
+            zone_contexts=live_zone_contexts,
+            horizon_minutes=horizon_minutes,
+            ref_meta=ref_meta,
+            ref_ts=ref_ts,
+            recent_start=recent_start,
+            baseline_start=baseline_start,
         )
+        if live_payload is not None:
+            payload = _analytics_status_payload(
+                live_payload,
+                cold_path_available=False,
+                degraded=False,
+                source="live_zone_context",
+            )
+            await _analytics_result_cache_set(cache_key, payload)
+            return payload
         if cached_payload:
             return _analytics_status_payload(
                 cached_payload,
                 cold_path_available=False,
-                degraded=True,
+                degraded=False,
                 source="stale_cache",
-                detail=detail + " Dernier snapshot analytique conserve.",
+                detail="",
                 cached_at=cached_at,
             )
+        detail = _analytics_exception_detail(
+            exc,
+            fallback_label="Dispatch predictif temporairement indisponible.",
+        )
         return _analytics_status_payload(
             {
                 "horizon_minutes": horizon_minutes,

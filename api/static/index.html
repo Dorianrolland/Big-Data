@@ -321,7 +321,7 @@ const POLL_BACKOFF_MAX_MS = 20000;
 
 /* ── Focus mode ────────────────────────────────────────────────────────────
    Active when the URL has ?focus=<driver_id>. In this mode the map tracks
-   a single chauffeur via /livreurs/focus, draws a short trail and
+   a single courier via /livreurs/focus, draws a short trail and
    interpolates between polls so the marker slides smoothly. The marker
    never disappears on a brief stale window — a "stale" pill is shown
    instead. */
@@ -951,7 +951,7 @@ window.addEventListener('unhandledrejection', () => {
 });
 
 /* ══════════════════════════════════════════════════════════════════════════
-   FOCUS MODE — suit un chauffeur unique avec trail + interpolation
+   FOCUS MODE — suit un livreur unique avec trail + interpolation
    ══════════════════════════════════════════════════════════════════════════ */
 const focusState = {
   marker: null,
@@ -1064,7 +1064,7 @@ async function pollFocusStatus() {
     const d = await fetchJson('/livreurs/focus/status');
     focusState.statusMeta = d || null;
     if (d && d.focus_supported === false) {
-      fallbackToFleetMode('single-driver focus not supported in this scenario');
+      fallbackToFleetMode('single-courier focus not supported in this scenario');
       return;
     }
     // refresh the pill text so counters update without waiting for next pollFocus
@@ -1094,7 +1094,7 @@ function ensureFocusMarker(lat, lon, status) {
 }
 
 // Color the trail by driver status so you can see at a glance when the
-// chauffeur was repositioning vs. actually delivering a course.
+// courier was repositioning vs. actually delivering a food order.
 function colorForTrailStatus(status) {
   switch ((status || '').toLowerCase()) {
     case 'delivering':      return '#4ade80'; // green — revenue leg
@@ -1285,7 +1285,7 @@ async function pollFocus() {
         && focusState.statusMeta.scenario
         && String(focusState.statusMeta.scenario).toLowerCase() !== 'single_driver';
       if (unsupportedScenario && focusState.missingPositionStreak >= 3) {
-        fallbackToFleetMode('missing focus position in non single-driver scenario');
+        fallbackToFleetMode('missing focus position in non single-courier scenario');
         return;
       }
     }

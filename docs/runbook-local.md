@@ -68,7 +68,7 @@ powershell -ExecutionPolicy Bypass -File scripts/proof-lot4.ps1
 - `POST http://localhost:8010/ingest/v1/position`
 - `POST http://localhost:8010/ingest/v1/positions`
 
-## Single-driver copilot mode (default profile: 10m train / 2m live)
+## Single-courier copilot mode (default profile: 10m train / 2m live)
 
 The default local profile is now:
 - `TLC_SCENARIO=single_driver`
@@ -97,7 +97,7 @@ http://localhost:8001/map?focus=drv_demo_001
 Reset runtime state (cursors + Redis hot keys, model kept):
 
 ```bash
-make single-driver-reset
+make courier-reset
 ```
 
 Observe health and quality signals:

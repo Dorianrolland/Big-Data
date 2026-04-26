@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -25,6 +27,15 @@ class _FakeRedis:
         for map_key, value in mapping.items():
             bucket[str(map_key)] = str(value)
         return len(mapping)
+
+    async def scan_iter(self, match: str | None = None, count: int | None = None):
+        _ = count
+        prefix = None
+        if isinstance(match, str) and match.endswith("*"):
+            prefix = match[:-1]
+        for key in self.hashes:
+            if prefix is None or key.startswith(prefix):
+                yield key
 
 
 def test_driver_profile_default_and_update_persistence():
@@ -347,3 +358,149 @@ def test_instant_dispatch_uses_profile_when_query_params_not_overridden(monkeypa
     assert payload["target_hourly_net_eur"] == 21.0
     assert payload["max_reposition_eta_min"] == 14.0
     assert payload["driver_profile"]["aversion_risque"] == 0.9
+
+
+def test_next_best_zone_is_safe_when_called_internally_without_optional_query_args(monkeypatch):
+    async def fake_load_zone_context_payloads(_redis):
+        return [
+            {
+                "zone_id": "40.7615_-73.9777",
+                "demand_index": 1.35,
+                "supply_index": 0.92,
+                "weather_factor": 1.0,
+                "traffic_factor": 1.08,
+                "opportunity_score": 1.58,
+            }
+        ]
+
+    monkeypatch.setattr(router, "_load_zone_context_payloads", fake_load_zone_context_payloads)
+
+    redis = _FakeRedis(
+        {
+            f"{router.COURIER_HASH_PREFIX}drv_demo_011": {
+                "lat": "40.7580",
+                "lon": "-73.9855",
+            },
+            router.FUEL_CONTEXT_KEY: {
+                "fuel_price_usd_gallon": "3.64",
+            },
+        }
+    )
+
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(redis=redis)))
+    payload = asyncio.run(router.next_best_zone(request, "drv_demo_011"))  # type: ignore[arg-type]
+
+    assert payload["driver_id"] == "drv_demo_011"
+    assert payload["count"] == 1
+    assert payload["home_lat"] is None
+    assert payload["home_lon"] is None
+    assert payload["recommendations"][0]["zone_id"] == "40.7615_-73.9777"
+
+
+def test_instant_dispatch_uses_live_source_when_demo_driver_feed_is_missing(monkeypatch):
+    async def fake_select_driver_brief_context(_redis, requested_driver_id: str):
+        return {
+            "requested_driver_id": requested_driver_id,
+            "source_driver_id": "drv_live_900",
+            "alias_active": True,
+            "requested_summary": {"driver_id": requested_driver_id, "available": False, "offer_count": 0},
+            "source_summary": {"driver_id": "drv_live_900", "available": True, "offer_count": 2},
+            "note": "Live demo alias",
+        }
+
+    async def fake_best_offers_around(*_args, **_kwargs):
+        return {
+            "offers": [
+                {
+                    "offer_id": "stay_1",
+                    "zone_id": "40.7600_-73.9800",
+                    "recommendation_action": "consider",
+                    "recommendation_score": 0.41,
+                    "accept_score": 0.58,
+                    "eur_per_hour_net": 16.5,
+                    "target_gap_eur_h": -1.5,
+                    "distance_to_pickup_km": 1.2,
+                    "route_duration_min": 9.0,
+                    "route_source": "estimated",
+                    "explanation": ["close_pickup"],
+                    "recommendation_signals": ["good_local_fit"],
+                }
+            ]
+        }
+
+    async def fake_next_best_zone(*_args, **_kwargs):
+        return {
+            "recommendations": [
+                {
+                    "zone_id": "40.7400_-73.9900",
+                    "demand_index": 1.45,
+                    "supply_index": 0.92,
+                    "weather_factor": 1.0,
+                    "traffic_factor": 1.12,
+                    "gbfs_demand_boost": 0.06,
+                    "demand_trend_ema": 0.05,
+                    "opportunity_score": 1.25,
+                }
+            ]
+        }
+
+    async def fake_estimate_leg(
+        *,
+        origin_lat: float,
+        origin_lon: float,
+        dest_lat: float,
+        dest_lon: float,
+        traffic_factor: float,
+        use_osrm: bool,
+        osrm_client,
+    ):
+        _ = origin_lat, origin_lon, dest_lat, dest_lon, traffic_factor, use_osrm, osrm_client
+        return 2.6, 8.2, "estimated"
+
+    monkeypatch.setattr(router, "_select_driver_brief_context", fake_select_driver_brief_context)
+    monkeypatch.setattr(router, "best_offers_around", fake_best_offers_around)
+    monkeypatch.setattr(router, "next_best_zone", fake_next_best_zone)
+    monkeypatch.setattr(router, "_estimate_reposition_leg", fake_estimate_leg)
+
+    redis = _FakeRedis(
+        {
+            router._driver_profile_key("drv_demo_011"): {
+                "target_eur_h": "19.0",
+                "vehicle_mpg": "30.0",
+                "aversion_risque": "0.5",
+                "max_eta": "18.0",
+                "source": "manual",
+            },
+            f"{router.COURIER_HASH_PREFIX}drv_live_900": {
+                "lat": "40.7580",
+                "lon": "-73.9855",
+            },
+            router.FUEL_CONTEXT_KEY: {
+                "fuel_price_usd_gallon": "3.64",
+            },
+        }
+    )
+
+    app = FastAPI()
+    app.include_router(router.copilot_router)
+    app.state.redis = redis
+
+    with TestClient(app) as client:
+        resp = client.get(
+            "/copilot/driver/drv_demo_011/instant-dispatch",
+            params={
+                "around_radius_km": 4.0,
+                "around_limit": 1,
+                "scan_limit": 20,
+                "zone_top_k": 1,
+                "min_accept_score": 0.0,
+                "use_osrm": False,
+            },
+        )
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["driver_id"] == "drv_demo_011"
+    assert payload["source_driver_id"] == "drv_live_900"
+    assert payload["alias_active"] is True
+    assert payload["origin"] == {"lat": 40.758, "lon": -73.9855}

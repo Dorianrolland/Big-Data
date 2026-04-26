@@ -16,11 +16,11 @@ make up && sleep 30 && python3 ml/backtest_copilot.py
 
 ### Min 0–1 : Contexte "le problème"
 
-> "FleetStream est un copilote décisionnel temps réel pour livreurs VTC NYC.
-> Chaque offre de mission dure 8 secondes — le chauffeur accepte ou refuse.
+> "FleetStream est un copilote décisionnel temps réel pour livreurs de nourriture à New York.
+> Chaque offre de mission dure 8 secondes — le livreur accepte ou refuse.
 > Notre Copilot score chaque offre en <50 ms et recommande la meilleure action."
 
-Montrer : `http://localhost:8001/copilot/driver-app` → app chauffeur Copilot dédiée.
+Montrer : `http://localhost:8001/copilot/driver-app` → app livreur Copilot dédiée.
 Secours si besoin : `http://localhost:8001/copilot` → PWA opérateur complète.
 
 ---
@@ -49,7 +49,7 @@ curl -X POST http://localhost:8001/copilot/score-offer \
 ```
 
 > "Score 0.81 → ACCEPT. Le modèle ML LogReg entraîné sur TLC data explique :
-> net €/h élevé + forte demande + faible supply = opportunité."
+> net $/h élevé + forte demande + faible supply = opportunité."
 
 Montrer : `/copilot/health` → qualité contexte, alertes supply/routing.
 
@@ -65,15 +65,15 @@ Ouvrir `data/reports/backtest_summary.csv` ou lancer :
 python3 ml/backtest_copilot.py
 ```
 
-| Stratégie    | Accept% | Net €/h | Km   |
+| Stratégie    | Accept% | Net $/h | Km   |
 |--------------|---------|---------|------|
-| copilot      | 92%     | 57 €/h  | ...  |
-| greedy       | 89%     | 59 €/h  | ...  |
-| random       | 59%     | 52 €/h  | ...  |
-| always_accept| 100%    | 53 €/h  | ...  |
+| copilot      | 92%     | 57 $/h  | ...  |
+| greedy       | 89%     | 59 $/h  | ...  |
+| random       | 59%     | 52 $/h  | ...  |
+| always_accept| 100%    | 53 $/h  | ...  |
 
 > "Le Copilot accepte sélectivement les offres à fort rendement, éliminant
-> les courses non rentables tout en maintenant un taux d'acceptation élevé."
+> les livraisons non rentables tout en maintenant un taux d'acceptation élevé."
 
 ---
 
@@ -87,7 +87,7 @@ python3 ml/scenario_generator.py --scenario traffic_jam
 ```
 
 > "En embouteillages : taux d'acceptation chute de 92% → 85%,
-> le Copilot protège le chauffeur des courses non rentables.
+> le Copilot protège le livreur des livraisons non rentables.
 > En pluie forte : demand +35%, Copilot capte les pics de surge."
 
 Montrer : `data/scenarios/scenarios_comparison.json`

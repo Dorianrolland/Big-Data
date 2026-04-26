@@ -108,6 +108,12 @@ class _FakeRedis:
             return list(self.ids[start:])
         return list(self.ids[start : end + 1])
 
+    async def lrange(self, key: str, start: int, end: int) -> list[str]:
+        items = self.tracks.get(key, [])
+        if end == -1:
+            return list(items[start:])
+        return list(items[start : end + 1])
+
     async def geosearch(self, *_args, **_kwargs):  # noqa: ANN002, ANN003
         return list(self.geosearch_rows)
 
@@ -115,7 +121,14 @@ class _FakeRedis:
         return _FakePipeline(self)
 
 
-def _track_point(ts: str, speed_kmh: float, status: str) -> str:
+def _track_point(
+    ts: str,
+    speed_kmh: float,
+    status: str,
+    *,
+    route_source: str = "osrm",
+    anomaly_state: str = "ok",
+) -> str:
     return json.dumps(
         {
             "lat": 40.758,
@@ -123,8 +136,8 @@ def _track_point(ts: str, speed_kmh: float, status: str) -> str:
             "ts": ts,
             "speed_kmh": speed_kmh,
             "status": status,
-            "route_source": "osrm",
-            "anomaly_state": "ok",
+            "route_source": route_source,
+            "anomaly_state": anomaly_state,
         },
         separators=(",", ":"),
     )
@@ -137,17 +150,30 @@ def _clear_analytics_cache():
     api_main._analytics_result_cache.clear()
 
 
-def test_detect_anomalies_returns_structured_fallback_when_duckdb_fails(monkeypatch):
+def test_detect_anomalies_uses_live_tracks_and_ignores_clean_motion(monkeypatch):
     ref_ts = datetime(2024, 1, 2, 12, 5, tzinfo=timezone.utc)
 
     async def _fake_resolve_reference_ts(_value=None):  # noqa: ANN001
         return ref_ts, {"source": "test"}
 
-    async def _failing_dq(*_args, **_kwargs):  # noqa: ANN001
-        raise HTTPException(status_code=504, detail="DuckDB timeout (4.0s).")
+    async def _unexpected_dq(*_args, **_kwargs):  # noqa: ANN001
+        raise AssertionError("detect_anomalies should not query DuckDB anymore")
+
+    redis = _FakeRedis(
+        ids=["drv_demo_001"],
+        tracks={
+            "fleet:track:drv_demo_001": [
+                _track_point("2024-01-02T12:05:00+00:00", 12.0, "delivering"),
+                _track_point("2024-01-02T12:04:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T12:03:00+00:00", 11.0, "delivering"),
+                _track_point("2024-01-02T12:02:00+00:00", 13.0, "delivering"),
+            ]
+        },
+    )
 
     monkeypatch.setattr(api_main, "_resolve_reference_ts", _fake_resolve_reference_ts)
-    monkeypatch.setattr(api_main, "_dq", _failing_dq)
+    monkeypatch.setattr(api_main, "_dq", _unexpected_dq)
+    api_main.app.state.redis = redis
 
     payload = asyncio.run(
         api_main.detect_anomalies(
@@ -159,28 +185,36 @@ def test_detect_anomalies_returns_structured_fallback_when_duckdb_fails(monkeypa
     )
 
     assert payload["cold_path_available"] is False
-    assert payload["analytics_status"]["source"] == "cold_path_fallback"
-    assert payload["analytics_status"]["degraded"] is True
+    assert payload["analytics_status"]["source"] == "hot_path_live"
+    assert payload["analytics_status"]["degraded"] is False
     assert payload["anomalies"] == []
-    assert "DuckDB timeout" in payload["detail"]
 
 
-def test_detect_anomalies_reuses_stale_cache_when_duckdb_fails(monkeypatch):
+def test_detect_anomalies_reuses_stale_cache_when_redis_is_unavailable(monkeypatch):
     ref_ts = datetime(2024, 1, 2, 12, 5, tzinfo=timezone.utc)
-    call_state = {"should_fail": False}
 
     async def _fake_resolve_reference_ts(_value=None):  # noqa: ANN001
         return ref_ts, {"source": "test"}
 
-    async def _fake_dq(sql, *_args, **_kwargs):  # noqa: ANN001
-        if call_state["should_fail"]:
-            raise HTTPException(status_code=504, detail="DuckDB timeout (4.0s).")
-        if "COUNT(DISTINCT livreur_id)" in sql:
-            return [(7,)]
-        return []
+    async def _unexpected_dq(*_args, **_kwargs):  # noqa: ANN001
+        raise AssertionError("detect_anomalies should not query DuckDB anymore")
+
+    class _UnavailableRedis:
+        async def ping(self):
+            raise OSError("redis offline")
 
     monkeypatch.setattr(api_main, "_resolve_reference_ts", _fake_resolve_reference_ts)
-    monkeypatch.setattr(api_main, "_dq", _fake_dq)
+    monkeypatch.setattr(api_main, "_dq", _unexpected_dq)
+    api_main.app.state.redis = _FakeRedis(
+        ids=["drv_demo_001"],
+        tracks={
+            "fleet:track:drv_demo_001": [
+                _track_point("2024-01-02T12:05:00+00:00", 12.0, "delivering"),
+                _track_point("2024-01-02T12:04:00+00:00", 11.0, "delivering"),
+                _track_point("2024-01-02T12:03:00+00:00", 12.0, "delivering"),
+            ]
+        },
+    )
 
     first = asyncio.run(
         api_main.detect_anomalies(
@@ -190,7 +224,7 @@ def test_detect_anomalies_reuses_stale_cache_when_duckdb_fails(monkeypatch):
             reference_ts=None,
         )
     )
-    call_state["should_fail"] = True
+    api_main.app.state.redis = _UnavailableRedis()
     second = asyncio.run(
         api_main.detect_anomalies(
             fenetre_minutes=10,
@@ -200,26 +234,33 @@ def test_detect_anomalies_reuses_stale_cache_when_duckdb_fails(monkeypatch):
         )
     )
 
-    assert first["cold_path_available"] is True
+    assert first["analytics_status"]["source"] == "hot_path_live"
     assert second["cold_path_available"] is False
     assert second["analytics_status"]["source"] == "stale_cache"
-    assert second["resume"]["livreurs_scannes"] == 7
+    assert second["analytics_status"]["degraded"] is False
+    assert second["resume"]["livreurs_scannes"] == 1
     assert second["analytics_status"]["snapshot_age_s"] >= 0
 
 
-def test_zone_coverage_reuses_stale_cache_when_duckdb_fails(monkeypatch):
+def test_zone_coverage_uses_live_zone_context_when_duckdb_fails(monkeypatch):
     ref_ts = datetime(2024, 1, 2, 12, 5, tzinfo=timezone.utc)
-    call_state = {"should_fail": False}
 
     async def _fake_resolve_reference_ts(_value=None):  # noqa: ANN001
         return ref_ts, {"source": "test"}
 
     async def _fake_dq(*_args, **_kwargs):  # noqa: ANN001
-        if call_state["should_fail"]:
-            raise HTTPException(status_code=504, detail="DuckDB timeout (4.0s).")
-        return [(40.76, -73.98, 120)]
+        raise HTTPException(status_code=504, detail="DuckDB timeout (4.0s).")
 
     redis = _FakeRedis(
+        hashes={
+            "copilot:context:zone:40.76_-73.98": {
+                "zone_id": "40.76_-73.98",
+                "demand_index": "1.8",
+                "supply_index": "0.9",
+                "traffic_factor": "1.1",
+                "forecast_demand_index_15m": "2.4",
+            }
+        },
         geosearch_rows=[
             ("drv_demo_001", (-73.98, 40.76)),
         ]
@@ -229,16 +270,13 @@ def test_zone_coverage_reuses_stale_cache_when_duckdb_fails(monkeypatch):
     monkeypatch.setattr(api_main, "_dq", _fake_dq)
     api_main.app.state.redis = redis
 
-    first = asyncio.run(api_main.zone_coverage(resolution=0.02, heures=1, reference_ts=None))
-    call_state["should_fail"] = True
-    second = asyncio.run(api_main.zone_coverage(resolution=0.02, heures=1, reference_ts=None))
+    payload = asyncio.run(api_main.zone_coverage(resolution=0.02, heures=1, reference_ts=None))
 
-    assert first["cold_path_available"] is True
-    assert first["nb_zones_analysees"] == 1
-    assert second["cold_path_available"] is False
-    assert second["analytics_status"]["source"] == "stale_cache"
-    assert second["nb_zones_analysees"] == 1
-    assert second["toutes_zones"][0]["passages_historiques"] == 120
+    assert payload["cold_path_available"] is False
+    assert payload["analytics_status"]["source"] == "live_zone_context"
+    assert payload["analytics_status"]["degraded"] is False
+    assert payload["nb_zones_analysees"] == 1
+    assert payload["toutes_zones"][0]["livreurs_actifs"] == 1
 
 
 def test_fleet_insights_reuses_stale_historical_snapshot_when_duckdb_fails(monkeypatch):
@@ -284,7 +322,8 @@ def test_fleet_insights_reuses_stale_historical_snapshot_when_duckdb_fails(monke
 
     assert first["cold_path_available"] is True
     assert second["cold_path_available"] is False
-    assert second["analytics_status"]["source"] == "stale_cache"
+    assert second["analytics_status"]["source"] == "stale_cache_blended"
+    assert second["analytics_status"]["degraded"] is False
     assert second["productivite_historique"]["vitesse_moyenne_kmh"] == 12.0
     assert second["flotte_temps_reel"]["total_actifs"] == 1
 
@@ -300,6 +339,7 @@ def test_history_returns_structured_fallback_when_duckdb_fails(monkeypatch):
 
     monkeypatch.setattr(api_main, "_resolve_reference_ts", _fake_resolve_reference_ts)
     monkeypatch.setattr(api_main, "_dq", _failing_dq)
+    api_main.app.state.redis = _FakeRedis()
 
     payload = asyncio.run(
         api_main.history(
@@ -311,9 +351,129 @@ def test_history_returns_structured_fallback_when_duckdb_fails(monkeypatch):
 
     assert payload["cold_path_available"] is False
     assert payload["analytics_status"]["source"] == "cold_path_fallback"
+    assert payload["resume"]["nb_points"] == 0
+    assert payload["resume"]["distance_totale_km"] == 0.0
     assert payload["trajectory"] == []
     assert payload["livreur_id"] == "drv_demo_001"
     assert "DuckDB timeout" in payload["detail"]
+
+
+def test_history_uses_live_track_fallback_when_duckdb_fails(monkeypatch):
+    ref_ts = datetime(2024, 1, 2, 12, 5, tzinfo=timezone.utc)
+
+    async def _fake_resolve_reference_ts(_value=None):  # noqa: ANN001
+        return ref_ts, {"mode": "explicit", "source": "test"}
+
+    async def _failing_dq(*_args, **_kwargs):  # noqa: ANN001
+        raise HTTPException(status_code=504, detail="DuckDB timeout (4.0s).")
+
+    redis = _FakeRedis(
+        tracks={
+            "fleet:track:drv_demo_001": [
+                json.dumps(
+                    {
+                        "lat": 40.7580,
+                        "lon": -73.9855,
+                        "ts": "2024-01-02T12:05:00+00:00",
+                        "speed_kmh": 12.0,
+                        "status": "delivering",
+                        "route_source": "osrm",
+                        "anomaly_state": "ok",
+                    },
+                    separators=(",", ":"),
+                ),
+                json.dumps(
+                    {
+                        "lat": 40.7586,
+                        "lon": -73.9848,
+                        "ts": "2024-01-02T12:04:00+00:00",
+                        "speed_kmh": 11.0,
+                        "status": "delivering",
+                        "route_source": "osrm",
+                        "anomaly_state": "ok",
+                    },
+                    separators=(",", ":"),
+                ),
+            ]
+        }
+    )
+
+    monkeypatch.setattr(api_main, "_resolve_reference_ts", _fake_resolve_reference_ts)
+    monkeypatch.setattr(api_main, "_dq", _failing_dq)
+    api_main.app.state.redis = redis
+
+    payload = asyncio.run(
+        api_main.history(
+            livreur_id="drv_demo_001",
+            heures=1,
+            reference_ts=None,
+        )
+    )
+
+    assert payload["cold_path_available"] is False
+    assert payload["analytics_status"]["source"] == "hot_path_live"
+    assert payload["analytics_status"]["degraded"] is False
+    assert payload["resume"]["nb_points"] == 2
+    assert len(payload["trajectory"]) == 2
+    assert "detail" not in payload
+
+
+def test_history_uses_live_track_fallback_when_cold_path_has_no_rows(monkeypatch):
+    ref_ts = datetime(2024, 1, 2, 12, 5, tzinfo=timezone.utc)
+
+    async def _fake_resolve_reference_ts(_value=None):  # noqa: ANN001
+        return ref_ts, {"mode": "explicit", "source": "test"}
+
+    async def _empty_dq(*_args, **_kwargs):  # noqa: ANN001
+        return []
+
+    redis = _FakeRedis(
+        tracks={
+            "fleet:track:drv_demo_001": [
+                json.dumps(
+                    {
+                        "lat": 40.7580,
+                        "lon": -73.9855,
+                        "ts": "2024-01-02T12:05:00+00:00",
+                        "speed_kmh": 12.0,
+                        "status": "delivering",
+                        "route_source": "osrm",
+                        "anomaly_state": "ok",
+                    },
+                    separators=(",", ":"),
+                ),
+                json.dumps(
+                    {
+                        "lat": 40.7586,
+                        "lon": -73.9848,
+                        "ts": "2024-01-02T12:04:00+00:00",
+                        "speed_kmh": 11.0,
+                        "status": "delivering",
+                        "route_source": "osrm",
+                        "anomaly_state": "ok",
+                    },
+                    separators=(",", ":"),
+                ),
+            ]
+        }
+    )
+
+    monkeypatch.setattr(api_main, "_resolve_reference_ts", _fake_resolve_reference_ts)
+    monkeypatch.setattr(api_main, "_dq", _empty_dq)
+    api_main.app.state.redis = redis
+
+    payload = asyncio.run(
+        api_main.history(
+            livreur_id="drv_demo_001",
+            heures=1,
+            reference_ts=None,
+        )
+    )
+
+    assert payload["cold_path_available"] is False
+    assert payload["analytics_status"]["source"] == "hot_path_live"
+    assert payload["resume"]["nb_points"] == 2
+    assert len(payload["trajectory"]) == 2
 
 
 def test_history_reuses_stale_cache_when_duckdb_fails(monkeypatch):
@@ -339,6 +499,8 @@ def test_history_reuses_stale_cache_when_duckdb_fails(monkeypatch):
     monkeypatch.setattr(api_main, "_dq", _fake_dq)
 
     first = asyncio.run(api_main.history(livreur_id="drv_demo_001", heures=1, reference_ts=None))
+    for key, (_expires_at, cached_at, payload) in list(api_main._analytics_result_cache.items()):
+        api_main._analytics_result_cache[key] = (0.0, cached_at, payload)
     call_state["should_fail"] = True
     second = asyncio.run(api_main.history(livreur_id="drv_demo_001", heures=1, reference_ts=None))
 
@@ -347,6 +509,7 @@ def test_history_reuses_stale_cache_when_duckdb_fails(monkeypatch):
     assert second["analytics_status"]["source"] == "stale_cache"
     assert second["resume"]["distance_totale_km"] == 1.23
     assert len(second["trajectory"]) == 2
+    assert "detail" not in second
 
 
 def test_driver_score_returns_structured_fallback_when_duckdb_fails(monkeypatch):
@@ -360,6 +523,7 @@ def test_driver_score_returns_structured_fallback_when_duckdb_fails(monkeypatch)
 
     monkeypatch.setattr(api_main, "_resolve_reference_ts", _fake_resolve_reference_ts)
     monkeypatch.setattr(api_main, "_dq", _failing_dq)
+    api_main.app.state.redis = _FakeRedis()
 
     payload = asyncio.run(
         api_main.driver_score(
@@ -376,50 +540,167 @@ def test_driver_score_returns_structured_fallback_when_duckdb_fails(monkeypatch)
     assert "DuckDB timeout" in payload["detail"]
 
 
-def test_detect_gps_fraud_reuses_stale_cache_when_duckdb_fails(monkeypatch):
+def test_driver_score_uses_live_track_fallback_when_duckdb_fails(monkeypatch):
     ref_ts = datetime(2024, 1, 2, 12, 5, tzinfo=timezone.utc)
-    call_state = {"should_fail": False}
+
+    async def _fake_resolve_reference_ts(_value=None):  # noqa: ANN001
+        return ref_ts, {"mode": "explicit", "source": "test"}
+
+    async def _failing_dq(*_args, **_kwargs):  # noqa: ANN001
+        raise HTTPException(status_code=504, detail="DuckDB timeout (4.0s).")
+
+    redis = _FakeRedis(
+        tracks={
+            "fleet:track:drv_demo_001": [
+                json.dumps(
+                    {
+                        "lat": 40.7580,
+                        "lon": -73.9855,
+                        "ts": "2024-01-02T12:05:00+00:00",
+                        "speed_kmh": 17.0,
+                        "status": "delivering",
+                    },
+                    separators=(",", ":"),
+                ),
+                json.dumps(
+                    {
+                        "lat": 40.7586,
+                        "lon": -73.9848,
+                        "ts": "2024-01-02T12:04:00+00:00",
+                        "speed_kmh": 14.0,
+                        "status": "available",
+                    },
+                    separators=(",", ":"),
+                ),
+            ]
+        }
+    )
+
+    monkeypatch.setattr(api_main, "_resolve_reference_ts", _fake_resolve_reference_ts)
+    monkeypatch.setattr(api_main, "_dq", _failing_dq)
+    api_main.app.state.redis = redis
+
+    payload = asyncio.run(
+        api_main.driver_score(
+            livreur_id="drv_demo_001",
+            heures=1,
+            reference_ts=None,
+        )
+    )
+
+    assert payload["cold_path_available"] is False
+    assert payload["analytics_status"]["source"] == "hot_path_live"
+    assert payload["analytics_status"]["degraded"] is False
+    assert payload["score_global"] >= 0
+    assert payload["metriques"]["vitesse_moyenne_kmh"] == 15.5
+    assert "detail" not in payload
+
+
+def test_driver_score_uses_live_track_fallback_when_cold_path_has_no_rows(monkeypatch):
+    ref_ts = datetime(2024, 1, 2, 12, 5, tzinfo=timezone.utc)
+
+    async def _fake_resolve_reference_ts(_value=None):  # noqa: ANN001
+        return ref_ts, {"mode": "explicit", "source": "test"}
+
+    async def _empty_dq(*_args, **_kwargs):  # noqa: ANN001
+        return []
+
+    redis = _FakeRedis(
+        tracks={
+            "fleet:track:drv_demo_001": [
+                json.dumps(
+                    {
+                        "lat": 40.7580,
+                        "lon": -73.9855,
+                        "ts": "2024-01-02T12:05:00+00:00",
+                        "speed_kmh": 12.0,
+                        "status": "delivering",
+                    },
+                    separators=(",", ":"),
+                ),
+                json.dumps(
+                    {
+                        "lat": 40.7586,
+                        "lon": -73.9848,
+                        "ts": "2024-01-02T12:04:00+00:00",
+                        "speed_kmh": 10.0,
+                        "status": "delivering",
+                    },
+                    separators=(",", ":"),
+                ),
+            ]
+        }
+    )
+
+    monkeypatch.setattr(api_main, "_resolve_reference_ts", _fake_resolve_reference_ts)
+    monkeypatch.setattr(api_main, "_dq", _empty_dq)
+    api_main.app.state.redis = redis
+
+    payload = asyncio.run(
+        api_main.driver_score(
+            livreur_id="drv_demo_001",
+            heures=1,
+            reference_ts=None,
+        )
+    )
+
+    assert payload["cold_path_available"] is False
+    assert payload["analytics_status"]["source"] == "hot_path_live"
+    assert payload["score_global"] >= 0
+    assert payload["metriques"]["taux_livraison_pct"] == 100.0
+
+
+def test_analytics_status_payload_clears_stale_detail():
+    payload = api_main._analytics_status_payload(
+        {"resume": {"ok": True}, "detail": "old warning"},
+        cold_path_available=False,
+        degraded=False,
+        source="stale_cache",
+        detail="",
+    )
+
+    assert payload["analytics_status"]["source"] == "stale_cache"
+    assert "detail" not in payload
+
+
+def test_detect_gps_fraud_uses_live_validated_tracks_and_only_surfaces_frozen_positions(monkeypatch):
+    ref_ts = datetime(2024, 1, 2, 12, 5, tzinfo=timezone.utc)
 
     async def _fake_resolve_reference_ts(_value=None):  # noqa: ANN001
         return ref_ts, {"source": "test"}
 
-    async def _fake_dq(sql, *_args, **_kwargs):  # noqa: ANN001
-        if call_state["should_fail"]:
-            raise HTTPException(status_code=504, detail="DuckDB timeout (4.0s).")
-        if "SELECT * FROM fraud" in sql:
-            return [
-                (
-                    "drv_demo_001",
-                    40.76,
-                    -73.98,
-                    40.75,
-                    -73.97,
-                    ref_ts,
-                    ref_ts,
-                    22.0,
-                    2.8,
-                    168.0,
-                )
-            ]
-        if "HAVING COUNT(*) >= 5" in sql:
-            return [("drv_demo_002", 40.76, -73.98, 6, ref_ts, ref_ts)]
-        if "COUNT(DISTINCT livreur_id)" in sql:
-            return [(4,)]
-        raise AssertionError(f"Unexpected SQL: {sql}")
+    async def _unexpected_dq(*_args, **_kwargs):  # noqa: ANN001
+        raise AssertionError("detect_gps_fraud should no longer query DuckDB")
+
+    redis = _FakeRedis(
+        ids=["drv_demo_001", "drv_demo_002"],
+        tracks={
+            "fleet:track:drv_demo_001": [
+                _track_point("2024-01-02T12:05:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T12:04:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T12:03:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T12:02:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T12:01:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T12:00:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T11:59:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T11:58:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T11:57:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T11:56:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T11:55:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T11:54:00+00:00", 0.0, "delivering"),
+            ],
+            "fleet:track:drv_demo_002": [
+                _track_point("2024-01-02T12:05:00+00:00", 12.0, "delivering"),
+                _track_point("2024-01-02T12:04:00+00:00", 10.0, "delivering"),
+            ],
+        },
+    )
 
     monkeypatch.setattr(api_main, "_resolve_reference_ts", _fake_resolve_reference_ts)
-    monkeypatch.setattr(api_main, "_dq", _fake_dq)
+    monkeypatch.setattr(api_main, "_dq", _unexpected_dq)
+    api_main.app.state.redis = redis
 
-    first = asyncio.run(
-        api_main.detect_gps_fraud(
-            fenetre_minutes=15,
-            seuil_teleport_km=2.0,
-            vitesse_max_physique_kmh=90.0,
-            reference_ts=None,
-        )
-    )
-    call_state["should_fail"] = True
-    second = asyncio.run(
+    payload = asyncio.run(
         api_main.detect_gps_fraud(
             fenetre_minutes=15,
             seuil_teleport_km=2.0,
@@ -428,13 +709,17 @@ def test_detect_gps_fraud_reuses_stale_cache_when_duckdb_fails(monkeypatch):
         )
     )
 
-    assert first["cold_path_available"] is True
-    assert second["cold_path_available"] is False
-    assert second["analytics_status"]["source"] == "stale_cache"
-    assert second["resume"]["total_fraudes"] == 2
+    assert payload["cold_path_available"] is False
+    assert payload["analytics_status"]["source"] == "hot_path_live"
+    assert payload["analytics_status"]["degraded"] is False
+    assert payload["resume"]["teleportations"] == 0
+    assert payload["resume"]["positions_figees"] == 1
+    assert payload["resume"]["total_fraudes"] == 1
+    assert payload["positions_figees"][0]["livreur_id"] == "drv_demo_001"
+    assert payload["teleportations"] == []
 
 
-def test_predict_demand_returns_structured_fallback_when_duckdb_fails(monkeypatch):
+def test_predict_demand_uses_live_zone_context_when_duckdb_fails(monkeypatch):
     ref_ts = datetime(2024, 1, 2, 12, 5, tzinfo=timezone.utc)
 
     async def _fake_resolve_reference_ts(_value=None):  # noqa: ANN001
@@ -445,6 +730,18 @@ def test_predict_demand_returns_structured_fallback_when_duckdb_fails(monkeypatc
 
     monkeypatch.setattr(api_main, "_resolve_reference_ts", _fake_resolve_reference_ts)
     monkeypatch.setattr(api_main, "_dq", _failing_dq)
+    api_main.app.state.redis = _FakeRedis(
+        hashes={
+            "copilot:context:zone:40.76_-73.98": {
+                "zone_id": "40.76_-73.98",
+                "demand_index": "1.4",
+                "supply_index": "0.8",
+                "traffic_factor": "1.1",
+                "forecast_demand_index_15m": "2.0",
+                "demand_trend": "0.22",
+            }
+        }
+    )
 
     payload = asyncio.run(
         api_main.predict_demand(
@@ -454,7 +751,7 @@ def test_predict_demand_returns_structured_fallback_when_duckdb_fails(monkeypatc
     )
 
     assert payload["cold_path_available"] is False
-    assert payload["analytics_status"]["source"] == "cold_path_fallback"
-    assert payload["nb_zones_analysees"] == 0
-    assert payload["dispatch_prioritaire"] == []
-    assert "DuckDB timeout" in payload["detail"]
+    assert payload["analytics_status"]["source"] == "live_zone_context"
+    assert payload["analytics_status"]["degraded"] is False
+    assert payload["nb_zones_analysees"] == 1
+    assert payload["dispatch_prioritaire"]

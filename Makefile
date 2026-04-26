@@ -1,4 +1,4 @@
-.PHONY: up fleet-up down logs build clean restart status train-copilot train-copilot-10m train-copilot-report demo-copilot demo-rank demo-next-zone bench-copilot smoke-e2e perf-lot4 proof-lot4 real-mode sim-mode demo-ingest prepare-routing-osrm single-driver-reset single-driver-up single-driver-down single-driver-logs focus-map demo-scoreboard demo-scenarios build-mart query-kpis fleet-demo-up fleet-demo-down fleet-demo-check fleet-jury-up fleet-jury-down fleet-jury-check
+.PHONY: up fleet-up down logs build clean restart status train-copilot train-copilot-10m train-copilot-report demo-copilot demo-rank demo-next-zone bench-copilot smoke-e2e perf-lot4 proof-lot4 real-mode sim-mode demo-ingest prepare-routing-osrm single-driver-reset single-driver-up single-driver-down single-driver-logs courier-reset courier-up courier-down courier-logs focus-map demo-scoreboard demo-scenarios build-mart query-kpis fleet-demo-up fleet-demo-down fleet-demo-check fleet-jury-up fleet-jury-down fleet-jury-check
 
 ## Lance l'intégralité du stack (build + démarrage)
 up:
@@ -109,6 +109,14 @@ single-driver-reset:
 	    fleet:geo
 	docker compose restart tlc-replay
 	@echo "✓ Runtime state reset (cursors + fleet:geo) — model pickle untouched"
+
+courier-reset: single-driver-reset
+
+courier-up: single-driver-up
+
+courier-down: single-driver-down
+
+courier-logs: single-driver-logs
 
 ## Stop + logs helpers pour le scénario single-driver.
 single-driver-down:

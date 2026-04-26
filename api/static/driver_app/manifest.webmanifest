@@ -1,7 +1,7 @@
 {
-  "name": "FleetStream Driver Copilot Demo",
-  "short_name": "Driver Copilot",
-  "description": "Single-driver demo application for the FleetStream oral presentation.",
+  "name": "FleetStream Courier Copilot Demo",
+  "short_name": "Courier Copilot",
+  "description": "Single-courier food delivery demo application for the FleetStream oral presentation.",
   "start_url": "/copilot/driver-app",
   "scope": "/copilot/driver-app",
   "display": "standalone",

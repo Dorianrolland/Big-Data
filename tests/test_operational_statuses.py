@@ -116,7 +116,14 @@ class _FakeRedis:
         return _FakePipeline(self)
 
 
-def _track_point(ts: str, speed_kmh: float, status: str) -> str:
+def _track_point(
+    ts: str,
+    speed_kmh: float,
+    status: str,
+    *,
+    route_source: str = "osrm",
+    anomaly_state: str = "ok",
+) -> str:
     return json.dumps(
         {
             "lat": 40.71,
@@ -124,8 +131,8 @@ def _track_point(ts: str, speed_kmh: float, status: str) -> str:
             "ts": ts,
             "speed_kmh": speed_kmh,
             "status": status,
-            "route_source": "osrm",
-            "anomaly_state": "ok",
+            "route_source": route_source,
+            "anomaly_state": anomaly_state,
         },
         separators=(",", ":"),
     )
@@ -205,9 +212,9 @@ def test_fleet_insights_separates_pickup_repositioning_and_duration_based_suspec
         },
         tracks={
             "fleet:track:drv_delivering": [
-                _track_point("2024-01-02T12:04:00+00:00", 0.0, "delivering"),
-                _track_point("2024-01-02T12:03:00+00:00", 0.2, "delivering"),
-                _track_point("2024-01-02T12:02:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T12:04:00+00:00", 0.0, "delivering", route_source="hold"),
+                _track_point("2024-01-02T12:03:00+00:00", 0.2, "delivering", route_source="hold"),
+                _track_point("2024-01-02T12:02:00+00:00", 0.0, "delivering", route_source="hold"),
             ],
             "fleet:track:drv_pickup": [
                 _track_point("2024-01-02T12:04:00+00:00", 0.0, "pickup_en_route"),
@@ -242,20 +249,29 @@ def test_fleet_insights_separates_pickup_repositioning_and_duration_based_suspec
 
 def test_detect_anomalies_uses_stationary_duration_threshold(monkeypatch):
     ref_ts = datetime(2024, 1, 2, 12, 5, tzinfo=timezone.utc)
-    captured: dict[str, object] = {}
 
     async def _fake_resolve_reference_ts(_value=None):  # noqa: ANN001
         return ref_ts, {"source": "test"}
 
-    async def _fake_dq(sql, params=None, **_kwargs):  # noqa: ANN001
-        if "COUNT(DISTINCT livreur_id)" in sql:
-            return [(0,)]
-        captured["sql"] = sql
-        captured["params"] = list(params or [])
-        return []
+    async def _unexpected_dq(*_args, **_kwargs):  # noqa: ANN001
+        raise AssertionError("detect_anomalies should not use DuckDB anymore")
+
+    redis = _FakeRedis(
+        ids=["drv_hold"],
+        tracks={
+            "fleet:track:drv_hold": [
+                _track_point("2024-01-02T12:05:00+00:00", 0.0, "delivering", route_source="hold"),
+                _track_point("2024-01-02T12:04:00+00:00", 0.0, "delivering", route_source="hold"),
+                _track_point("2024-01-02T12:03:00+00:00", 0.0, "delivering", route_source="hold"),
+                _track_point("2024-01-02T12:02:00+00:00", 16.0, "delivering"),
+                _track_point("2024-01-02T12:01:00+00:00", 15.0, "delivering"),
+            ],
+        },
+    )
 
     monkeypatch.setattr(api_main, "_resolve_reference_ts", _fake_resolve_reference_ts)
-    monkeypatch.setattr(api_main, "_dq", _fake_dq)
+    monkeypatch.setattr(api_main, "_dq", _unexpected_dq)
+    api_main.app.state.redis = redis
 
     payload = asyncio.run(
         api_main.detect_anomalies(
@@ -266,12 +282,73 @@ def test_detect_anomalies_uses_stationary_duration_threshold(monkeypatch):
         )
     )
 
-    sql = str(captured["sql"])
-    params = captured["params"]
-    assert "immobile_duration_s" in sql
-    assert "immobile_duration_s >= ?" in sql
-    assert params[-1] == api_main.ANOMALY_STATIONARY_MIN_SECONDS
+    assert payload["analytics_status"]["source"] == "hot_path_live"
     assert (
         payload["seuils"]["immobilisation_duree_min_secondes"]
         == api_main.ANOMALY_STATIONARY_MIN_SECONDS
     )
+    assert (
+        payload["seuils"]["vitesse_excessive_min_occurrences"]
+        == api_main.ANOMALY_SPEED_MIN_EXCEEDANCES
+    )
+    assert payload["resume"]["anomalies_detectees"] == 1
+    assert payload["anomalies"][0]["anomalies"][0]["type"] == "IMMOBILISATION_SUSPECTE"
+
+
+def test_detect_gps_fraud_uses_live_tracks_and_frozen_duration_thresholds(monkeypatch):
+    ref_ts = datetime(2024, 1, 2, 12, 5, tzinfo=timezone.utc)
+
+    async def _fake_resolve_reference_ts(_value=None):  # noqa: ANN001
+        return ref_ts, {"source": "test"}
+
+    async def _unexpected_dq(*_args, **_kwargs):  # noqa: ANN001
+        raise AssertionError("detect_gps_fraud should not use DuckDB anymore")
+
+    redis = _FakeRedis(
+        ids=["drv_frozen", "drv_short"],
+        tracks={
+            "fleet:track:drv_frozen": [
+                _track_point("2024-01-02T12:05:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T12:04:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T12:03:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T12:02:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T12:01:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T12:00:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T11:59:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T11:58:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T11:57:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T11:56:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T11:55:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T11:54:00+00:00", 0.0, "delivering"),
+            ],
+            "fleet:track:drv_short": [
+                _track_point("2024-01-02T12:05:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T12:04:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T12:03:00+00:00", 0.0, "delivering"),
+                _track_point("2024-01-02T12:02:00+00:00", 0.0, "delivering"),
+            ],
+        },
+    )
+
+    monkeypatch.setattr(api_main, "_resolve_reference_ts", _fake_resolve_reference_ts)
+    monkeypatch.setattr(api_main, "_dq", _unexpected_dq)
+    api_main.app.state.redis = redis
+
+    payload = asyncio.run(
+        api_main.detect_gps_fraud(
+            fenetre_minutes=15,
+            seuil_teleport_km=2.0,
+            vitesse_max_physique_kmh=90.0,
+            reference_ts=None,
+        )
+    )
+
+    assert payload["seuils"]["min_interval_seconds"] == api_main.GPS_FRAUD_MIN_INTERVAL_SECONDS
+    assert payload["seuils"]["position_figee_min_rep"] == api_main.GPS_FRAUD_FROZEN_MIN_REPETITIONS
+    assert (
+        payload["seuils"]["position_figee_min_duration_s"]
+        == api_main.GPS_FRAUD_FROZEN_MIN_DURATION_SECONDS
+    )
+    assert payload["resume"]["teleportations"] == 0
+    assert payload["resume"]["positions_figees"] == 1
+    assert payload["positions_figees"][0]["livreur_id"] == "drv_frozen"

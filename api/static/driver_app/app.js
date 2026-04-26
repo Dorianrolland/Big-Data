@@ -93,7 +93,12 @@ function fmtSigned(value, digits = 1) {
 
 function fmtCurrency(value, digits = 2) {
   const num = Number(value);
-  return Number.isFinite(num) ? `${num.toFixed(digits)} EUR` : '-';
+  return Number.isFinite(num) ? `$${num.toFixed(digits)}` : '-';
+}
+
+function fmtCurrencyPerHour(value, digits = 1) {
+  const num = Number(value);
+  return Number.isFinite(num) ? `$${num.toFixed(digits)}/h` : '-';
 }
 
 function fmtFuelCost(value, digits = 2) {
@@ -208,7 +213,7 @@ function recommendationSubtitle(rec) {
   if (!rec) return 'Waiting for live data';
   if (rec.kind === 'reposition') return `Reposition to ${escapeHtml(rec.zone_id || 'next zone')}`;
   if (rec.kind === 'hold') return 'Hold and watch the next stronger pocket';
-  return `${escapeHtml(rec.decision_badge || 'Take')} - zone ${escapeHtml(rec.zone_id || 'unknown')}`;
+  return `${escapeHtml(rec.decision_badge || 'Take')} - delivery zone ${escapeHtml(rec.zone_id || 'unknown')}`;
 }
 
 function humanizeUiReason(value, fallback = '') {
@@ -221,7 +226,7 @@ function humanizeUiReason(value, fallback = '') {
     best_offers_around_unavailable: 'Nearby offer ranking is refreshing. The last useful live snapshot stays visible.',
     offers_unavailable: 'Offer feed is refreshing. The site keeps the most useful live snapshot visible.',
     shift_plan_unavailable: 'The longer-range plan is refreshing. Market-driven moves stay visible in the meantime.',
-    position_missing: 'The live driver position is still warming up.',
+    position_missing: 'The live courier position is still warming up.',
   };
   for (const [key, copy] of Object.entries(mapping)) {
     if (normalized.includes(key)) return copy;
@@ -231,10 +236,10 @@ function humanizeUiReason(value, fallback = '') {
 }
 
 function recommendationNarration(rec, demoContext) {
-  if (rec?.kind === 'offer') return 'Show the live order, explain the why chips, then zoom into the route map.';
-  if (rec?.kind === 'reposition') return 'Explain that the copilot found a stronger pocket and justify the fuel versus upside tradeoff.';
-  if (demoContext?.alias_active) return 'Explain that the demo account is linked to live fleet context so the jury always sees a real situation.';
-  return 'Show the market overview first, then explain why the copilot is waiting for a better order.';
+  if (rec?.kind === 'offer') return 'Accept the top delivery when the ETA and earnings are strong.';
+  if (rec?.kind === 'reposition') return 'Move toward the stronger demand pocket when the fuel tradeoff stays controlled.';
+  if (demoContext?.alias_active) return 'Live fleet context is linked to this courier profile.';
+  return 'Watch the market until a stronger delivery appears.';
 }
 
 function renderQualityBadges() {
@@ -253,8 +258,8 @@ function renderHeader() {
   setText(
     'brandSubtitle',
     demoContext.alias_active
-      ? `${DEMO_DRIVER.name} - ${DEMO_DRIVER.vehicle} - linked to live fleet context`
-      : `${DEMO_DRIVER.name} - ${DEMO_DRIVER.vehicle}`
+        ? `${DEMO_DRIVER.name} - ${DEMO_DRIVER.vehicle} - live context`
+        : `${DEMO_DRIVER.name} - ${DEMO_DRIVER.vehicle}`
   );
   setText('staleBadge', stale ? 'Partial live data - cached snapshot kept' : 'Live snapshot ready');
   const staleBadge = $('staleBadge');
@@ -271,19 +276,19 @@ function renderHome() {
   const driverPosition = driver.position || {};
   const demoContext = state.brief?.demo_context || {};
 
-  setText('homeHeadline', recommendation?.coach_headline || 'Best order right now');
+  setText('homeHeadline', recommendation?.coach_headline || 'Next best action');
   setText(
     'homeSubheadline',
     recommendation?.kind === 'hold'
       ? 'The copilot prefers patience until the next strong opportunity appears.'
       : demoContext.alias_active
-        ? 'The site is using live fleet context to keep a concrete mission visible for the jury.'
-        : 'The copilot ranks this move highest for the current driver profile.'
+        ? 'Live fleet context is shaping the next action.'
+        : 'The copilot ranks this move highest for the current courier profile.'
   );
   setText('recommendationBadge', recommendationSubtitle(recommendation));
   setText('recommendationKind', recommendation?.kind ? recommendation.kind.toUpperCase() : 'WAIT');
   setText('metricScore', recommendation ? fmtPercent(recommendation.accept_score) : '-');
-  setText('metricProfit', recommendation ? fmtCurrency(recommendation.eur_per_hour_net, 1) : '-');
+  setText('metricProfit', recommendation ? fmtCurrencyPerHour(recommendation.eur_per_hour_net, 1) : '-');
   setText('metricTripNet', recommendation ? fmtCurrency(recommendation.estimated_net_eur, 2) : '-');
   setText('metricFuel', recommendation ? fmtFuelCost(recommendation.fuel_cost_usd, 2) : '-');
   setText('metricPickupEta', recommendation ? fmtMinutes(recommendation.pickup_eta_min) : '-');
@@ -299,19 +304,19 @@ function renderHome() {
   const active = state.activeJob;
   if (active) {
     const startedAt = active.started_at || active.accepted_at || nowIso();
-    setText('activeJobTitle', `${active.kind === 'reposition' ? 'Reposition' : 'Accepted order'} - ${active.zone_id || 'active mission'}`);
+    setText('activeJobTitle', `${active.kind === 'reposition' ? 'Reposition' : 'Accepted delivery'} - ${active.zone_id || 'active mission'}`);
     setText('activeJobStatus', 'Live mission');
-    setText('activeJobMeta', `Started ${new Date(startedAt).toLocaleTimeString()} | ${fmtCurrency(active.eur_per_hour_net, 1)} target upside | ${active.traffic_level || 'Traffic unknown'}`);
+    setText('activeJobMeta', `Started ${new Date(startedAt).toLocaleTimeString()} | ${fmtCurrencyPerHour(active.eur_per_hour_net, 1)} upside vs target | ${active.traffic_level || 'Traffic unknown'}`);
   } else {
-    setText('activeJobTitle', 'No accepted job yet.');
+    setText('activeJobTitle', 'No accepted delivery yet.');
     setText('activeJobStatus', recommendation?.kind === 'hold' ? 'Watch mode' : 'Idle');
     setText(
       'activeJobMeta',
       driverPosition.available
         ? recommendation?.kind === 'hold'
-          ? 'The copilot is watching the market. Use the Zones panel to explain the next move.'
-          : 'Take the recommended job to lock it in for the demo story.'
-        : 'Waiting for a live driver position before starting a mission.'
+        ? 'The copilot is watching the market. Check Zones for the next move.'
+          : 'Accept the recommended delivery to start the mission.'
+        : 'Waiting for a live courier position before starting a mission.'
     );
   }
 
@@ -322,7 +327,7 @@ function renderHome() {
   setText('railNarration', recommendationNarration(recommendation, demoContext));
   const takeButton = $('takeJobButton');
   if (takeButton) {
-    takeButton.textContent = recommendation?.kind === 'hold' ? 'Lock market watch' : 'Take this job';
+    takeButton.textContent = recommendation?.kind === 'hold' ? 'Lock market watch' : 'Accept this delivery';
   }
 }
 
@@ -337,14 +342,14 @@ function renderOrderCard(rec, index) {
         <span class="chip ${rec.decision_badge === 'Take' ? 'good' : rec.decision_badge === 'Skip' ? 'bad' : 'warn'}">${escapeHtml(rec.decision_badge || 'Maybe')}</span>
       </div>
       <div class="mini-grid">
-        <div class="mini-stat"><div class="metric-label">Profit</div><div class="metric-value">${escapeHtml(fmtCurrency(rec.eur_per_hour_net, 1))}</div></div>
+        <div class="mini-stat"><div class="metric-label">Net USD/h</div><div class="metric-value">${escapeHtml(fmtCurrencyPerHour(rec.eur_per_hour_net, 1))}</div></div>
         <div class="mini-stat"><div class="metric-label">Fuel</div><div class="metric-value">${escapeHtml(fmtFuelCost(rec.fuel_cost_usd, 2))}</div></div>
         <div class="mini-stat"><div class="metric-label">ETA</div><div class="metric-value">${escapeHtml(fmtMinutes(rec.full_eta_min))}</div></div>
         <div class="mini-stat"><div class="metric-label">Risk</div><div class="metric-value">${escapeHtml(rec.traffic_level || '-') }</div></div>
       </div>
       <div class="reason-list">${renderReasons(rec.coach_reasons || [])}</div>
       <div class="action-row">
-        <button class="solid-button subtle" type="button" data-action="take-order" data-index="${index}">Take this option</button>
+        <button class="solid-button subtle" type="button" data-action="take-order" data-index="${index}">Accept this option</button>
       </div>
     </article>
   `;
@@ -356,7 +361,7 @@ function renderOrders() {
   const list = [primary, ...alternatives].filter(Boolean).slice(0, 3);
   $('ordersList').innerHTML = list.length
     ? list.map((rec, index) => renderOrderCard(rec, index)).join('')
-    : '<div class="empty-state">No ranked options are available yet. The app will keep the last valid snapshot instead of blanking out.</div>';
+    : '<div class="empty-state">No ranked delivery options are available yet. The app keeps the last valid snapshot visible.</div>';
 }
 
 function renderZoneItem(zone, maxScore, variant) {
@@ -433,7 +438,7 @@ function renderShift() {
         </div>
         <div class="mini-grid">
           <div class="mini-stat"><div class="metric-label">Shift score</div><div class="metric-value">${escapeHtml(fmtNumber(item.shift_score, 2))}</div></div>
-          <div class="mini-stat"><div class="metric-label">Net EUR/h</div><div class="metric-value">${escapeHtml(fmtCurrency(item.estimated_net_eur_h, 1))}</div></div>
+          <div class="mini-stat"><div class="metric-label">Net USD/h</div><div class="metric-value">${escapeHtml(fmtCurrencyPerHour(item.estimated_net_eur_h, 1))}</div></div>
           <div class="mini-stat"><div class="metric-label">ETA</div><div class="metric-value">${escapeHtml(fmtMinutes(item.eta_min))}</div></div>
           <div class="mini-stat"><div class="metric-label">Confidence</div><div class="metric-value">${escapeHtml(fmtPercent(item.confidence))}</div></div>
         </div>
@@ -455,7 +460,7 @@ function renderShift() {
         <div class="mini-copy">${escapeHtml(entry.created_at || '')}</div>
       </article>
     `).join('')
-    : '<div class="empty-state">Accepted jobs and mission updates will appear here during the demo.</div>');
+    : '<div class="empty-state">Accepted deliveries and mission updates will appear here during the shift.</div>');
 }
 
 function populateProfileSheet() {
@@ -584,7 +589,7 @@ async function renderHomeMap() {
       weight: 2,
       fillColor: '#22d3ee',
       fillOpacity: 0.8,
-    }).addTo(state.homeLayer).bindTooltip('Driver');
+    }).addTo(state.homeLayer).bindTooltip('Courier');
   }
 
   if (pickup) {
@@ -594,7 +599,7 @@ async function renderHomeMap() {
       weight: 2,
       fillColor: '#ffb020',
       fillOpacity: 0.85,
-    }).addTo(state.homeLayer).bindTooltip(recommendation?.kind === 'reposition' ? 'Target zone' : 'Pickup');
+    }).addTo(state.homeLayer).bindTooltip(recommendation?.kind === 'reposition' ? 'Target zone' : 'Restaurant');
   }
 
   if (dropoff && recommendation?.kind === 'offer') {
@@ -604,7 +609,7 @@ async function renderHomeMap() {
       weight: 2,
       fillColor: '#34d399',
       fillOpacity: 0.82,
-    }).addTo(state.homeLayer).bindTooltip('Dropoff');
+    }).addTo(state.homeLayer).bindTooltip('Customer');
   }
 
   if (latLngs.length >= 2) {
@@ -681,7 +686,7 @@ function renderZonesMap() {
       fillColor: '#22d3ee',
       fillOpacity: 0.88,
     });
-    marker.bindTooltip('Driver');
+    marker.bindTooltip('Courier');
     marker.addTo(state.zonesLayer);
     bounds.push([Number(position.lat), Number(position.lon)]);
   }
@@ -704,13 +709,13 @@ function renderAll() {
 }
 
 async function refreshBrief({ silent = false } = {}) {
-  if (!silent) setUxStatus('Refreshing live driver briefing...');
+  if (!silent) setUxStatus('Refreshing live courier briefing...');
   try {
     const brief = await api(`/copilot/driver/${encodeURIComponent(DEMO_DRIVER.driverId)}/copilot-brief`);
     state.brief = brief;
     saveJson(STORAGE_KEYS.snapshot, brief);
     renderAll();
-    setUxStatus('Live driver briefing updated.');
+    setUxStatus('Live courier briefing updated.');
   } catch (err) {
     const fallback = loadJson(STORAGE_KEYS.snapshot, null);
     if (fallback) {
@@ -720,7 +725,7 @@ async function refreshBrief({ silent = false } = {}) {
       renderAll();
       setUxStatus(`Using cached briefing: ${err.message}`);
     } else {
-      setUxStatus(`Live driver briefing failed: ${err.message}`);
+      setUxStatus(`Live courier briefing failed: ${err.message}`);
     }
   }
 }
@@ -743,7 +748,7 @@ function stopPolling() {
 async function applyPreset(presetName) {
   const payload = PRESETS[presetName];
   if (!payload) return;
-  $('onboardingStatus').textContent = 'Applying driver preset...';
+  $('onboardingStatus').textContent = 'Applying courier preset...';
   try {
     await api(`/copilot/driver/${encodeURIComponent(DEMO_DRIVER.driverId)}/profile`, {
       method: 'PUT',
@@ -770,7 +775,7 @@ function takeRecommendation(rec) {
     }
     appendJournal({
       title: 'Watch mode armed',
-      subtitle: humanizeUiReason(rec.coach_warning, 'Waiting for the next strong order.'),
+      subtitle: humanizeUiReason(rec.coach_warning, 'Waiting for the next strong delivery.'),
       status: 'watch',
       created_at: new Date().toLocaleTimeString(),
     });
@@ -786,13 +791,13 @@ function takeRecommendation(rec) {
   };
   persistActiveJob(job);
   appendJournal({
-    title: rec.kind === 'reposition' ? `Reposition locked - ${rec.zone_id || 'target zone'}` : `Order locked - ${rec.offer_id || rec.zone_id || 'offer'}`,
+    title: rec.kind === 'reposition' ? `Reposition locked - ${rec.zone_id || 'target zone'}` : `Delivery locked - ${rec.offer_id || rec.zone_id || 'offer'}`,
     subtitle: rec.coach_headline || recommendationSubtitle(rec),
     status: 'accepted',
     created_at: new Date().toLocaleTimeString(),
   });
   renderAll();
-  setUxStatus('Mission locked in for the demo.');
+    setUxStatus('Delivery mission locked in for this shift.');
 }
 
 async function submitMissionReport(activeJob, success) {
@@ -812,7 +817,7 @@ async function submitMissionReport(activeJob, success) {
         baseline_eur_h: Number(state.brief?.alternatives?.[0]?.eur_per_hour_net || 0),
         realized_best_offer_eur_h: success ? Number(activeJob.eur_per_hour_net || 0) : null,
         route_source: activeJob.route_source || null,
-        stop_reason: success ? 'Completed from driver demo app' : 'Stopped from driver demo app',
+        stop_reason: success ? 'Completed from courier app' : 'Stopped from courier app',
         success: Boolean(success),
         target_lat: Number(activeJob.dropoff?.lat || activeJob.zone?.lat || activeJob.dropoff?.latitude || 0) || null,
         target_lon: Number(activeJob.dropoff?.lon || activeJob.zone?.lon || activeJob.dropoff?.longitude || 0) || null,
@@ -828,8 +833,8 @@ async function completeMission() {
   const activeJob = state.activeJob;
   await submitMissionReport(activeJob, true);
   appendJournal({
-    title: `Mission completed - ${activeJob.zone_id || activeJob.offer_id || 'job'}`,
-    subtitle: activeJob.coach_headline || 'Completed from the driver app',
+    title: `Mission completed - ${activeJob.zone_id || activeJob.offer_id || 'delivery'}`,
+    subtitle: activeJob.coach_headline || 'Completed from the courier app',
     status: 'completed',
     created_at: new Date().toLocaleTimeString(),
   });
@@ -843,8 +848,8 @@ async function stopMission() {
   const activeJob = state.activeJob;
   await submitMissionReport(activeJob, false);
   appendJournal({
-    title: `Mission stopped - ${activeJob.zone_id || activeJob.offer_id || 'job'}`,
-    subtitle: activeJob.coach_warning || 'Stopped from the driver app',
+    title: `Mission stopped - ${activeJob.zone_id || activeJob.offer_id || 'delivery'}`,
+    subtitle: activeJob.coach_warning || 'Stopped from the courier app',
     status: 'stopped',
     created_at: new Date().toLocaleTimeString(),
   });
@@ -866,7 +871,7 @@ async function saveProfile() {
       method: 'PUT',
       body: JSON.stringify(payload),
     });
-    $('profileStatus').textContent = 'Profile saved. Refreshing driver briefing...';
+    $('profileStatus').textContent = 'Profile saved. Refreshing courier briefing...';
     await refreshBrief({ silent: true });
     $('profileStatus').textContent = 'Profile saved.';
   } catch (err) {
@@ -960,7 +965,7 @@ function boot() {
     setStage('login');
   }
 
-  setUxStatus('Driver Copilot ready.');
+  setUxStatus('Courier Copilot ready.');
 }
 
 boot();

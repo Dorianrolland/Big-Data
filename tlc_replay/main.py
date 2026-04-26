@@ -39,6 +39,7 @@ from aiokafka import AIOKafkaProducer
 from dotenv import load_dotenv
 
 from copilot_events_pb2 import CourierPositionV1, OrderEventV1, OrderOfferV1
+from motion import build_motion_schedule, progress_at_elapsed
 
 load_dotenv()
 
@@ -96,9 +97,12 @@ TLC_ROUTE_FETCH_TIMEOUT_S = float(os.getenv("TLC_ROUTE_FETCH_TIMEOUT_S", "2.5"))
 TLC_ROUTE_LINEAR_FALLBACK_ALLOWED = os.getenv("TLC_ROUTE_LINEAR_FALLBACK_ALLOWED", "true").lower() in {
     "1", "true", "yes", "on",
 }
+TLC_STRICT_ROAD_GEOMETRY = os.getenv("TLC_STRICT_ROAD_GEOMETRY", "true").lower() in {
+    "1", "true", "yes", "on",
+}
 TLC_ROUTE_SYNC_ON_CACHE_MISS = os.getenv(
     "TLC_ROUTE_SYNC_ON_CACHE_MISS",
-    "false" if TLC_SCENARIO == "fleet" else "true",
+    "true",
 ).lower() in {"1", "true", "yes", "on"}
 TLC_ROUTE_SYNC_KEY_REPEAT_THRESHOLD = max(
     1,
@@ -113,6 +117,26 @@ TLC_ROUTE_CACHE_MAX = int(os.getenv("TLC_ROUTE_CACHE_MAX", "4096"))
 TLC_ROUTE_DENSIFY_MAX_STEP_KM = max(0.0, float(os.getenv("TLC_ROUTE_DENSIFY_MAX_STEP_KM", "0.05") or "0.05"))
 TLC_LIVE_ROUTE_MAX_STEP_KM = max(0.02, float(os.getenv("TLC_LIVE_ROUTE_MAX_STEP_KM", "0.08") or "0.08"))
 TLC_LIVE_ROUTE_MAX_POINTS_PER_TICK = max(1, int(os.getenv("TLC_LIVE_ROUTE_MAX_POINTS_PER_TICK", "12") or "12"))
+TLC_COURIER_SIGNAL_MIN_SPACING_KM = max(
+    0.08,
+    float(os.getenv("TLC_COURIER_SIGNAL_MIN_SPACING_KM", "0.16") or "0.16"),
+)
+TLC_COURIER_SIGNAL_TURN_THRESHOLD_DEG = max(
+    10.0,
+    float(os.getenv("TLC_COURIER_SIGNAL_TURN_THRESHOLD_DEG", "28.0") or "28.0"),
+)
+TLC_COURIER_SIGNAL_BASE_STOP_SECONDS = max(
+    2.0,
+    float(os.getenv("TLC_COURIER_SIGNAL_BASE_STOP_SECONDS", "5.0") or "5.0"),
+)
+TLC_COURIER_SIGNAL_MAX_PAUSE_RATIO = min(
+    0.45,
+    max(0.0, float(os.getenv("TLC_COURIER_SIGNAL_MAX_PAUSE_RATIO", "0.28") or "0.28")),
+)
+TLC_COURIER_MAX_SPEED_KMH = max(
+    12.0,
+    float(os.getenv("TLC_COURIER_MAX_SPEED_KMH", "42.0") or "42.0"),
+)
 TLC_ROUTE_WAYPOINT_MAX_SNAP_KM = max(
     0.05,
     float(os.getenv("TLC_ROUTE_WAYPOINT_MAX_SNAP_KM", "0.4") or "0.4"),
@@ -550,7 +574,7 @@ def degraded_route_geometry(
     dest_lat: float,
     dest_lon: float,
 ) -> tuple[str, list[tuple[float, float]], list[float]]:
-    if TLC_ROUTE_LINEAR_FALLBACK_ALLOWED:
+    if TLC_ROUTE_LINEAR_FALLBACK_ALLOWED and not (TLC_ROUTE_MODE == "osrm" and TLC_STRICT_ROAD_GEOMETRY):
         geometry = route_geometry_for_replay(
             synthetic_grid_geometry(origin_lat, origin_lon, dest_lat, dest_lon)
         )
@@ -704,6 +728,8 @@ class Trip:
         "route_geometry",
         "route_cumulative_km",
         "last_position_ts",
+        "last_position_lat",
+        "last_position_lon",
     )
 
     def __init__(
@@ -760,6 +786,8 @@ class Trip:
         ]
         self.route_cumulative_km = cumulative_route_distances_km(self.route_geometry)
         self.last_position_ts = request_ts
+        self.last_position_lat = pickup_lat
+        self.last_position_lon = pickup_lon
 
 
 class TLCReplay:
@@ -1824,6 +1852,7 @@ class TLCReplay:
         payload["night_accel_factor"] = str(TLC_NIGHT_ACCEL_FACTOR)
         payload["trajectory_mode"] = TLC_ROUTE_MODE
         payload["route_linear_fallback_allowed"] = str(TLC_ROUTE_LINEAR_FALLBACK_ALLOWED).lower()
+        payload["route_strict_road_geometry"] = str(TLC_STRICT_ROAD_GEOMETRY).lower()
         payload["route_require_local_osrm_data"] = str(TLC_REQUIRE_LOCAL_OSRM_DATA).lower()
         payload["route_local_osrm_data_file"] = str(TLC_LOCAL_OSRM_DATA_FILE)
         payload["route_sync_on_cache_miss"] = str(TLC_ROUTE_SYNC_ON_CACHE_MISS).lower()
@@ -2146,39 +2175,102 @@ class TLCReplay:
         if total_phase_s <= 0:
             return
 
-        start_progress = max(0.0, min(1.0, (segment_start_ts - phase_start_ts).total_seconds() / total_phase_s))
-        end_progress = max(0.0, min(1.0, (segment_end_ts - phase_start_ts).total_seconds() / total_phase_s))
-        if end_progress <= start_progress:
+        segment_start_elapsed_s = max(0.0, (segment_start_ts - phase_start_ts).total_seconds())
+        segment_end_elapsed_s = min(total_phase_s, (segment_end_ts - phase_start_ts).total_seconds())
+        if segment_end_elapsed_s <= segment_start_elapsed_s:
             return
 
-        total_route_km = cumulative_km[-1] if cumulative_km else 0.0
-        span_km = max(0.0, total_route_km * (end_progress - start_progress))
-        sample_count = max(1, int(math.ceil(span_km / max(TLC_LIVE_ROUTE_MAX_STEP_KM, 0.001))))
-        sample_count = min(sample_count, TLC_LIVE_ROUTE_MAX_POINTS_PER_TICK)
+        schedule = build_motion_schedule(
+            geometry=geometry,
+            cumulative_km=cumulative_km,
+            total_duration_s=total_phase_s,
+            seed=(
+                f"{trip.courier_id}|{trip.trip_key}|{status}|"
+                f"{route_source_override or trip.route_source}|{int(phase_start_ts.timestamp())}"
+            ),
+            reference_ts=phase_start_ts,
+            status=status,
+            min_spacing_km=TLC_COURIER_SIGNAL_MIN_SPACING_KM,
+            turn_threshold_deg=TLC_COURIER_SIGNAL_TURN_THRESHOLD_DEG,
+            base_stop_seconds=TLC_COURIER_SIGNAL_BASE_STOP_SECONDS,
+            max_pause_ratio=TLC_COURIER_SIGNAL_MAX_PAUSE_RATIO,
+        )
+        start_progress, _start_paused = progress_at_elapsed(schedule, segment_start_elapsed_s)
+        end_progress, _end_paused = progress_at_elapsed(schedule, segment_end_elapsed_s)
 
+        total_route_km = cumulative_km[-1] if cumulative_km else 0.0
+        span_km = max(0.0, total_route_km * max(0.0, end_progress - start_progress))
+        segment_duration_s = max(0.0, (segment_end_ts - segment_start_ts).total_seconds())
+        sample_count = max(
+            1,
+            int(math.ceil(span_km / max(TLC_LIVE_ROUTE_MAX_STEP_KM, 0.001))),
+            int(math.ceil(segment_duration_s / 8.0)) if segment_duration_s >= 16.0 else 1,
+        )
+        sample_count = min(sample_count, TLC_LIVE_ROUTE_MAX_POINTS_PER_TICK)
         segment_delta = segment_end_ts - segment_start_ts
+        speed_cap_kmh = max(TLC_COURIER_MAX_SPEED_KMH, float(speed_kmh_override or 0.0))
+
+        prev_lat = float(trip.last_position_lat)
+        prev_lon = float(trip.last_position_lon)
+        prev_progress = start_progress
+        prev_ts = trip.last_position_ts
+        if prev_ts.tzinfo is None:
+            prev_ts = prev_ts.replace(tzinfo=timezone.utc)
         for idx in range(1, sample_count + 1):
             ratio = idx / sample_count
-            progress = start_progress + ((end_progress - start_progress) * ratio)
             ts = segment_start_ts + (segment_delta * ratio)
-            lat, lon, heading = interpolate_on_geometry(
-                geometry,
-                cumulative_km,
-                progress,
+            elapsed_s = segment_start_elapsed_s + (segment_duration_s * ratio)
+            progress, paused = progress_at_elapsed(schedule, elapsed_s)
+            lat, lon, heading = interpolate_on_geometry(geometry, cumulative_km, progress)
+
+            step_km = haversine_km(prev_lat, prev_lon, lat, lon)
+            delta_s = max(1.0, (ts - prev_ts).total_seconds())
+            allowed_step_km = max(
+                0.01,
+                min(
+                    TLC_LIVE_ROUTE_MAX_STEP_KM,
+                    (speed_cap_kmh * delta_s / 3600.0) * 1.15,
+                ),
             )
-            pos = self._build_position(
-                trip,
-                lat,
-                lon,
-                ts,
-                status,
-                heading_deg_override=heading,
-                speed_kmh_override=speed_kmh_override,
-                route_source_override=route_source_override,
-            )
-            await self._send(COURIER_TOPIC, trip.courier_id, pos.SerializeToString())
-            self.stats_emitted_positions += 1
-        trip.last_position_ts = segment_end_ts
+            substeps = max(1, int(math.ceil(step_km / allowed_step_km)))
+            substeps = min(substeps, max(TLC_LIVE_ROUTE_MAX_POINTS_PER_TICK, 24))
+
+            for sub_idx in range(1, substeps + 1):
+                sub_ratio = sub_idx / substeps
+                sub_progress = prev_progress + ((progress - prev_progress) * sub_ratio)
+                sub_ts = prev_ts + ((ts - prev_ts) * sub_ratio)
+                sub_lat, sub_lon, sub_heading = interpolate_on_geometry(
+                    geometry,
+                    cumulative_km,
+                    sub_progress,
+                )
+                sub_step_km = haversine_km(prev_lat, prev_lon, sub_lat, sub_lon)
+                sub_delta_s = max(1.0, (sub_ts - prev_ts).total_seconds())
+                sample_speed_kmh = 0.0
+                if status in {"delivering", "repositioning"} and not paused and sub_step_km > 0.005:
+                    sample_speed_kmh = min(
+                        speed_cap_kmh,
+                        sub_step_km / max(sub_delta_s / 3600.0, 1e-4),
+                    )
+                pos = self._build_position(
+                    trip,
+                    sub_lat,
+                    sub_lon,
+                    sub_ts,
+                    status,
+                    heading_deg_override=sub_heading,
+                    speed_kmh_override=sample_speed_kmh,
+                    route_source_override=route_source_override,
+                )
+                await self._send(COURIER_TOPIC, trip.courier_id, pos.SerializeToString())
+                self.stats_emitted_positions += 1
+                prev_lat = sub_lat
+                prev_lon = sub_lon
+                prev_progress = sub_progress
+                prev_ts = sub_ts
+                trip.last_position_lat = sub_lat
+                trip.last_position_lon = sub_lon
+        trip.last_position_ts = prev_ts
 
     async def _emit_trip_start(self, trip: Trip) -> None:
         offer = self._build_offer(trip)
@@ -2204,6 +2296,8 @@ class TLCReplay:
             pos = self._build_position(trip, pickup_lat, pickup_lon, trip.request_ts, "pickup_arrived")
         await self._send(COURIER_TOPIC, trip.courier_id, pos.SerializeToString())
         self.stats_emitted_positions += 1
+        trip.last_position_lat = float(pos.lat)
+        trip.last_position_lon = float(pos.lon)
         trip.last_position_ts = trip.reposition_start_ts if self._trip_needs_reposition(trip) else trip.request_ts
 
     async def _emit_trip_progress(self, trip: Trip, now: datetime) -> None:
@@ -2225,6 +2319,8 @@ class TLCReplay:
             )
             await self._send(COURIER_TOPIC, trip.courier_id, pos.SerializeToString())
             self.stats_emitted_positions += 1
+            trip.last_position_lat = float(pos.lat)
+            trip.last_position_lon = float(pos.lon)
             trip.last_position_ts = now
             return
 

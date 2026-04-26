@@ -32,18 +32,21 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, time as dtime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from copilot_events_pb2 import CourierPositionV1, OrderEventV1, OrderOfferV1
+from motion import build_motion_schedule, progress_at_elapsed
 
 from routing import (
     Route,
     RoutingClient,
     RoutingUnavailableError,
     cumulative_distances_km,
+    haversine_km,
     interpolate_on_route,
 )
 
@@ -57,6 +60,26 @@ SINGLE_DRIVER_ID = os.getenv("TLC_SINGLE_DRIVER_ID", "drv_demo_001").strip() or 
 MAX_REPOSITION_MIN = float(os.getenv("TLC_SINGLE_MAX_REPOSITION_MIN", "20"))
 MAX_IDLE_GAP_MIN = float(os.getenv("TLC_SINGLE_MAX_IDLE_GAP_MIN", "45"))
 REPOSITION_AVG_SPEED_KMH = float(os.getenv("TLC_SINGLE_REPOSITION_KMH", "24"))
+COURIER_SIGNAL_MIN_SPACING_KM = max(
+    0.08,
+    float(os.getenv("TLC_COURIER_SIGNAL_MIN_SPACING_KM", "0.16")),
+)
+COURIER_SIGNAL_TURN_THRESHOLD_DEG = max(
+    10.0,
+    float(os.getenv("TLC_COURIER_SIGNAL_TURN_THRESHOLD_DEG", "28.0")),
+)
+COURIER_SIGNAL_BASE_STOP_SECONDS = max(
+    2.0,
+    float(os.getenv("TLC_COURIER_SIGNAL_BASE_STOP_SECONDS", "5.0")),
+)
+COURIER_SIGNAL_MAX_PAUSE_RATIO = min(
+    0.45,
+    max(0.0, float(os.getenv("TLC_COURIER_SIGNAL_MAX_PAUSE_RATIO", "0.28"))),
+)
+COURIER_MAX_SPEED_KMH = max(
+    12.0,
+    float(os.getenv("TLC_COURIER_MAX_SPEED_KMH", "42.0")),
+)
 
 LUNCH_BREAK_ENABLED = os.getenv("TLC_LUNCH_BREAK_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 LUNCH_BREAK_WINDOW = os.getenv("TLC_LUNCH_BREAK_WINDOW", "12:00-14:00").strip()
@@ -111,6 +134,7 @@ class _DriverState:
     lon: float
     heading: float = 0.0
     status: str = "idle"
+    last_position_ts: datetime | None = None
     last_route: Route | None = None
     last_route_cumkm: list[float] = field(default_factory=list)
     route_start: datetime | None = None
@@ -233,6 +257,7 @@ class SingleDriverScenario:
         await self.replay._send(_courier_topic(), SINGLE_DRIVER_ID, pos.SerializeToString())
         self.stats_positions += 1
         self.state.status = status
+        self.state.last_position_ts = vt
 
     async def _emit_offer(self, trip: "Trip") -> None:
         offer = OrderOfferV1(
@@ -391,7 +416,7 @@ class SingleDriverScenario:
                 self._cursor += 1
                 first = self.replay._row_to_trip(dict(zip(cols, rows[0])))
 
-            self.state = _DriverState(lat=first.pickup_lat, lon=first.pickup_lon)
+            self.state = _DriverState(lat=first.pickup_lat, lon=first.pickup_lon, last_position_ts=first.request_ts)
             vt = first.request_ts
             log.info("virtual clock start (single) %s at pickup zone %d", vt.isoformat(), first.pu_loc)
 
@@ -594,15 +619,65 @@ class SingleDriverScenario:
             self.stats_hold_ticks += 1
             await self._emit_position(vt, target_status, 0.0)
             return
-        elapsed = (vt - start).total_seconds()
+        elapsed = max(0.0, (vt - start).total_seconds())
         total = max(1.0, (end - start).total_seconds())
-        progress = max(0.0, min(1.0, elapsed / total))
+        schedule = build_motion_schedule(
+            geometry=route.geometry,
+            cumulative_km=self.state.last_route_cumkm,
+            total_duration_s=total,
+            seed=f"{SINGLE_DRIVER_ID}|{leg}|{route.source}|{int(start.timestamp())}",
+            reference_ts=start,
+            status=target_status,
+            min_spacing_km=COURIER_SIGNAL_MIN_SPACING_KM,
+            turn_threshold_deg=COURIER_SIGNAL_TURN_THRESHOLD_DEG,
+            base_stop_seconds=COURIER_SIGNAL_BASE_STOP_SECONDS,
+            max_pause_ratio=COURIER_SIGNAL_MAX_PAUSE_RATIO,
+        )
+        progress, paused = progress_at_elapsed(schedule, elapsed)
         (lat, lon), bearing = interpolate_on_route(route, self.state.last_route_cumkm, progress)
-        self.state.lat = lat
-        self.state.lon = lon
-        self.state.heading = bearing
-        speed_kmh = (route.distance_km / max(total / 3600.0, 1e-4))
-        await self._emit_position(vt, target_status, speed_kmh)
+
+        prev_ts = self.state.last_position_ts or start
+        prev_elapsed = max(0.0, min(total, (prev_ts - start).total_seconds()))
+        prev_progress, _ = progress_at_elapsed(schedule, prev_elapsed)
+        prev_lat = float(self.state.lat)
+        prev_lon = float(self.state.lon)
+        step_km = haversine_km(prev_lat, prev_lon, lat, lon)
+        delta_s = max(1.0, (vt - prev_ts).total_seconds())
+        allowed_step_km = max(
+            0.01,
+            min(
+                0.08,
+                (COURIER_MAX_SPEED_KMH * delta_s / 3600.0) * 1.15,
+            ),
+        )
+        substeps = max(1, int(math.ceil(step_km / allowed_step_km)))
+        substeps = min(substeps, 24)
+
+        for sub_idx in range(1, substeps + 1):
+            sub_ratio = sub_idx / substeps
+            sub_progress = prev_progress + ((progress - prev_progress) * sub_ratio)
+            sub_ts = prev_ts + ((vt - prev_ts) * sub_ratio)
+            (sub_lat, sub_lon), sub_bearing = interpolate_on_route(
+                route,
+                self.state.last_route_cumkm,
+                sub_progress,
+            )
+            sub_step_km = haversine_km(prev_lat, prev_lon, sub_lat, sub_lon)
+            sub_delta_s = max(1.0, (sub_ts - prev_ts).total_seconds())
+            speed_kmh = 0.0
+            if not paused and sub_step_km > 0.005:
+                speed_kmh = min(
+                    COURIER_MAX_SPEED_KMH,
+                    sub_step_km / max(sub_delta_s / 3600.0, 1e-4),
+                )
+            self.state.lat = sub_lat
+            self.state.lon = sub_lon
+            self.state.heading = sub_bearing
+            await self._emit_position(sub_ts, target_status, speed_kmh)
+            prev_lat = sub_lat
+            prev_lon = sub_lon
+            prev_ts = sub_ts
+            prev_progress = sub_progress
 
     def _maybe_take_lunch(self, vt: datetime) -> bool:
         if not LUNCH_BREAK_ENABLED:
