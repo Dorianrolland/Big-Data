@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>FleetStream Operator Console</title>
-  <meta name="theme-color" content="#0f172a" />
+  <meta name="theme-color" content="#f6f8fc" />
   <meta name="description" content="Realtime operations console for FleetStream courier dispatch in New York." />
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
@@ -1503,6 +1503,602 @@
         font-size: 16px; /* prevent iOS auto-zoom */
       }
     }
+
+    /* ════════════════════════════════════════════════════════════════════════
+       Refonte visuelle — Operations Console v2 (clarity pass)
+       Override layer: lighter background, single font, flat decorations,
+       compact header, accordion config, professional density.
+       ════════════════════════════════════════════════════════════════════════ */
+    :root {
+      --bg: #0d1117;
+      --bg-deep: #090c12;
+      --surface-0: #11151c;
+      --surface-1: #161b24;
+      --surface-2: #1c222d;
+      --surface-3: #232a37;
+      --line: #232a37;
+      --line-strong: #2e3645;
+      --ink: #e6e9ef;
+      --ink-soft: #a3a9b8;
+      --ink-muted: #6b7280;
+      --accent: #5eead4;
+      --accent-strong: #2dd4bf;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+      --shadow-sm: 0 1px 1px rgba(0, 0, 0, 0.25);
+      --radius-lg: 8px;
+      --radius-md: 6px;
+      --radius-sm: 5px;
+      --page-max: 1480px;
+    }
+
+    /* Strip body texture + radial glows */
+    html, body {
+      background: var(--bg) !important;
+      background-attachment: initial !important;
+      font-family: var(--font-body);
+    }
+    body::before { display: none !important; }
+
+    /* Page padding tighter */
+    .page {
+      padding: 14px 18px 28px;
+      gap: 12px;
+    }
+
+    /* Glass surface — flatter, no gradients */
+    .glass {
+      background: var(--surface-1);
+      border: 1px solid var(--line);
+      box-shadow: var(--shadow-sm);
+    }
+
+    /* Header — single row, no decorative stripe/gradient */
+    .header {
+      padding: 12px 16px 0;
+      gap: 10px;
+      background: var(--surface-1) !important;
+    }
+    .header::before, .header::after { display: none !important; }
+
+    .header-top {
+      align-items: center;
+      gap: 12px;
+    }
+    .brand { gap: 4px; }
+    .eyebrow { display: none !important; }
+    .subtitle { display: none !important; }
+    .title {
+      font-family: var(--font-body);
+      font-size: 1.15rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      line-height: 1.2;
+      font-variation-settings: normal;
+    }
+    .title em {
+      font-family: var(--font-body);
+      font-style: normal;
+      font-weight: 600;
+      color: var(--accent);
+      font-variation-settings: normal;
+    }
+
+    .header-actions {
+      gap: 8px;
+      flex-direction: row;
+      align-items: center;
+    }
+    .chip-row { gap: 6px; }
+    .chip {
+      padding: 3px 9px;
+      border-radius: 999px;
+      font-size: 0.7rem;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+    .chip::before { box-shadow: none; }
+    .console-link {
+      padding: 6px 12px;
+      font-size: 0.74rem;
+      letter-spacing: 0.04em;
+      box-shadow: none;
+    }
+    .console-link::after { content: "→"; }
+    .console-link:hover { box-shadow: none; transform: none; }
+
+    /* Tab nav — single line, simpler */
+    .tab-nav {
+      margin: 0 -16px;
+      background: var(--bg);
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+    }
+    .tab-nav-item {
+      padding: 10px 16px;
+      min-width: 0;
+      flex: 0 0 auto;
+      border-right: none;
+      gap: 0;
+      display: inline-flex;
+      align-items: center;
+      border-bottom: 2px solid transparent;
+      transition: color 140ms ease, border-color 140ms ease;
+    }
+    .tab-nav-item .index { display: none !important; }
+    .tab-nav-item .meta { display: none !important; }
+    .tab-nav-item .label {
+      font-family: var(--font-body);
+      font-size: 0.86rem;
+      font-weight: 500;
+      letter-spacing: 0;
+      font-variation-settings: normal;
+      color: inherit;
+    }
+    .tab-nav-item.active {
+      background: transparent;
+      border-bottom-color: var(--accent);
+    }
+    .tab-nav-item.active::after { display: none !important; }
+    .tab-nav-item.active .label { color: var(--ink); }
+
+    /* Auto-refresh — flatter */
+    .auto-refresh {
+      padding: 4px 8px;
+      font-size: 0.72rem;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+    .auto-refresh input[type="checkbox"]:checked::before { box-shadow: none; }
+
+    /* Ops overview — flatter, no gradient */
+    .ops-overview {
+      padding: 0;
+      border: none;
+      background: transparent;
+      gap: 8px;
+    }
+    .ops-overview-label { display: none; }
+
+    /* KPI — bigger value, no decorative glow line */
+    .kpi-grid { gap: 8px; }
+    .kpi {
+      padding: 12px 14px;
+      min-height: 64px;
+      border-radius: var(--radius-md);
+    }
+    .kpi::before { display: none !important; }
+    .kpi .k {
+      font-family: var(--font-body);
+      font-size: 0.74rem;
+      letter-spacing: 0;
+      text-transform: none;
+      font-weight: 500;
+    }
+    .kpi .v {
+      font-family: var(--font-body);
+      font-size: 1.55rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      font-variation-settings: normal;
+    }
+
+    /* Status line */
+    .state-message {
+      padding: 8px 12px;
+      font-size: 0.82rem;
+      border-left-width: 2px;
+    }
+
+    /* Layout */
+    .layout {
+      gap: 12px;
+      grid-template-columns: minmax(320px, 360px) minmax(0, 1fr);
+    }
+    .col { gap: 12px; }
+    .control-col { top: 12px; }
+
+    /* Cards — flatter, no glow bar on h2 */
+    .card {
+      padding: 14px 16px;
+      gap: 12px;
+    }
+    .card h2 {
+      font-family: var(--font-body);
+      font-size: 0.98rem;
+      font-weight: 600;
+      letter-spacing: -0.005em;
+      font-variation-settings: normal;
+      gap: 0;
+    }
+    .card h2::before { display: none !important; }
+
+    .section-head { padding-bottom: 6px; }
+    .section-head .eyebrow { display: none !important; }
+
+    /* Control groups — accordion (using <details>) */
+    details.control-group {
+      padding: 0;
+      gap: 0;
+      overflow: hidden;
+      background: var(--surface-0);
+    }
+    details.control-group > summary {
+      list-style: none;
+      cursor: pointer;
+      padding: 9px 14px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      user-select: none;
+      background: var(--surface-2);
+      transition: background 140ms ease;
+    }
+    details.control-group > summary:hover { background: var(--surface-3); }
+    details.control-group > summary::-webkit-details-marker { display: none; }
+    details.control-group > summary::after {
+      content: "+";
+      color: var(--ink-muted);
+      font-weight: 600;
+      font-size: 0.95rem;
+      font-family: var(--font-mono);
+      width: 16px;
+      text-align: center;
+    }
+    details.control-group[open] > summary::after { content: "−"; }
+    details.control-group > summary > .ctrl-title {
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+      min-width: 0;
+    }
+    details.control-group > summary > .ctrl-title strong {
+      font-family: var(--font-body);
+      font-size: 0.82rem;
+      font-weight: 600;
+      letter-spacing: 0;
+      text-transform: none;
+      color: var(--ink);
+    }
+    details.control-group > summary > .ctrl-title span {
+      font-size: 0.74rem;
+      color: var(--ink-muted);
+    }
+    details.control-group[open] > summary { border-bottom: 1px solid var(--line); }
+    details.control-group > .control-group-body {
+      padding: 12px 14px;
+      display: grid;
+      gap: 10px;
+    }
+
+    /* Form labels — readable, sentence case */
+    label {
+      font-family: var(--font-body);
+      font-size: 0.74rem;
+      font-weight: 500;
+      letter-spacing: 0;
+      text-transform: none;
+      color: var(--ink-soft);
+      gap: 5px;
+    }
+
+    input:not([type="checkbox"]):not([type="range"]),
+    select {
+      padding: 7px 10px;
+      min-height: 36px;
+      font-size: 0.85rem;
+      background: var(--surface-0);
+      border-color: var(--line-strong);
+    }
+
+    button {
+      padding: 8px 14px;
+      min-height: 36px;
+      font-size: 0.84rem;
+      letter-spacing: 0;
+      box-shadow: none;
+      transition: background 140ms ease, transform 80ms ease;
+    }
+    button:hover { box-shadow: none; }
+    button.alt {
+      box-shadow: none;
+    }
+    .quick-row { gap: 6px; }
+    .quick-row button {
+      padding: 6px 12px;
+      font-size: 0.76rem;
+    }
+
+    /* Score pills */
+    .score-board { gap: 8px; }
+    .score-pill {
+      padding: 12px;
+      border-radius: var(--radius-md);
+    }
+    .score-pill::before { display: none !important; }
+    .score-pill .k {
+      font-family: var(--font-body);
+      font-size: 0.72rem;
+      letter-spacing: 0;
+      text-transform: none;
+      font-weight: 500;
+    }
+    .score-pill .v {
+      font-family: var(--font-body);
+      font-size: 1.3rem;
+      font-weight: 700;
+      letter-spacing: -0.005em;
+      font-variation-settings: normal;
+    }
+
+    /* Info-line — quieter */
+    .info-line {
+      font-family: var(--font-body);
+      font-size: 0.8rem;
+      padding: 7px 11px;
+      border-left-width: 2px;
+    }
+
+    /* Mission stats — uniform with KPIs */
+    .mission-stats { gap: 6px; }
+    .mission-stat {
+      padding: 9px 11px;
+      min-height: 56px;
+      border-radius: var(--radius-md);
+    }
+    .mission-stat .k {
+      font-family: var(--font-body);
+      font-size: 0.7rem;
+      letter-spacing: 0;
+      text-transform: none;
+      font-weight: 500;
+    }
+    .mission-stat .v {
+      font-family: var(--font-body);
+      font-size: 0.98rem;
+      font-weight: 700;
+      letter-spacing: -0.005em;
+      font-variation-settings: normal;
+    }
+
+    /* Offers */
+    .offer { padding: 11px 13px; gap: 8px; }
+    .offer-actions button {
+      padding: 6px 10px;
+      font-size: 0.78rem;
+      border-radius: 6px;
+    }
+    .offer-metric { padding: 7px 9px; min-height: 48px; }
+    .offer-metric .k {
+      font-family: var(--font-body);
+      font-size: 0.7rem;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+
+    .badge {
+      padding: 2px 8px;
+      letter-spacing: 0.03em;
+      text-transform: none;
+    }
+
+    /* Flow steps */
+    .flow-step .k {
+      font-family: var(--font-body);
+      font-size: 0.7rem;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+    .flow-step .v {
+      font-family: var(--font-body);
+      font-size: 0.95rem;
+      font-weight: 600;
+    }
+    .flow-step.active::after { display: none !important; }
+    .flow-step.active { background: var(--accent-soft); }
+
+    /* Compare strip */
+    .compare-card strong {
+      font-family: var(--font-body);
+      font-size: 0.78rem;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+
+    /* Fleet wallboard */
+    .fleet-side-title {
+      font-family: var(--font-body);
+      font-size: 0.74rem;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+    .fleet-opportunity-main span {
+      font-family: var(--font-body);
+      letter-spacing: 0;
+      text-transform: none;
+    }
+
+    /* Replay timeline */
+    .event-row { padding: 7px 10px; gap: 3px; }
+
+    /* Footer */
+    .footer {
+      font-family: var(--font-body);
+      font-size: 0.72rem;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+
+    /* Map slimmer */
+    .map-board { min-height: 300px; }
+    .map-board.map-ready { min-height: 300px; }
+    .dispatch-leaflet { height: 300px; }
+    .map-board svg { height: 300px; }
+
+    /* Hide empty/placeholder containers — declutters initial render */
+    .info-line:empty,
+    .state-message:empty,
+    .ops-overview-meta:empty,
+    .mission-note:empty,
+    .section-head:empty,
+    .section-copy:empty { display: none !important; }
+
+    /* In dense admin mode, hide the verbose section-head wrapper completely
+       when its only content was the marketing intro */
+    [data-density="dense"] .section-head[data-decorative] { display: none !important; }
+
+    /* Hide the 3-step decision flow decorative strip — operators know the flow */
+    .flow-steps { display: none !important; }
+
+    /* Quieter eyebrows above h2 — redundant with the h2 itself */
+    .section-head .eyebrow { display: none !important; }
+
+    /* Status line in header: shrink when no live message */
+    #uxStatusLine:empty { display: none !important; }
+
+    /* Mission stats: hide visually when inactive (all dashes) — operator focus */
+    .mission-stats { gap: 6px; }
+
+    /* Responsive: stack KPI 2x2 on tablet */
+    @media (max-width: 1080px) {
+      .layout { grid-template-columns: minmax(300px, 340px) minmax(0, 1fr); }
+    }
+    @media (max-width: 920px) {
+      .header-top { flex-direction: column; align-items: flex-start; gap: 10px; }
+      .header-actions { width: 100%; justify-content: space-between; flex-wrap: wrap; }
+      .tab-nav { overflow-x: auto; }
+      .tab-nav-item { white-space: nowrap; }
+    }
+
+    /* Presentation clarity theme: light backgrounds and dark text for projectors. */
+    :root {
+      --bg: #f4f7fb;
+      --bg-deep: #eaf0f7;
+      --bg-grid: rgba(37, 99, 235, 0.045);
+      --surface-0: #f8fafc;
+      --surface-1: #ffffff;
+      --surface-2: #eef4fb;
+      --surface-3: #e2eaf4;
+      --surface-raised: rgba(15, 23, 42, 0.035);
+      --line: #d7e2ee;
+      --line-strong: #b8c7d9;
+      --rule: rgba(37, 99, 235, 0.18);
+      --ink: #0f172a;
+      --ink-soft: #334155;
+      --ink-muted: #64748b;
+      --paper: #f4f7fb;
+      --paper-cream: #ffffff;
+      --paper-soft: #eef4fb;
+      --panel: #ffffff;
+      --panel-strong: #ffffff;
+      --panel-soft: #f8fafc;
+      --accent: #2563eb;
+      --accent-strong: #1d4ed8;
+      --accent-deep: #1e40af;
+      --accent-soft: rgba(37, 99, 235, 0.10);
+      --signal: #d97706;
+      --signal-soft: rgba(217, 119, 6, 0.12);
+      --good: #059669;
+      --good-soft: rgba(5, 150, 105, 0.12);
+      --bad: #dc2626;
+      --bad-soft: rgba(220, 38, 38, 0.10);
+      --warn: #d97706;
+      --warn-soft: rgba(217, 119, 6, 0.12);
+      --amber: #d97706;
+      --shadow: 0 12px 28px rgba(15, 23, 42, 0.10);
+      --shadow-sm: 0 4px 12px rgba(15, 23, 42, 0.08);
+    }
+
+    html,
+    body {
+      background: linear-gradient(180deg, #f8fbff 0%, #edf3fa 100%) !important;
+      color: var(--ink);
+    }
+
+    .glass,
+    .header,
+    .card,
+    .fleet-wallboard {
+      background: rgba(255, 255, 255, 0.96) !important;
+      border-color: var(--line);
+      box-shadow: var(--shadow-sm);
+    }
+
+    .tab-nav {
+      background: #f8fafc;
+    }
+
+    .kpi,
+    .score-pill,
+    details.control-group,
+    .control-group,
+    .offer,
+    .offer-metric,
+    .zone,
+    .map-row,
+    .mission-stat,
+    .fleet-opportunity,
+    .fleet-detail,
+    .fleet-alerts,
+    .fleet-empty,
+    .event-row,
+    .replay-controls,
+    .chips span,
+    input:not([type="checkbox"]):not([type="range"]),
+    select {
+      background: var(--surface-0);
+      border-color: var(--line);
+      color: var(--ink);
+    }
+
+    details.control-group > summary,
+    .offer.selectable:hover,
+    .event-row:hover,
+    .fleet-opportunity:hover,
+    .tab-nav-item:hover {
+      background: var(--surface-2);
+    }
+
+    .state-message.loading,
+    .info-line,
+    .event-row.active {
+      color: var(--accent);
+    }
+
+    .state-message.error { color: var(--bad); }
+    .state-message.empty,
+    .fleet-alerts { color: var(--warn); }
+    .state-message.success { color: var(--good); }
+
+    .console-link,
+    button {
+      color: #ffffff;
+    }
+
+    button.ghost {
+      color: var(--ink-soft);
+      background: #ffffff;
+    }
+
+    .map-board,
+    .map-board.map-ready,
+    .dispatch-leaflet,
+    .dispatch-leaflet .leaflet-container,
+    .fleet-map {
+      background: #e8f0f7 !important;
+      border-color: var(--line);
+    }
+
+    .map-board .leaflet-control-attribution {
+      background: rgba(255, 255, 255, 0.88) !important;
+      color: var(--ink-muted) !important;
+    }
+
+    .zone-pin,
+    .origin-pin {
+      border-color: #ffffff;
+      box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.18), 0 0 8px currentColor;
+    }
   </style>
 </head>
 <body data-density="dense">
@@ -1557,137 +2153,148 @@
         </div>
         <div class="ops-overview-meta" id="healthMetrics"></div>
       </div>
-      <div class="state-message loading" id="uxStatusLine" role="status" aria-live="polite" aria-atomic="true">Ready: choose a courier, score dispatch, then inspect the replay if needed.</div>
+      <div class="state-message loading" id="uxStatusLine" role="status" aria-live="polite" aria-atomic="true"></div>
     </section>
 
     <section class="layout">
       <div class="col control-col">
         <section class="card glass" data-tab-panel="tuning">
-          <div class="section-head">
-            <div>
-              <h2>Live Dispatch Console</h2>
-              <div class="section-copy">This screen is the operator view: one live courier, replay, dispatch filters, and the fleet wallboard. The driver app stays as the mobile courier demo.</div>
+          <div class="section-head" data-decorative></div>
+          <details class="control-group" open>
+            <summary>
+              <span class="ctrl-title">
+                <strong>Live session</strong>
+                <span>courier identity and replay window</span>
+              </span>
+            </summary>
+            <div class="control-group-body">
+              <div class="grid three">
+                <label>Courier<input id="driverId" value="L001" /></label>
+                <label>From<input id="fromTs" /></label>
+                <label>To<input id="toTs" /></label>
+              </div>
+              <div class="quick-row">
+                <button class="ghost" id="window30">30m</button>
+                <button class="ghost" id="window120">2h</button>
+                <button class="ghost" id="windowToday">Today</button>
+              </div>
+              <div class="grid two">
+                <button id="refreshBtn">Refresh</button>
+                <button class="alt" id="replayBtn">Replay</button>
+              </div>
             </div>
-          </div>
-          <div class="control-group">
-            <div class="control-group-head">
-              <strong>Live session</strong>
-              <span>courier identity and replay window</span>
+          </details>
+          <details class="control-group">
+            <summary>
+              <span class="ctrl-title">
+                <strong>Dispatch filters</strong>
+                <span>around search, routing, and zone scan</span>
+              </span>
+            </summary>
+            <div class="control-group-body">
+            <div class="grid three">
+              <label>Radius (km)<input id="aroundRadius" type="number" step="0.1" value="4.0" /></label>
+              <label>Limit<input id="aroundLimit" type="number" step="1" value="10" /></label>
+              <label>Min score<input id="aroundMinScore" type="number" step="0.05" value="0.25" /></label>
             </div>
             <div class="grid three">
-              <label>Courier ID<input id="driverId" value="L001" /></label>
-              <label>From (UTC)<input id="fromTs" /></label>
-              <label>To (UTC)<input id="toTs" /></label>
-            </div>
-            <div class="quick-row">
-              <button class="ghost" id="window30">Last 30m</button>
-              <button class="ghost" id="window120">Last 2h</button>
-              <button class="ghost" id="windowToday">Today</button>
+              <label>Max ETA (min)<input id="dispatchMaxEta" type="number" step="1" value="20" /></label>
+              <label>Forecast (min)<input id="dispatchForecastHorizon" type="number" step="5" value="30" /></label>
+              <label>Zones<input id="dispatchZoneTopK" type="number" step="1" value="5" /></label>
             </div>
             <div class="grid two">
-              <button id="refreshBtn">Refresh Courier Data</button>
-              <button class="alt" id="replayBtn">Replay Session</button>
-            </div>
-          </div>
-          <div class="control-group">
-            <div class="control-group-head">
-              <strong>Dispatch filters</strong>
-              <span>around search, routing, and zone scan</span>
-            </div>
-            <div class="grid three">
-              <label>Around Radius (km)<input id="aroundRadius" type="number" step="0.1" value="4.0" /></label>
-              <label>Around Limit<input id="aroundLimit" type="number" step="1" value="10" /></label>
-              <label>Min Accept Score<input id="aroundMinScore" type="number" step="0.05" value="0.25" /></label>
-            </div>
-            <div class="grid three">
-              <label>Max Reposition ETA (min)<input id="dispatchMaxEta" type="number" step="1" value="20" /></label>
-              <label>Forecast Horizon (min)<input id="dispatchForecastHorizon" type="number" step="5" value="30" /></label>
-              <label>Dispatch Zone Limit<input id="dispatchZoneTopK" type="number" step="1" value="5" /></label>
+              <label title="0 = opportunity only, 0.3 = balanced, 0.6 = distance-sensitive">Distance weight<input id="zoneDistanceWeight" type="number" step="0.05" min="0" max="1" value="0.3" /></label>
+              <label title="Hard filter: farther zones are ignored">Max distance (km)<input id="zoneMaxDistanceKm" type="number" step="0.5" min="0.5" max="50" value="12" /></label>
             </div>
             <div class="grid two">
-              <label title="0 = opportunity only, 0.3 = balanced, 0.6 = distance-sensitive">Zone Distance Weight<input id="zoneDistanceWeight" type="number" step="0.05" min="0" max="1" value="0.3" /></label>
-              <label title="Hard filter: farther zones are ignored">Zone Max Distance (km)<input id="zoneMaxDistanceKm" type="number" step="0.5" min="0.5" max="50" value="12" /></label>
+              <label title="Optional homeward bonus - leave empty to disable">Home lat<input id="zoneHomeLat" type="number" step="0.000001" placeholder="40.7580" /></label>
+              <label title="Optional homeward bonus - leave empty to disable">Home lon<input id="zoneHomeLon" type="number" step="0.000001" placeholder="-73.9855" /></label>
             </div>
             <div class="grid two">
-              <label title="Optional homeward bonus - leave empty to disable">Home Lat<input id="zoneHomeLat" type="number" step="0.000001" placeholder="40.7580" /></label>
-              <label title="Optional homeward bonus - leave empty to disable">Home Lon<input id="zoneHomeLon" type="number" step="0.000001" placeholder="-73.9855" /></label>
-            </div>
-            <div class="grid two">
-              <label>Dispatch Strategy
+              <label>Strategy
                 <select id="dispatchStrategy">
                   <option value="conservative">Conservative</option>
                   <option value="balanced" selected>Balanced</option>
                   <option value="aggressive">Aggressive</option>
                 </select>
               </label>
-              <label>Shift Horizon
+              <label>Shift horizon
                 <select id="shiftPlanHorizon">
                   <option value="60" selected>60 min</option>
                   <option value="90">90 min</option>
                 </select>
               </label>
             </div>
-            <div class="quick-row">
-              <label class="auto-refresh"><input id="aroundUseOsrm" type="checkbox" /> route-aware (OSRM)</label>
-              <button class="ghost" id="refreshAroundBtn">Refresh Best Around</button>
-              <button class="ghost" id="refreshShiftPlanBtn">Refresh Shift Plan</button>
-              <button class="ghost" id="refreshFuelBtn">Sync Fuel API</button>
+              <div class="quick-row">
+                <label class="auto-refresh"><input id="aroundUseOsrm" type="checkbox" /> OSRM</label>
+                <button class="ghost" id="refreshAroundBtn">Best around</button>
+                <button class="ghost" id="refreshShiftPlanBtn">Shift plan</button>
+                <button class="ghost" id="refreshFuelBtn">Fuel API</button>
+              </div>
             </div>
-          </div>
-          <div class="control-group">
-            <div class="control-group-head">
-              <strong>Courier profile</strong>
-              <span>target, fuel efficiency, and risk appetite</span>
+          </details>
+          <details class="control-group">
+            <summary>
+              <span class="ctrl-title">
+                <strong>Courier profile</strong>
+                <span>target, fuel efficiency, and risk appetite</span>
+              </span>
+            </summary>
+            <div class="control-group-body">
+              <div class="grid two">
+                <label>Target USD/h<input id="profileTargetEurH" type="number" step="0.1" min="0" max="150" value="18" /></label>
+                <label>MPG<input id="profileConsumption" type="number" step="0.1" min="1" max="120" value="31" /></label>
+              </div>
+              <div class="grid two">
+                <label>Risk (0-1)<input id="profileRiskAversion" type="number" step="0.01" min="0" max="1" value="0.5" /></label>
+                <label>Max ETA (min)<input id="profileMaxEta" type="number" step="1" min="3" max="60" value="20" /></label>
+              </div>
+              <div class="quick-row">
+                <button class="ghost" id="profileSaveBtn">Save profile</button>
+                <span class="info-line" id="profileStatus">Courier profile: loading...</span>
+              </div>
             </div>
-            <div class="grid two">
-              <label>Courier Target USD/h<input id="profileTargetEurH" type="number" step="0.1" min="0" max="150" value="18" /></label>
-              <label>Courier MPG<input id="profileConsumption" type="number" step="0.1" min="1" max="120" value="31" /></label>
+          </details>
+          <details class="control-group">
+            <summary>
+              <span class="ctrl-title">
+                <strong>Decision weighting</strong>
+                <span>shape how the console ranks the next move</span>
+              </span>
+            </summary>
+            <div class="control-group-body">
+              <div class="grid three">
+                <label title="Higher means prioritise net gain (accept score + target gap)">
+                  Gain
+                  <input id="objWeightGain" type="range" min="0" max="100" step="1" value="62" />
+                  <span class="info-line" id="objWeightGainValue">62%</span>
+                </label>
+                <label title="Higher means prioritise fast/short offers">
+                  Time
+                  <input id="objWeightTime" type="range" min="0" max="100" step="1" value="23" />
+                  <span class="info-line" id="objWeightTimeValue">23%</span>
+                </label>
+                <label title="Higher means prioritise fuel-efficient offers">
+                  Fuel
+                  <input id="objWeightFuel" type="range" min="0" max="100" step="1" value="15" />
+                  <span class="info-line" id="objWeightFuelValue">15%</span>
+                </label>
+              </div>
+              <div class="info-line" id="objectiveWeightStatus">Objective mix: gain 62% / time 23% / fuel 15%.</div>
+              <div class="grid two">
+                <label>Shift zone count<input id="shiftPlanTopK" type="number" step="1" min="3" max="20" value="6" /></label>
+              </div>
             </div>
-            <div class="grid two">
-              <label>Risk Aversion (0-1)<input id="profileRiskAversion" type="number" step="0.01" min="0" max="1" value="0.5" /></label>
-              <label>Max ETA (min)<input id="profileMaxEta" type="number" step="1" min="3" max="60" value="20" /></label>
-            </div>
-            <div class="quick-row">
-              <button class="ghost" id="profileSaveBtn">Save Courier Profile</button>
-              <span class="info-line" id="profileStatus">Courier profile: loading...</span>
-            </div>
-          </div>
-          <div class="control-group">
-            <div class="control-group-head">
-              <strong>Decision weighting</strong>
-              <span>shape how the console ranks the next move</span>
-            </div>
-            <div class="grid three">
-              <label title="Higher means prioritise net gain (accept score + target gap)">
-                Gain Priority
-                <input id="objWeightGain" type="range" min="0" max="100" step="1" value="62" />
-                <span class="info-line" id="objWeightGainValue">62%</span>
-              </label>
-              <label title="Higher means prioritise fast/short offers">
-                Time Priority
-                <input id="objWeightTime" type="range" min="0" max="100" step="1" value="23" />
-                <span class="info-line" id="objWeightTimeValue">23%</span>
-              </label>
-              <label title="Higher means prioritise fuel-efficient offers">
-                Fuel Priority
-                <input id="objWeightFuel" type="range" min="0" max="100" step="1" value="15" />
-                <span class="info-line" id="objWeightFuelValue">15%</span>
-              </label>
-            </div>
-            <div class="info-line" id="objectiveWeightStatus">Objective mix: gain 62% / time 23% / fuel 15%.</div>
-            <div class="grid two">
-              <label>Shift Plan Zone Limit<input id="shiftPlanTopK" type="number" step="1" min="3" max="20" value="6" /></label>
-            </div>
-          </div>
+          </details>
         </section>
 
         <section class="card glass" data-tab-panel="live">
-          <h2>Active Mission Control</h2>
+          <h2>Mission</h2>
           <div class="quick-row">
-            <button class="ghost" id="missionStartBestBtn">Start Best Mission</button>
-            <button class="ghost" id="missionStopBtn">Stop Mission</button>
+            <button class="ghost" id="missionStartBestBtn">Start best</button>
+            <button class="ghost" id="missionStopBtn">Stop</button>
           </div>
-          <div class="info-line" id="missionStatus">Mission inactive.</div>
+          <div class="info-line" id="missionStatus"></div>
           <div class="mission-stats">
             <div class="mission-stat"><div class="k">Target</div><div class="v" id="missionTarget">-</div></div>
             <div class="mission-stat"><div class="k">Elapsed</div><div class="v" id="missionElapsed">-</div></div>
@@ -1695,18 +2302,18 @@
             <div class="mission-stat"><div class="k">ETA</div><div class="v" id="missionEta">-</div></div>
           </div>
           <div class="zone-meter"><div id="missionProgressFill" style="width:0%"></div></div>
-          <div class="mission-note" id="missionMeta">Start from best zone or from a dispatch row.</div>
+          <div class="mission-note" id="missionMeta"></div>
         </section>
 
         <section class="card glass" data-tab-panel="live">
-          <h2>Mission Journal</h2>
+          <h2>Journal</h2>
           <div class="quick-row">
-            <button class="ghost" id="missionJournalRefreshBtn">Refresh Journal</button>
-            <button class="ghost" id="exportSessionJsonBtn">Export JSON</button>
-            <button class="ghost" id="exportSessionCsvBtn">Export CSV</button>
-            <button class="ghost" id="exportSessionPdfBtn">Export PDF</button>
+            <button class="ghost" id="missionJournalRefreshBtn">Refresh</button>
+            <button class="ghost" id="exportSessionJsonBtn">JSON</button>
+            <button class="ghost" id="exportSessionCsvBtn">CSV</button>
+            <button class="ghost" id="exportSessionPdfBtn">PDF</button>
           </div>
-          <div class="info-line" id="missionJournalSummary">No mission report yet.</div>
+          <div class="info-line" id="missionJournalSummary"></div>
           <div class="mission-stats">
             <div class="mission-stat"><div class="k">Success Rate</div><div class="v" id="journalSuccessRate">-</div></div>
             <div class="mission-stat"><div class="k">Realized Delta</div><div class="v" id="journalRealizedDelta">-</div></div>
@@ -1717,7 +2324,7 @@
         </section>
 
         <section class="card glass" data-tab-panel="dispatch">
-          <h2>Manual Offer Scoring</h2>
+          <h2>Score offer</h2>
           <div class="score-board">
             <div class="score-pill"><div class="k">Probability</div><div class="v" id="scoreProb">-</div></div>
             <div class="score-pill"><div class="k">Decision</div><div class="v" id="scoreDecision">-</div></div>
@@ -1739,7 +2346,7 @@
             <label>Traffic factor<input id="traffic" type="number" step="0.1" value="1.1" /></label>
           </div>
           <button id="scoreBtn">Score Offer</button>
-          <div class="info-line" id="scoreReasons">No score yet.</div>
+          <div class="info-line" id="scoreReasons"></div>
         </section>
       </div>
 
@@ -1747,11 +2354,10 @@
         <section class="card glass" data-tab-panel="dispatch">
           <div class="section-head">
             <div>
-              <div class="eyebrow">Dispatch desk</div>
               <h2>Instant Dispatch</h2>
             </div>
           </div>
-          <div class="info-line" id="dispatchSummary">No dispatch recommendation yet.</div>
+          <div class="info-line" id="dispatchSummary"></div>
           <div class="list" id="dispatchPlan"></div>
           <div class="map-wrap">
             <div class="map-board" id="dispatchMap">Map pending...</div>
@@ -1760,30 +2366,30 @@
         </section>
 
         <section class="card glass" data-tab-panel="dispatch">
-          <h2>Decision Flow</h2>
+          <h2>Decision</h2>
           <div class="flow-steps">
             <div class="flow-step active" id="flowStepChoose"><div class="k">Step 1</div><div class="v">Choose</div></div>
             <div class="flow-step" id="flowStepScore"><div class="k">Step 2</div><div class="v">Score</div></div>
             <div class="flow-step" id="flowStepAction"><div class="k">Step 3</div><div class="v">Action</div></div>
           </div>
-          <div class="state-message empty" id="decisionStatus" role="status" aria-live="polite" aria-atomic="true">Choose a delivery to start the 3-step flow.</div>
+          <div class="state-message empty" id="decisionStatus" role="status" aria-live="polite" aria-atomic="true"></div>
           <div class="offer" id="decisionOfferCard">
-            <div class="muted">No delivery selected yet.</div>
+            <div class="muted">No delivery selected.</div>
           </div>
           <div class="offer-actions">
-            <button id="decisionQuickScoreBtn">Pick + Score Top Delivery</button>
-            <button class="ghost" id="decisionScoreBtn">Score Selected</button>
-            <button class="alt" id="decisionActionBtn">Open Action Route</button>
+            <button id="decisionQuickScoreBtn">Pick + score top</button>
+            <button class="ghost" id="decisionScoreBtn">Score selected</button>
+            <button class="alt" id="decisionActionBtn">Open route</button>
           </div>
         </section>
 
         <section class="card glass" data-tab-panel="live">
-          <h2>Best Deliveries Nearby</h2>
+          <h2>Best nearby</h2>
           <div class="list" id="bestOffers"></div>
         </section>
 
         <section class="card glass" data-tab-panel="live">
-          <h2>Latest Delivery Offers</h2>
+          <h2>Offers</h2>
           <div class="grid two">
             <label>Filter
               <select id="offerFilter">
@@ -1804,19 +2410,19 @@
         </section>
 
         <section class="card glass" data-tab-panel="live">
-          <h2>Zone Opportunities</h2>
+          <h2>Zones</h2>
           <div class="list" id="zones"></div>
         </section>
 
         <section class="card glass" data-tab-panel="live">
-          <h2>Shift Plan (60-90 min)</h2>
-          <div class="info-line" id="shiftPlanSummary">No shift plan yet.</div>
+          <h2>Shift plan</h2>
+          <div class="info-line" id="shiftPlanSummary"></div>
           <div class="list" id="shiftPlanList"></div>
         </section>
 
         <section class="card glass" data-tab-panel="diagnostics">
-          <h2>Replay Timeline</h2>
-          <div class="info-line" id="replaySummary">No replay requested yet.</div>
+          <h2>Replay</h2>
+          <div class="info-line" id="replaySummary"></div>
           <div class="replay-wrap">
             <div class="map-board replay-board" id="replayMap">Replay map pending...</div>
             <div class="replay-controls">
@@ -1834,7 +2440,7 @@
 
     <section class="card glass fleet-wallboard" id="fleetWallboard" data-tab-panel="live">
       <div class="fleet-head">
-        <h2>Fleet Wallboard</h2>
+        <h2>Fleet</h2>
         <div class="fleet-actions">
           <span class="chip" id="fleetActiveChip">0 active</span>
           <span class="chip" id="fleetPressureChip">pressure -</span>

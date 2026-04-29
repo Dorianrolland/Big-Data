@@ -480,8 +480,8 @@ function closeProfileSheet() {
   $('profileSheet').classList.remove('open');
 }
 
-const DARK_TILE_URL = 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
-const DARK_TILE_OPTS = {
+const LIGHT_TILE_URL = 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png';
+const LIGHT_TILE_OPTS = {
   maxZoom: 19,
   subdomains: 'abcd',
   attribution: '&copy; OpenStreetMap &copy; CARTO',
@@ -492,7 +492,7 @@ function ensureMap(targetId) {
   if (targetId === 'homeMap') {
     if (!state.homeMap) {
       state.homeMap = L.map(targetId, { zoomControl: false }).setView(DEFAULT_CENTER, 12);
-      L.tileLayer(DARK_TILE_URL, DARK_TILE_OPTS).addTo(state.homeMap);
+      L.tileLayer(LIGHT_TILE_URL, LIGHT_TILE_OPTS).addTo(state.homeMap);
       state.homeLayer = L.layerGroup().addTo(state.homeMap);
     }
     setTimeout(() => state.homeMap.invalidateSize(), 60);
@@ -500,7 +500,7 @@ function ensureMap(targetId) {
   }
   if (!state.zonesMap) {
     state.zonesMap = L.map(targetId, { zoomControl: false }).setView(DEFAULT_CENTER, 11);
-    L.tileLayer(DARK_TILE_URL, DARK_TILE_OPTS).addTo(state.zonesMap);
+    L.tileLayer(LIGHT_TILE_URL, LIGHT_TILE_OPTS).addTo(state.zonesMap);
     state.zonesLayer = L.layerGroup().addTo(state.zonesMap);
   }
   setTimeout(() => state.zonesMap.invalidateSize(), 60);

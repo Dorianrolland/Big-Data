@@ -11,18 +11,18 @@
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
     :root {
-      --bg:         #0d1117;
-      --surface:    #161b22;
-      --surface2:   #21262d;
-      --border:     #30363d;
-      --text:       #e6edf3;
-      --muted:      #7d8590;
-      --accent:     #6e40c9;
-      --accent-glow:#a371f7;
-      --orange:     #f0883e;
-      --green:      #3fb950;
-      --grey:       #484f58;
-      --red:        #f85149;
+      --bg:         #f3f7fb;
+      --surface:    #ffffff;
+      --surface2:   #eef4fb;
+      --border:     #d7e2ee;
+      --text:       #0f172a;
+      --muted:      #475569;
+      --accent:     #2563eb;
+      --accent-glow:#1d4ed8;
+      --orange:     #d97706;
+      --green:      #059669;
+      --grey:       #64748b;
+      --red:        #dc2626;
     }
 
     html, body { height: 100%; font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); overflow: hidden; }
@@ -171,7 +171,7 @@
       cursor: pointer; transition: border-color .12s, background .12s;
       font-size: 11px;
     }
-    .lv:hover { border-color: var(--accent); background: #21262d; }
+    .lv:hover { border-color: var(--accent); background: #e8f0fb; }
     .lv-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
     .lv-id  { font-family: 'JetBrains Mono', monospace; font-weight: 600; color: var(--text); }
     .lv-spd { color: var(--muted); font-size: 10px; }
@@ -197,8 +197,8 @@
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
 
-    /* Map dark overlay via CSS filter — fonctionne avec n'importe quelle tuile */
-    .leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(.85) contrast(1.05) saturate(.7); }
+    /* Map light mode for projector readability. */
+    .leaflet-tile-pane { filter: none; }
     /* Remet les marqueurs SVG dans les couleurs d'origine */
     .leaflet-overlay-pane, .leaflet-marker-pane, .leaflet-shadow-pane { filter: none; }
 

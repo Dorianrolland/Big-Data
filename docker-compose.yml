@@ -64,7 +64,7 @@ services:
       KAFKA_SCHEMAREGISTRY_ENABLED: "true"
       KAFKA_SCHEMAREGISTRY_URLS: http://redpanda:8081
     ports:
-      - "8080:8080"
+      - "8088:8080"
     restart: unless-stopped
 
   redpanda-init:
@@ -454,6 +454,7 @@ services:
     environment:
       GF_SECURITY_ADMIN_PASSWORD: fleetstream
       GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_USERS_DEFAULT_THEME: light
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/fleetstream.json
     volumes:

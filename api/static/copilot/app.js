@@ -788,7 +788,7 @@ function ensureDispatchLeafletMap() {
     attributionControl: true,
     preferCanvas: true,
   });
-  window.L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+  window.L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
     maxZoom: 19,
     attribution: '&copy; OpenStreetMap contributors',
   }).addTo(map);
@@ -2234,7 +2234,7 @@ function ensureReplayLeafletMap() {
     zoomControl: true,
     attributionControl: true,
   });
-  window.L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+  window.L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
     maxZoom: 19,
     attribution: '&copy; OpenStreetMap contributors',
   }).addTo(map);
@@ -3325,7 +3325,7 @@ async function refreshAll() {
   if (!mapEl || typeof L === 'undefined') return;
 
   const fleetMap = L.map(mapEl, { zoomControl: true }).setView([40.75, -73.99], 12);
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
     attribution: '© OpenStreetMap',
     maxZoom: 18,
   }).addTo(fleetMap);

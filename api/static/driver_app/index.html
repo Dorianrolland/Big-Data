@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>FleetStream Courier Copilot</title>
-  <meta name="theme-color" content="#141414" />
+  <meta name="theme-color" content="#f6f8fc" />
   <meta name="description" content="Courier-facing food delivery copilot demo for FleetStream." />
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
@@ -1244,6 +1244,131 @@
     @media (max-width: 899px) {
       .desktop-nav {
         display: none;
+      }
+    }
+
+    /* Presentation clarity theme: light, high-contrast surfaces for projectors. */
+    :root {
+      --bg: #f4f7fb;
+      --bg-soft: #eaf0f7;
+      --panel: rgba(255, 255, 255, 0.94);
+      --panel-strong: #ffffff;
+      --panel-raised: rgba(15, 23, 42, 0.035);
+      --line: rgba(15, 23, 42, 0.12);
+      --line-strong: rgba(15, 23, 42, 0.22);
+      --ink: #0f172a;
+      --ink-soft: #334155;
+      --muted: #64748b;
+      --amber: #b45309;
+      --amber-soft: rgba(245, 158, 11, 0.14);
+      --amber-strong: rgba(180, 83, 9, 0.28);
+      --cyan: #0891b2;
+      --cyan-soft: rgba(8, 145, 178, 0.12);
+      --emerald: #047857;
+      --emerald-soft: rgba(4, 120, 87, 0.12);
+      --violet: #6d28d9;
+      --violet-soft: rgba(109, 40, 217, 0.12);
+      --rose: #dc2626;
+      --rose-soft: rgba(220, 38, 38, 0.10);
+      --shadow: 0 18px 36px rgba(15, 23, 42, 0.12);
+      --shadow-sm: 0 5px 14px rgba(15, 23, 42, 0.10);
+    }
+
+    html,
+    body {
+      background: linear-gradient(180deg, #f8fbff 0%, #edf3fa 100%);
+      color: var(--ink);
+    }
+
+    .phone-shell,
+    .topbar,
+    .sheet {
+      background: rgba(255, 255, 255, 0.96);
+      border-color: var(--line);
+      box-shadow: var(--shadow);
+    }
+
+    .phone-shell::before {
+      background:
+        linear-gradient(180deg, rgba(180, 83, 9, 0.08), transparent 34%),
+        linear-gradient(135deg, rgba(8, 145, 178, 0.08), transparent 44%);
+    }
+
+    .ghost-button,
+    .solid-button.subtle,
+    .shift-preview-item,
+    .preset-button,
+    .panel,
+    .rail-panel,
+    .metric,
+    .list-item,
+    .mini-stat,
+    .zone-column,
+    .shift-journal,
+    .zone-item,
+    .empty-state {
+      background: rgba(255, 255, 255, 0.82);
+      border-color: var(--line);
+    }
+
+    .ghost-button:hover,
+    .solid-button.subtle:hover,
+    .preset-button:hover,
+    .list-item:hover,
+    .metric:hover,
+    .zone-item:hover {
+      background: #ffffff;
+      border-color: var(--line-strong);
+    }
+
+    .input {
+      background: #ffffff;
+      border-color: var(--line);
+      color: var(--ink);
+    }
+
+    .chip,
+    .reason-list .chip,
+    .zone-count,
+    .tabbar .tab-button,
+    .desktop-nav {
+      background: rgba(255, 255, 255, 0.78);
+      border-color: var(--line);
+      color: var(--ink-soft);
+    }
+
+    .headline-card,
+    #ordersList > .list-item:first-child,
+    .list-item.top-pick,
+    .metric.primary,
+    .zone-column--best {
+      background:
+        linear-gradient(140deg, rgba(245, 158, 11, 0.14), rgba(14, 165, 233, 0.06) 58%, rgba(255, 255, 255, 0.86)),
+        #ffffff;
+    }
+
+    .map {
+      background: #e8f0f7;
+      border-color: var(--line);
+    }
+
+    .map .leaflet-control-attribution {
+      background: rgba(255, 255, 255, 0.88);
+      color: var(--muted);
+    }
+
+    .tabbar {
+      background: linear-gradient(180deg, rgba(244, 247, 251, 0), rgba(244, 247, 251, 0.96) 40%);
+    }
+
+    @media (min-width: 900px) {
+      .topbar {
+        background: rgba(255, 255, 255, 0.90);
+        border-bottom-color: var(--line);
+      }
+
+      .sheet {
+        border-color: var(--line);
       }
     }
   </style>
